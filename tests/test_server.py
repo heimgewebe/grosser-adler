@@ -151,6 +151,22 @@ def test_github_read_fails_closed_without_dedicated_credential(monkeypatch: pyte
     assert called is False
 
 
+def test_github_pr_requests_base_oid(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return {"returncode": 0, "stdout": "{}", "stderr": ""}
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    server.github_pr("heimgewebe/grosser-adler", 2)
+
+    assert len(calls) == 2
+    fields = calls[0][calls[0].index("--json") + 1].split(",")
+    assert "headRefOid" in fields
+    assert "baseRefOid" in fields
+
+
 def test_relational_checkpoint_binds_every_component(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = tmp_path / "state"
     findings = state / "findings"
@@ -161,6 +177,7 @@ def test_relational_checkpoint_binds_every_component(tmp_path: Path, monkeypatch
         subject_kind="repo",
         subject="heimgewebe/grabowski",
         checkpoint="local-head-a",
+        checkpoint_mode="relational",
         checkpoint_components=[
             {"name": "upstream_head", "value": "upstream-b"},
             {"name": "local_head", "value": "local-head-a"},
@@ -173,6 +190,7 @@ def test_relational_checkpoint_binds_every_component(tmp_path: Path, monkeypatch
     payload = json.loads(next(findings.glob("*.json")).read_text(encoding="utf-8"))
     assert result["automatic_effect"] is False
     assert payload["schema_version"] == 2
+    assert payload["checkpoint_mode"] == "relational"
     assert payload["checkpoint_components"] == [
         {"name": "local_head", "value": "local-head-a"},
         {"name": "upstream_head", "value": "upstream-b"},
@@ -185,6 +203,40 @@ def test_relational_checkpoint_binds_every_component(tmp_path: Path, monkeypatch
     ])
     assert changed is not None
     assert server._checkpoint_set_sha256(changed) != payload["checkpoint_set_sha256"]
+
+
+def test_relational_checkpoint_rejects_incomplete_component_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "FINDINGS_ROOT", tmp_path / "state" / "findings")
+
+    with pytest.raises(ValueError, match="at least two checkpoint_components"):
+        server.submit_finding(
+            subject_kind="pr",
+            subject="heimgewebe/grosser-adler#2",
+            checkpoint_mode="relational",
+            checkpoint_components=[{"name": "pr_head", "value": "head-a"}],
+            severity="medium",
+            summary="Incomplete relational fixture.",
+            evidence_refs=["fixture:incomplete-relational"],
+        )
+
+
+def test_single_checkpoint_rejects_relational_components(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "FINDINGS_ROOT", tmp_path / "state" / "findings")
+
+    with pytest.raises(ValueError, match="checkpoint_mode='relational'"):
+        server.submit_finding(
+            subject_kind="repo",
+            subject="heimgewebe/grosser-adler",
+            checkpoint_components=[
+                {"name": "local_head", "value": "a"},
+                {"name": "upstream_head", "value": "b"},
+            ],
+            severity="medium",
+            summary="Ambiguous mode fixture.",
+            evidence_refs=["fixture:ambiguous-mode"],
+        )
 
 
 def test_deploy_templates_keep_credentials_separate() -> None:

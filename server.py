@@ -307,7 +307,7 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
         raise ValueError("invalid pull request number")
     metadata = _run([
         "/usr/bin/gh", "pr", "view", str(pr), "--repo", gh_repo,
-        "--json", "number,title,state,isDraft,headRefName,headRefOid,baseRefName,mergeStateStatus,url,reviewDecision,statusCheckRollup",
+        "--json", "number,title,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,url,reviewDecision,statusCheckRollup",
     ], timeout=20)
     reviews = _run([
         "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/reviews", "--paginate",
@@ -359,6 +359,7 @@ def list_findings(limit: int = 20) -> dict[str, Any]:
             "subject_kind": payload.get("subject_kind"),
             "subject": payload.get("subject"),
             "checkpoint": payload.get("checkpoint"),
+            "checkpoint_mode": payload.get("checkpoint_mode", "single"),
             "checkpoint_components": payload.get("checkpoint_components"),
             "checkpoint_set_sha256": payload.get("checkpoint_set_sha256"),
             "checkpoint_contract": payload.get("checkpoint_contract"),
@@ -379,10 +380,11 @@ def submit_finding(
     summary: str,
     evidence_refs: list[str],
     checkpoint: str | None = None,
+    checkpoint_mode: Literal["single", "relational"] = "single",
     checkpoint_components: list[dict[str, str]] | None = None,
     status: Literal["observation", "finding", "recheck_suggested"] = "finding",
 ) -> dict[str, Any]:
-    """Append one evidence-bound advisory finding. This never triggers a task or action."""
+    """Append one advisory finding. For relational claims set checkpoint_mode='relational' and bind every relevant state as at least two checkpoint_components; single mode forbids components. This never triggers a task or action."""
     _ensure_state()
     if not isinstance(subject, str) or not subject.strip() or len(subject) > 500:
         raise ValueError("subject must be 1..500 characters")
@@ -390,7 +392,16 @@ def submit_finding(
         raise ValueError(f"summary must be 1..{MAX_SUMMARY_CHARS} characters")
     if checkpoint is not None and (not isinstance(checkpoint, str) or len(checkpoint) > 500):
         raise ValueError("checkpoint must be at most 500 characters")
+    if checkpoint_mode not in {"single", "relational"}:
+        raise ValueError("checkpoint_mode must be single or relational")
     normalized_checkpoints = _normalize_checkpoint_components(checkpoint_components)
+    if checkpoint_mode == "relational":
+        if normalized_checkpoints is None or len(normalized_checkpoints) < 2:
+            raise ValueError(
+                "relational findings require at least two checkpoint_components covering every relevant state"
+            )
+    elif normalized_checkpoints is not None:
+        raise ValueError("checkpoint_components require checkpoint_mode='relational'")
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
         raise ValueError(f"evidence_refs must contain 1..{MAX_EVIDENCE_REFS} entries")
     cleaned_refs: list[str] = []
@@ -402,7 +413,7 @@ def submit_finding(
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
     payload = {
-        "schema_version": 2 if normalized_checkpoints is not None else 1,
+        "schema_version": 2 if checkpoint_mode == "relational" else 1,
         "finding_id": finding_id,
         "adler_identity": IDENTITY,
         "subject_kind": subject_kind,
@@ -415,8 +426,10 @@ def submit_finding(
         "observed_at": observed_at,
         "effect_contract": "advisory_only_no_automatic_action",
     }
-    if normalized_checkpoints is not None:
+    if checkpoint_mode == "relational":
+        assert normalized_checkpoints is not None
         payload.update({
+            "checkpoint_mode": "relational",
             "checkpoint_components": normalized_checkpoints,
             "checkpoint_set_sha256": _checkpoint_set_sha256(normalized_checkpoints),
             "checkpoint_contract": "all_components_must_match_or_recheck",
