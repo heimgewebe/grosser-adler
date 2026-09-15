@@ -1,0 +1,13 @@
+[project]
+name = "grosser-adler"
+version = "0.1.0"
+description = "Independent read-mostly MCP observer for the Heimgewebe operator ecosystem"
+requires-python = ">=3.10"
+dependencies = ["mcp==1.30.0"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
