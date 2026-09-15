@@ -69,3 +69,23 @@ def test_finding_is_create_only_and_advisory(tmp_path: Path, monkeypatch: pytest
 def test_internal_runner_has_no_shell_escape() -> None:
     with pytest.raises(ValueError):
         server._run(["bash", "-lc", "true"])
+
+
+def test_internal_runner_preserves_user_bus_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        captured.update(kwargs["env"])
+        return Completed()
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    server._run(["/usr/bin/systemctl", "--user", "show", "grabowski-transport-ingress.service"])
+    assert captured["XDG_RUNTIME_DIR"] == "/run/user/1000"
+    assert captured["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"

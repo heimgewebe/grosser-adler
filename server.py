@@ -99,6 +99,10 @@ def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 15) -> dict
         "GH_PAGER": "cat",
         "PAGER": "cat",
         "NO_COLOR": "1",
+        "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+        "DBUS_SESSION_BUS_ADDRESS": os.environ.get(
+            "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus"
+        ),
     }
     completed = subprocess.run(
         argv,
