@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/repos/grosser-adler
 Environment=GROSSER_ADLER_STATE_ROOT=%h/.local/state/grosser-adler
+EnvironmentFile=-%h/.config/grosser-adler/github.env
 ExecStart=%h/repos/grosser-adler/.venv/bin/python %h/repos/grosser-adler/server.py --transport streamable-http --host 127.0.0.1 --port 18186
 Restart=on-failure
 RestartSec=3

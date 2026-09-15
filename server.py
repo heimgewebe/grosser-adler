@@ -25,6 +25,9 @@ MAX_OUTPUT_BYTES = 160_000
 MAX_SUMMARY_CHARS = 4_000
 MAX_EVIDENCE_REFS = 32
 MAX_EVIDENCE_REF_CHARS = 1_000
+MAX_CHECKPOINT_COMPONENTS = 16
+MAX_CHECKPOINT_NAME_CHARS = 100
+MAX_CHECKPOINT_VALUE_CHARS = 500
 
 READ_ANNOTATIONS = ToolAnnotations(
     title="Independent read-only observation",
@@ -71,8 +74,11 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _redact(text: str) -> str:
+def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     result = text
+    for secret in exact_secrets:
+        if secret:
+            result = result.replace(secret, "<REDACTED>")
     for pattern in _SECRET_PATTERNS:
         result = pattern.sub("<REDACTED>", result)
     return result
@@ -104,6 +110,13 @@ def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 15) -> dict
             "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus"
         ),
     }
+    gh_token: str | None = None
+    if argv[0] == "/usr/bin/gh":
+        gh_token = os.environ.get("GROSSER_ADLER_GITHUB_TOKEN")
+        if not gh_token or not gh_token.strip():
+            raise RuntimeError("Großer Adler GitHub credential is not configured")
+        env["GH_TOKEN"] = gh_token
+
     completed = subprocess.run(
         argv,
         cwd=str(cwd) if cwd else None,
@@ -115,8 +128,11 @@ def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 15) -> dict
         timeout=timeout,
         check=False,
     )
-    stdout, stdout_truncated = _bounded(_redact(completed.stdout))
-    stderr, stderr_truncated = _bounded(_redact(completed.stderr), 32_000)
+    exact_secrets = (gh_token,) if gh_token else ()
+    stdout, stdout_truncated = _bounded(_redact(completed.stdout, exact_secrets=exact_secrets))
+    stderr, stderr_truncated = _bounded(
+        _redact(completed.stderr, exact_secrets=exact_secrets), 32_000
+    )
     return {
         "returncode": completed.returncode,
         "stdout": stdout,
@@ -162,6 +178,49 @@ def _validate_revision(revision: str) -> str:
     if not isinstance(revision, str) or not _REV_RE.fullmatch(revision):
         raise ValueError("invalid Git revision")
     return revision
+
+
+def _normalize_checkpoint_components(
+    value: list[dict[str, str]] | None,
+) -> list[dict[str, str]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_CHECKPOINT_COMPONENTS:
+        raise ValueError(
+            f"checkpoint_components must contain 1..{MAX_CHECKPOINT_COMPONENTS} entries"
+        )
+    normalized: list[dict[str, str]] = []
+    names: set[str] = set()
+    for component in value:
+        if not isinstance(component, dict) or set(component) != {"name", "value"}:
+            raise ValueError("each checkpoint component must contain exactly name and value")
+        name = component["name"]
+        component_value = component["value"]
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or len(name) > MAX_CHECKPOINT_NAME_CHARS
+        ):
+            raise ValueError("invalid checkpoint component name")
+        if (
+            not isinstance(component_value, str)
+            or not component_value.strip()
+            or len(component_value) > MAX_CHECKPOINT_VALUE_CHARS
+        ):
+            raise ValueError("invalid checkpoint component value")
+        name = name.strip()
+        if name in names:
+            raise ValueError("checkpoint component names must be unique")
+        names.add(name)
+        normalized.append({"name": name, "value": component_value.strip()})
+    return sorted(normalized, key=lambda item: item["name"])
+
+
+def _checkpoint_set_sha256(components: list[dict[str, str]]) -> str:
+    encoded = json.dumps(
+        components, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _ensure_state() -> None:
@@ -300,6 +359,9 @@ def list_findings(limit: int = 20) -> dict[str, Any]:
             "subject_kind": payload.get("subject_kind"),
             "subject": payload.get("subject"),
             "checkpoint": payload.get("checkpoint"),
+            "checkpoint_components": payload.get("checkpoint_components"),
+            "checkpoint_set_sha256": payload.get("checkpoint_set_sha256"),
+            "checkpoint_contract": payload.get("checkpoint_contract"),
             "severity": payload.get("severity"),
             "status": payload.get("status"),
             "summary": payload.get("summary"),
@@ -317,6 +379,7 @@ def submit_finding(
     summary: str,
     evidence_refs: list[str],
     checkpoint: str | None = None,
+    checkpoint_components: list[dict[str, str]] | None = None,
     status: Literal["observation", "finding", "recheck_suggested"] = "finding",
 ) -> dict[str, Any]:
     """Append one evidence-bound advisory finding. This never triggers a task or action."""
@@ -327,6 +390,7 @@ def submit_finding(
         raise ValueError(f"summary must be 1..{MAX_SUMMARY_CHARS} characters")
     if checkpoint is not None and (not isinstance(checkpoint, str) or len(checkpoint) > 500):
         raise ValueError("checkpoint must be at most 500 characters")
+    normalized_checkpoints = _normalize_checkpoint_components(checkpoint_components)
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
         raise ValueError(f"evidence_refs must contain 1..{MAX_EVIDENCE_REFS} entries")
     cleaned_refs: list[str] = []
@@ -338,7 +402,7 @@ def submit_finding(
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2 if normalized_checkpoints is not None else 1,
         "finding_id": finding_id,
         "adler_identity": IDENTITY,
         "subject_kind": subject_kind,
@@ -351,6 +415,12 @@ def submit_finding(
         "observed_at": observed_at,
         "effect_contract": "advisory_only_no_automatic_action",
     }
+    if normalized_checkpoints is not None:
+        payload.update({
+            "checkpoint_components": normalized_checkpoints,
+            "checkpoint_set_sha256": _checkpoint_set_sha256(normalized_checkpoints),
+            "checkpoint_contract": "all_components_must_match_or_recheck",
+        })
     encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     target = FINDINGS_ROOT / f"{finding_id}.json"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
