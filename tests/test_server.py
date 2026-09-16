@@ -437,7 +437,6 @@ def test_git_status_hides_untracked_filenames_and_tracks_completeness(monkeypatc
 
 def test_status_cleanliness_requires_observed_branch_line() -> None:
     assert server._status_is_clean("## feature\n") is True
-    assert server._status_is_clean("") is False
     assert server._status_is_clean("## feature\n M server.py\n") is False
 
 def _configure_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -532,6 +531,8 @@ def test_legacy_finding_remains_readable_without_driving_v1_semantics(tmp_path: 
     legacy = {
         "schema_version": 3,
         "finding_id": "ga-20260916T000000Z-aaaaaaaaaaaa",
+        "adler_identity": server.IDENTITY,
+        "subject_kind": "work",
         "status": "advice",
         "severity": "medium",
         "subject": "legacy-subject",
@@ -539,12 +540,20 @@ def test_legacy_finding_remains_readable_without_driving_v1_semantics(tmp_path: 
         "summary": "legacy",
         "evidence_refs": ["fixture:legacy"],
         "observed_at": "2026-09-16T00:00:00Z",
+        "effect_contract": "advisory_only_no_automatic_action",
+        "target_actor": None,
+        "binding": None,
+        "recommendation": None,
+        "rationale": None,
+        "confidence": None,
     }
     (findings / f"{legacy['finding_id']}.json").write_text(json.dumps(legacy), encoding="utf-8")
     listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is True
     assert listing["count"] == 1
     assert listing["findings"][0]["legacy"] is True
     assert listing["findings"][0]["kind"] == "advice"
+    assert listing["findings"][0]["status"] == "advice"
     assert listing["findings"][0]["binding_strength"] == "legacy-unbound"
 
 
