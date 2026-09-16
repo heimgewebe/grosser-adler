@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -52,6 +53,23 @@ mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
+_SYSTEMD_SERVICE_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+    "MainPID",
+    "FragmentPath",
+    "NRestarts",
+    "ActiveEnterTimestamp",
+    "ExecMainStartTimestamp",
+    "ControlGroup",
+    "MemoryCurrent",
+    "TasksCurrent",
+    "CPUUsageNSec",
+)
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -157,14 +175,25 @@ def _validate_unit(unit: str) -> str:
     return unit
 
 
-def _parse_key_value_lines(text: str) -> dict[str, str]:
+def _parse_key_value_lines(
+    text: str, *, expected_keys: tuple[str, ...] | None = None
+) -> tuple[dict[str, str], bool]:
     values: dict[str, str] = {}
+    complete = True
     for raw in text.splitlines():
+        if not raw.strip():
+            continue
         if "=" not in raw:
+            complete = False
             continue
         key, value = raw.split("=", 1)
+        if not key or key in values:
+            complete = False
+            continue
         values[key] = value
-    return values
+    if expected_keys is not None and set(values) != set(expected_keys):
+        complete = False
+    return values, complete
 
 
 def _parse_process_table(text: str) -> tuple[list[dict[str, Any]], bool]:
@@ -450,11 +479,21 @@ def service_status(unit: str) -> dict[str, Any]:
     """Read fixed status, lifecycle, cgroup and resource fields for any user service."""
     safe_unit = _validate_unit(unit)
     result = _run(["/usr/bin/systemctl", "--user", "show", safe_unit, "--no-pager", "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=Result", "--property=ExecMainCode", "--property=ExecMainStatus", "--property=MainPID", "--property=FragmentPath", "--property=NRestarts", "--property=ActiveEnterTimestamp", "--property=ExecMainStartTimestamp", "--property=ControlGroup", "--property=MemoryCurrent", "--property=TasksCurrent", "--property=CPUUsageNSec"])
-    observation_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    properties: dict[str, str] = {}
+    parse_complete = False
+    if source_complete:
+        properties, parse_complete = _parse_key_value_lines(
+            result["stdout"], expected_keys=_SYSTEMD_SERVICE_PROPERTIES
+        )
+    observation_complete = source_complete and parse_complete
+    if not observation_complete:
+        properties = {}
     return {
         "unit": safe_unit,
         "status": result,
-        "properties": _parse_key_value_lines(result["stdout"]) if observation_complete else {},
+        "properties": properties,
+        "parse_complete": parse_complete,
         "observation_complete": observation_complete,
         "observed_at": _utc_now(),
     }
@@ -851,7 +890,7 @@ def submit_finding(
     optional_text = {"target_actor": target_actor, "binding": binding, "recommendation": recommendation, "rationale": rationale}
     for field, value in optional_text.items():
         if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > MAX_SUMMARY_CHARS): raise ValueError(f"{field} must be 1..{MAX_SUMMARY_CHARS} characters when supplied")
-    if confidence is not None and (not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or confidence < 0 or confidence > 1): raise ValueError("confidence must be between 0 and 1")
+    if confidence is not None and (not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not math.isfinite(float(confidence)) or confidence < 0 or confidence > 1): raise ValueError("confidence must be a finite number between 0 and 1")
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
         raise ValueError(f"evidence_refs must contain 1..{MAX_EVIDENCE_REFS} entries")
     cleaned_refs: list[str] = []

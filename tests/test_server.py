@@ -264,6 +264,20 @@ def _complete_git_fixture(head: str = "abc123", *, untracked: bool = False) -> d
     }
 
 
+def _complete_service_show_fixture(
+    *, main_pid: int = 100, control_group: str = "/user.slice/nixer", active_state: str = "active"
+) -> str:
+    values = {
+        "LoadState": "loaded", "ActiveState": active_state,
+        "SubState": "running" if active_state == "active" else "dead", "Result": "success",
+        "ExecMainCode": "0", "ExecMainStatus": "0", "MainPID": str(main_pid),
+        "FragmentPath": "/home/alex/.config/systemd/user/nixer-mcp.service", "NRestarts": "2",
+        "ActiveEnterTimestamp": "now", "ExecMainStartTimestamp": "now", "ControlGroup": control_group,
+        "MemoryCurrent": "2048", "TasksCurrent": "2", "CPUUsageNSec": "1000",
+    }
+    return "".join(f"{key}={values[key]}\n" for key in server._SYSTEMD_SERVICE_PROPERTIES)
+
+
 def test_process_descendants_are_bounded_to_requested_root() -> None:
     rows = [
         {"pid": 10, "ppid": 1},
@@ -362,13 +376,26 @@ def test_service_status_fails_closed_on_truncated_or_failed_show(monkeypatch: py
         assert result["properties"] == {}
 
 
+def test_service_status_fails_closed_on_missing_or_malformed_properties(monkeypatch: pytest.MonkeyPatch) -> None:
+    observations = [
+        {"returncode": 0, "stdout": "ActiveState=active\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False},
+        {"returncode": 0, "stdout": _complete_service_show_fixture() + "malformed-row\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False},
+    ]
+    for observation in observations:
+        monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
+        result = server.service_status("nixer-mcp.service")
+        assert result["parse_complete"] is False
+        assert result["observation_complete"] is False
+        assert result["properties"] == {}
+
+
 def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl" and "show" in argv:
             return {
                 "returncode": 0,
-                "stdout": "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=100\nNRestarts=2\nExecMainStartTimestamp=now\nControlGroup=/user.slice/nixer\n",
+                "stdout": _complete_service_show_fixture(),
                 "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
             }
         if argv[0] == "/usr/bin/ps":
@@ -403,7 +430,7 @@ def test_service_runtime_complete_zero_listener_match_is_valid_negative_evidence
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
-            return {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\nControlGroup=/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": _complete_service_show_fixture(control_group="/cg"), "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ps":
             return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
@@ -421,7 +448,7 @@ def test_service_runtime_marks_successful_unattributed_socket_source_incomplete(
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
-            return {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\nControlGroup=/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": _complete_service_show_fixture(control_group="/cg"), "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ps":
             return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
@@ -439,7 +466,7 @@ def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(mo
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
-            return {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\nControlGroup=/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": _complete_service_show_fixture(control_group="/cg"), "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ps":
             return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
@@ -538,6 +565,21 @@ def test_supervise_work_missing_pr_head_is_incomplete(monkeypatch: pytest.Monkey
     )
     assert result["conclusion"] == "incomplete"
     assert "github_pr_head" in result["missing_evidence"]
+
+
+@pytest.mark.parametrize("confidence", [float("nan"), float("inf"), float("-inf")])
+def test_enriched_advice_rejects_non_finite_confidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confidence: float
+) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setattr(server, "STATE_ROOT", state)
+    monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
+    with pytest.raises(ValueError, match="finite number between 0 and 1"):
+        server.submit_finding(
+            subject_kind="work", subject="lane:fixture", severity="medium", status="advice",
+            summary="Non-finite confidence fixture.", evidence_refs=["fixture:confidence"], confidence=confidence,
+        )
+    assert list((state / "findings").glob("*.json")) == []
 
 
 def test_enriched_advice_stays_append_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
