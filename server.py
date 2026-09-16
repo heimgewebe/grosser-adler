@@ -606,10 +606,15 @@ def service_runtime(unit: str) -> dict[str, Any]:
             line for line, socket_cgroup in socket_cgroups
             if _cgroup_within(socket_cgroup, control_group)
         ]
-    listener_observation_complete = sockets_source_complete and bool(control_group) and bool(listeners)
+    listener_observation_complete = (
+        sockets_source_complete
+        and bool(control_group)
+        and bool(listeners)
+        and unattributed_socket_lines == 0
+    )
     if not sockets_source_complete or not control_group:
         missing.append("listeners")
-    elif not listeners and unattributed_socket_lines:
+    elif unattributed_socket_lines:
         missing.append("listeners")
     elif not listeners:
         missing.append("listener_absence_not_established")

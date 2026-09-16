@@ -491,7 +491,7 @@ def test_service_runtime_zero_listener_match_does_not_establish_absence(monkeypa
     assert "exhaustive_socket_inventory" in runtime["does_not_establish"]
 
 
-def test_service_runtime_marks_successful_unattributed_socket_source_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
@@ -499,13 +499,22 @@ def test_service_runtime_marks_successful_unattributed_socket_source_incomplete(
         if argv[0] == "/usr/bin/ps":
             return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
-            return {"returncode": 0, "stdout": "tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:*\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {
+                "returncode": 0,
+                "stdout": (
+                    f"tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/cg <->\n"
+                    "tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:*\n"
+                ),
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+            }
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
     runtime = server.service_runtime("nixer-mcp.service")
     assert runtime["listener_observation_complete"] is False
     assert runtime["complete"] is False
-    assert runtime["listeners"] == []
+    assert len(runtime["listeners"]) == 1
+    assert "127.0.0.1:18187" in runtime["listeners"][0]
+    assert runtime["listener_unattributed_source_lines"] == 1
     assert "listeners" in runtime["missing_evidence"]
 
 
