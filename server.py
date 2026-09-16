@@ -69,6 +69,23 @@ _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
 _LANE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _LANE_SUBJECT_RE = re.compile(r"^lane:([0-9a-f]{32})$")
 _FINDING_ID_RE = re.compile(r"^ga-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+_LEGACY_SUBJECT_KINDS = {
+    "repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane",
+    "agent_run", "service", "work",
+}
+_LEGACY_STATUSES = {
+    "observation", "finding", "recheck_suggested", "contradiction",
+    "missing_evidence", "risk", "advice", "recheck_required",
+}
+_LEGACY_BASE_STATUSES = {"observation", "finding", "recheck_suggested"}
+_LEGACY_ENRICHED_FIELDS = ("target_actor", "binding", "recommendation", "rationale", "confidence")
+_LEGACY_RELATIONAL_FIELDS = (
+    "checkpoint_mode", "checkpoint_components", "checkpoint_set_sha256", "checkpoint_contract",
+)
+_V1_ONLY_MARKERS = {
+    "finding_contract", "finding_sha256", "kind", "binding_strength",
+    "recheck_of", "conclusion", "affected_effects",
+}
 _SYSTEMD_SERVICE_PROPERTIES = (
     "LoadState",
     "ActiveState",
@@ -775,42 +792,159 @@ def _finding_record_view(payload: dict[str, Any], path: Path) -> dict[str, Any]:
         view = {key: payload.get(key) for key in fields if key in payload}
         view["legacy"] = False
         return view
-    legacy_status = payload.get("status")
-    legacy_kind = legacy_status if legacy_status in {
-        "risk", "contradiction", "missing_evidence", "advice"
-    } else "observation"
+
+    legacy_status = payload["status"]
     return {
-        "finding_id": payload.get("finding_id"),
-        "finding_sha256": payload.get("finding_sha256") or _sha256_json(payload),
-        "kind": legacy_kind,
-        "severity": payload.get("severity"),
+        "finding_id": payload["finding_id"],
+        "finding_sha256": _sha256_json(payload),
+        "kind": legacy_status,
+        "status": legacy_status,
+        "subject_kind": payload["subject_kind"],
+        "severity": payload["severity"],
         "confidence": payload.get("confidence"),
-        "subject": payload.get("subject"),
+        "subject": payload["subject"],
         "checkpoint": payload.get("checkpoint"),
-        "binding_strength": payload.get("binding_strength") or "legacy-unbound",
-        "summary": payload.get("summary"),
-        "evidence_refs": payload.get("evidence_refs", []),
+        "checkpoint_mode": payload.get("checkpoint_mode", "single"),
+        "checkpoint_components": payload.get("checkpoint_components"),
+        "checkpoint_set_sha256": payload.get("checkpoint_set_sha256"),
+        "checkpoint_contract": payload.get("checkpoint_contract"),
+        "binding_strength": "legacy-unbound",
+        "summary": payload["summary"],
+        "evidence_refs": payload["evidence_refs"],
+        "target_actor": payload.get("target_actor"),
+        "binding": payload.get("binding"),
         "recommendation": payload.get("recommendation"),
-        "observed_at": payload.get("observed_at"),
+        "rationale": payload.get("rationale"),
+        "observed_at": payload["observed_at"],
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "legacy": True,
     }
 
 
-def _is_explicit_legacy_finding_payload(payload: dict[str, Any]) -> bool:
-    v1_markers = {
-        "finding_contract", "finding_sha256", "kind", "binding_strength",
-        "recheck_of", "conclusion", "affected_effects",
-    }
-    if any(key in payload for key in v1_markers):
-        return False
-    return isinstance(payload.get("status"), str) or isinstance(payload.get("subject_kind"), str)
+def _validate_legacy_finding_payload(payload: dict[str, Any], path: Path) -> None:
+    if any(key in payload for key in _V1_ONLY_MARKERS):
+        raise RuntimeError("finding contract is invalid or ambiguous")
+
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+        raise RuntimeError("legacy finding schema version is invalid")
+    if payload.get("adler_identity") != IDENTITY:
+        raise RuntimeError("legacy finding Adler identity is invalid")
+    if payload.get("effect_contract") != "advisory_only_no_automatic_action":
+        raise RuntimeError("legacy finding effect contract is invalid")
+
+    finding_id = payload.get("finding_id")
+    if (
+        not isinstance(finding_id, str)
+        or _FINDING_ID_RE.fullmatch(finding_id) is None
+        or path.name != f"{finding_id}.json"
+    ):
+        raise RuntimeError("legacy finding file identity mismatch")
+    if payload.get("subject_kind") not in _LEGACY_SUBJECT_KINDS:
+        raise RuntimeError("legacy finding subject kind is invalid")
+
+    subject = payload.get("subject")
+    if not isinstance(subject, str) or not subject.strip() or len(subject) > 500:
+        raise RuntimeError("legacy finding subject is invalid")
+    checkpoint = payload.get("checkpoint")
+    if checkpoint is not None and (not isinstance(checkpoint, str) or len(checkpoint) > 500):
+        raise RuntimeError("legacy finding checkpoint is invalid")
+    if payload.get("severity") not in {"low", "medium", "high", "critical"}:
+        raise RuntimeError("legacy finding severity is invalid")
+    if payload.get("status") not in _LEGACY_STATUSES:
+        raise RuntimeError("legacy finding status is invalid")
+
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
+        raise RuntimeError("legacy finding summary is invalid")
+    evidence_refs = payload.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
+        raise RuntimeError("legacy finding evidence refs are invalid")
+    if any(
+        not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_EVIDENCE_REF_CHARS
+        for ref in evidence_refs
+    ):
+        raise RuntimeError("legacy finding evidence refs are invalid")
+    observed_at = payload.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at.strip() or len(observed_at) > 100:
+        raise RuntimeError("legacy finding observed_at is invalid")
+
+    relational_present = [field in payload for field in _LEGACY_RELATIONAL_FIELDS]
+    relational = any(relational_present)
+    if relational and not all(relational_present):
+        raise RuntimeError("legacy relational checkpoint fields are incomplete")
+    if relational:
+        if payload.get("checkpoint_mode") != "relational":
+            raise RuntimeError("legacy checkpoint mode is invalid")
+        components = payload.get("checkpoint_components")
+        if not isinstance(components, list) or not 2 <= len(components) <= 16:
+            raise RuntimeError("legacy checkpoint components are invalid")
+        names: set[str] = set()
+        for component in components:
+            if not isinstance(component, dict) or set(component) != {"name", "value"}:
+                raise RuntimeError("legacy checkpoint component is invalid")
+            name = component["name"]
+            value = component["value"]
+            if not isinstance(name, str) or not name.strip() or len(name) > 100:
+                raise RuntimeError("legacy checkpoint component name is invalid")
+            if not isinstance(value, str) or not value.strip() or len(value) > 500:
+                raise RuntimeError("legacy checkpoint component value is invalid")
+            if name in names:
+                raise RuntimeError("legacy checkpoint component names are not unique")
+            names.add(name)
+        if components != sorted(components, key=lambda item: item["name"]):
+            raise RuntimeError("legacy checkpoint components are not canonical")
+        supplied_checkpoint_digest = payload.get("checkpoint_set_sha256")
+        if (
+            not isinstance(supplied_checkpoint_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", supplied_checkpoint_digest) is None
+            or supplied_checkpoint_digest != _sha256_json(components)
+        ):
+            raise RuntimeError("legacy checkpoint set digest is invalid")
+        if payload.get("checkpoint_contract") != "all_components_must_match_or_recheck":
+            raise RuntimeError("legacy checkpoint contract is invalid")
+
+    enriched_present = [field in payload for field in _LEGACY_ENRICHED_FIELDS]
+    if schema_version == 3:
+        if not all(enriched_present):
+            raise RuntimeError("legacy enriched fields are incomplete")
+        for field in ("target_actor", "binding", "recommendation", "rationale"):
+            value = payload.get(field)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip() or len(value) > MAX_SUMMARY_CHARS
+            ):
+                raise RuntimeError(f"legacy finding {field} is invalid")
+        confidence = payload.get("confidence")
+        if confidence is not None and (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not math.isfinite(float(confidence))
+            or not 0 <= float(confidence) <= 1
+        ):
+            raise RuntimeError("legacy finding confidence is invalid")
+        enriched = (
+            payload["status"] not in _LEGACY_BASE_STATUSES
+            or any(payload.get(field) is not None for field in ("target_actor", "binding", "recommendation", "rationale"))
+            or confidence is not None
+        )
+        if not enriched:
+            raise RuntimeError("legacy schema 3 finding is not enriched")
+    else:
+        if any(enriched_present):
+            raise RuntimeError("legacy enriched fields are invalid for schema 1/2")
+        if payload["status"] not in _LEGACY_BASE_STATUSES:
+            raise RuntimeError("legacy status requires schema 3")
+
+    if schema_version == 1 and relational:
+        raise RuntimeError("legacy schema 1 cannot be relational")
+    if schema_version == 2 and not relational:
+        raise RuntimeError("legacy schema 2 must be relational")
 
 
 def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
     if payload.get("finding_contract") != FINDING_CONTRACT:
-        if _is_explicit_legacy_finding_payload(payload):
-            return
-        raise RuntimeError("finding contract is invalid or ambiguous")
+        _validate_legacy_finding_payload(payload, path)
+        return
 
     schema_version = payload.get("schema_version")
     if type(schema_version) is not int or schema_version != 1:
@@ -919,6 +1053,25 @@ def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[st
             errors.append(type(exc).__name__)
             continue
         records.append((path, payload))
+
+    v1_by_id = {
+        str(payload["finding_id"]): payload
+        for _, payload in records
+        if payload.get("finding_contract") == FINDING_CONTRACT
+    }
+    for _, payload in records:
+        if payload.get("finding_contract") != FINDING_CONTRACT:
+            continue
+        parent_id = payload.get("recheck_of")
+        if parent_id is None:
+            continue
+        parent = v1_by_id.get(str(parent_id))
+        if (
+            parent is None
+            or parent.get("recheck_of") is not None
+            or parent.get("subject") != payload.get("subject")
+        ):
+            errors.append("RuntimeError")
     return records, errors
 
 
