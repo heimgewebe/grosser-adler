@@ -7,7 +7,7 @@
 | PR-HEAD / Base / CI / Reviews | GitHub | `github_pr` | primär für GitHub |
 | User-Servicezustand | user-systemd | `service_status` | primär für Servicezustand |
 | Service-Prozessbaum | Prozesssicht + systemd MainPID/ControlGroup | `service_runtime` | aktuelle same-UID, cgroup-gebundene Hostbeobachtung |
-| sichtbare Listener | `ss` mit cgroup-Metadaten | `service_runtime` | cgroup-korreliert; fehlende/truncierte Attribution => incomplete |
+| positive TCP/UDP-Listener-Evidenz | `ss` mit cgroup-Metadaten | `service_runtime` | cgroup-korreliert; leeres Match oder fehlende Attribution => `incomplete`; keine Aussage über UNIX-Sockets oder Listener-Abwesenheit |
 | Grabowski Work/Lane | Grabowski Stores/Projektionen | caller claim in v1 | Claim/Discovery, nicht Adler-Autorität |
 | Bureau Task/Run | Bureau StateStore | caller claim in v1 | Claim bis direkter Adapter nötig/belegt |
 | Agent Run | Agent/Workspace-Store | caller claim in v1 | Claim bis direkter Adapter nötig/belegt |
@@ -21,3 +21,6 @@
 5. Neue Adapter nur, wenn ein realer Pilotfall mit bestehenden Reads nicht sinnvoll prüfbar ist.
 6. Cross-Work-Konflikte später nur über starke gemeinsame Schlüssel.
 7. `claimed_head` ist eine exakte Identität; für Git-/PR-Vergleiche den vollständigen Commit-OID verwenden, keine abgekürzte SHA.
+
+8. Listener-Beobachtung v1 belegt nur positiv zugeordnete TCP/UDP-Listener; ein leeres Match ist keine Abwesenheitsbehauptung und bleibt `incomplete`.
+9. Relationale Checkpoint-Komponenten müssen ohne Redaction persistierbar sein; Namen oder Werte, die Secret-Redaction benötigen oder bereits `<REDACTED>` enthalten, werden fail-closed abgewiesen statt identitätskollabierend gehasht.

@@ -9,6 +9,12 @@ import pytest
 import server
 
 
+OID_A = "a" * 40
+OID_B = "b" * 40
+OID_C = "c" * 40
+OID_D = "d" * 40
+
+
 def test_status_declares_read_mostly_boundary() -> None:
     status = server.adler_status()
     assert status["identity"] == "grosser-adler-observer-v1"
@@ -209,6 +215,26 @@ def test_relational_checkpoint_binds_every_component(tmp_path: Path, monkeypatch
     assert server._checkpoint_set_sha256(changed) != payload["checkpoint_set_sha256"]
 
 
+def test_relational_checkpoint_rejects_components_requiring_redaction_before_persisting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    findings = state / "findings"
+    monkeypatch.setattr(server, "STATE_ROOT", state)
+    monkeypatch.setattr(server, "FINDINGS_ROOT", findings)
+
+    for sensitive_value in ("sk-proj-" + "A" * 24, "sk-proj-" + "B" * 24):
+        with pytest.raises(ValueError, match="requiring redaction"):
+            server.submit_finding(
+                subject_kind="work", subject="fixture", severity="medium", summary="fixture",
+                evidence_refs=["fixture:redaction"], checkpoint_mode="relational",
+                checkpoint_components=[
+                    {"name": "local_head", "value": "a" * 40},
+                    {"name": "runtime_token", "value": sensitive_value},
+                ],
+            )
+
+    assert list(findings.glob("*.json")) == []
+
+
 def test_relational_checkpoint_rejects_incomplete_component_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(server, "FINDINGS_ROOT", tmp_path / "state" / "findings")
@@ -253,7 +279,7 @@ def test_deploy_templates_keep_credentials_separate() -> None:
     assert ".config/grosser-adler/github.env" in mcp
 
 
-def _complete_git_fixture(head: str = "abc123", *, untracked: bool = False) -> dict:
+def _complete_git_fixture(head: str = OID_A, *, untracked: bool = False) -> dict:
     return {
         "repo": "/home/alex/repos/nixer",
         "head": {"returncode": 0, "stdout": head + "\n", "stdout_truncated": False},
@@ -301,7 +327,7 @@ def test_process_reader_is_internal_and_cgroup_bound(monkeypatch: pytest.MonkeyP
                 f"100 1 {own_uid} S 10 512 0.0 python 0::/user.slice/nixer\n"
                 f"101 100 {own_uid} S 8 256 0.0 Web Content 0::/user.slice/nixer/child\n"
                 f"102 100 {own_uid} S 8 256 0.0 stray 0::/user.slice/other\n"
-                f"103 100 {own_uid + 1} S 8 256 0.0 foreign 0::/user.slice/nixer/foreign\n"
+                f"103 1 {own_uid} S 8 256 0.0 reparented 0::/user.slice/nixer/detached\n"
                 f"104 100 {own_uid} S 8 256 0.0 prefix 0::/user.slice/nixer-other\n"
             ),
             "stderr": "",
@@ -313,12 +339,28 @@ def test_process_reader_is_internal_and_cgroup_bound(monkeypatch: pytest.MonkeyP
     result = server._process_snapshot(100, "/user.slice/nixer")
     assert result["complete"] is True
     assert result["parse_complete"] is True
-    assert [row["pid"] for row in result["processes"]] == [100, 101]
+    assert [row["pid"] for row in result["processes"]] == [100, 101, 103]
     assert result["processes"][1]["comm"] == "Web Content"
     assert all("args" not in row for row in result["processes"])
     assert server._cgroup_within("/foo", "/foo") is True
     assert server._cgroup_within("/foo/child", "/foo") is True
     assert server._cgroup_within("/foobar", "/foo") is False
+
+
+def test_process_reader_fails_closed_on_foreign_uid_cgroup_member(monkeypatch: pytest.MonkeyPatch) -> None:
+    own_uid = server.os.getuid()
+    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: {
+        "returncode": 0,
+        "stdout": (
+            f"100 1 {own_uid} S 10 512 0.0 python 0::/user.slice/nixer\n"
+            f"101 1 {own_uid + 1} S 8 256 0.0 foreign 0::/user.slice/nixer/helper\n"
+        ),
+        "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+    })
+    result = server._process_snapshot(100, "/user.slice/nixer")
+    assert result["uid_complete"] is False
+    assert result["complete"] is False
+    assert result["processes"] == []
 
 
 def test_process_reader_marks_unparseable_rows_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -336,6 +378,7 @@ def test_process_reader_marks_unparseable_rows_incomplete(monkeypatch: pytest.Mo
     result = server._process_snapshot(100, "/user.slice/nixer")
     assert result["parse_complete"] is False
     assert result["complete"] is False
+    assert result["processes"] == []
 
 
 def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -426,7 +469,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
     assert runtime["complete"] is True
 
 
-def test_service_runtime_complete_zero_listener_match_is_valid_negative_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_service_runtime_zero_listener_match_does_not_establish_absence(monkeypatch: pytest.MonkeyPatch) -> None:
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
@@ -439,12 +482,16 @@ def test_service_runtime_complete_zero_listener_match_is_valid_negative_evidence
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
     runtime = server.service_runtime("nixer-mcp.service")
-    assert runtime["listener_observation_complete"] is True
+    assert runtime["listener_observation_complete"] is False
+    assert runtime["listener_negative_claim_supported"] is False
+    assert runtime["listener_scope"] == "tcp_udp_positive_cgroup_evidence"
     assert runtime["listeners"] == []
-    assert runtime["complete"] is True
+    assert runtime["complete"] is False
+    assert "listener_absence_not_established" in runtime["missing_evidence"]
+    assert "exhaustive_socket_inventory" in runtime["does_not_establish"]
 
 
-def test_service_runtime_marks_successful_unattributed_socket_source_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
@@ -452,13 +499,22 @@ def test_service_runtime_marks_successful_unattributed_socket_source_incomplete(
         if argv[0] == "/usr/bin/ps":
             return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
-            return {"returncode": 0, "stdout": "tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:*\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {
+                "returncode": 0,
+                "stdout": (
+                    f"tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/cg <->\n"
+                    "tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:*\n"
+                ),
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+            }
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
     runtime = server.service_runtime("nixer-mcp.service")
     assert runtime["listener_observation_complete"] is False
     assert runtime["complete"] is False
-    assert runtime["listeners"] == []
+    assert len(runtime["listeners"]) == 1
+    assert "127.0.0.1:18187" in runtime["listeners"][0]
+    assert runtime["listener_unattributed_source_lines"] == 1
     assert "listeners" in runtime["missing_evidence"]
 
 
@@ -479,11 +535,20 @@ def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(mo
     assert "listeners" in runtime["missing_evidence"]
 
 
+def test_supervise_work_rejects_symbolic_or_abbreviated_claimed_head() -> None:
+    for claimed in ("HEAD", "abc123", "a" * 12):
+        with pytest.raises(ValueError, match="full commit OID"):
+            server.supervise_work(
+                binding_kind="manual", binding_id="manual:fixture",
+                repo="/home/alex/repos/nixer", claimed_head=claimed,
+            )
+
+
 def test_supervise_work_keeps_unverified_lane_top_level_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture())
     result = server.supervise_work(
         binding_kind="grabowski_lane", binding_id="lane:fixture",
-        repo="/home/alex/repos/nixer", claimed_head="abc123", expect_clean=True,
+        repo="/home/alex/repos/nixer", claimed_head=OID_A, expect_clean=True,
     )
     assert result["evidence_conclusion"] == "confirmed"
     assert result["conclusion"] == "incomplete"
@@ -496,7 +561,7 @@ def test_supervise_work_manual_claim_can_confirm_evidence(monkeypatch: pytest.Mo
     monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture())
     result = server.supervise_work(
         binding_kind="manual", binding_id="manual:fixture",
-        repo="/home/alex/repos/nixer", claimed_head="abc123", expect_clean=True,
+        repo="/home/alex/repos/nixer", claimed_head=OID_A, expect_clean=True,
     )
     assert result["conclusion"] == "confirmed"
     assert result["binding"]["verification"] == "not_applicable"
@@ -510,7 +575,7 @@ def test_supervise_work_truncated_git_is_incomplete(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(server, "git_status", lambda repo: fixture)
     result = server.supervise_work(
         binding_kind="manual", binding_id="manual:fixture",
-        repo="/home/alex/repos/nixer", claimed_head="abc123", expect_clean=True,
+        repo="/home/alex/repos/nixer", claimed_head=OID_A, expect_clean=True,
     )
     assert result["conclusion"] == "incomplete"
     assert result["dimensions"]["cleanliness"]["status"] == "incomplete"
@@ -532,36 +597,60 @@ def test_supervise_work_missing_active_state_is_incomplete(monkeypatch: pytest.M
     })
     result = server.supervise_work(
         binding_kind="manual", binding_id="manual:fixture", repo="/home/alex/repos/nixer",
-        claimed_head="abc123", unit="nixer-mcp.service", expect_service_active=True,
+        claimed_head=OID_A, unit="nixer-mcp.service", expect_service_active=True,
     )
     assert result["conclusion"] == "incomplete"
     assert result["dimensions"]["runtime_active"]["status"] == "incomplete"
     assert not result["contradictions"]
+    assert not any(item["name"].startswith("runtime_") for item in result["checkpoint_components"])
+
+
+def test_supervise_work_checkpoint_components_bind_cleanliness_and_complete_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture(OID_A))
+    monkeypatch.setattr(server, "service_runtime", lambda unit: {
+        "service": {
+            "ActiveState": "active", "ExecMainStartTimestamp": "now", "NRestarts": "2",
+        },
+        "main_pid": 100, "control_group": "/cg", "processes": [{"pid": 100}],
+        "listeners": ["tcp LISTEN ... cgroup:/cg"], "missing_evidence": [], "complete": True,
+    })
+    result = server.supervise_work(
+        binding_kind="manual", binding_id="manual:fixture", repo="/home/alex/repos/nixer",
+        claimed_head=OID_A, expect_clean=True, unit="nixer-mcp.service", expect_service_active=True,
+    )
+    components = {item["name"]: item["value"] for item in result["checkpoint_components"]}
+    assert components["local_head"] == OID_A
+    assert components["local_clean"] == "true"
+    assert components["runtime_main_pid"] == "100"
+    assert components["runtime_active_state"] == "active"
+    assert components["runtime_start"] == "now"
+    assert components["runtime_restarts"] == "2"
+    assert components["runtime_cgroup"] == "/cg"
 
 
 def test_supervise_work_pr_head_mismatch_is_contradicted(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture("newhead"))
+    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture(OID_B))
     monkeypatch.setattr(server, "github_pr", lambda repo, pr: {
-        "metadata": {"returncode": 0, "stdout": json.dumps({"number": 1, "headRefOid": "oldhead", "baseRefOid": "basehead"}), "stdout_truncated": False},
+        "metadata": {"returncode": 0, "stdout": json.dumps({"number": 1, "headRefOid": OID_C, "baseRefOid": OID_D}), "stdout_truncated": False},
         "reviews": {"returncode": 0, "stdout": "[]"},
     })
     result = server.supervise_work(
         binding_kind="pr", binding_id="heimgewebe/nixer#1", repo="/home/alex/repos/nixer",
-        claimed_head="newhead", github_repo="heimgewebe/nixer", pr=1,
+        claimed_head=OID_B, github_repo="heimgewebe/nixer", pr=1,
     )
     assert result["conclusion"] == "contradicted"
     assert result["dimensions"]["github_pr_head"]["status"] == "contradicted"
 
 
 def test_supervise_work_missing_pr_head_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture("newhead"))
+    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture(OID_B))
     monkeypatch.setattr(server, "github_pr", lambda repo, pr: {
-        "metadata": {"returncode": 0, "stdout": json.dumps({"number": 1, "baseRefOid": "basehead"}), "stdout_truncated": False},
+        "metadata": {"returncode": 0, "stdout": json.dumps({"number": 1, "baseRefOid": OID_D}), "stdout_truncated": False},
         "reviews": {"returncode": 0, "stdout": "[]"},
     })
     result = server.supervise_work(
         binding_kind="pr", binding_id="heimgewebe/nixer#1", repo="/home/alex/repos/nixer",
-        claimed_head="newhead", github_repo="heimgewebe/nixer", pr=1,
+        claimed_head=OID_B, github_repo="heimgewebe/nixer", pr=1,
     )
     assert result["conclusion"] == "incomplete"
     assert "github_pr_head" in result["missing_evidence"]

@@ -52,6 +52,7 @@ mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
+_COMMIT_OID_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
 _SYSTEMD_SERVICE_PROPERTIES = (
     "LoadState",
@@ -292,6 +293,12 @@ def _validate_revision(revision: str) -> str:
     return revision
 
 
+def _validate_commit_oid(value: str) -> str:
+    if not isinstance(value, str) or _COMMIT_OID_RE.fullmatch(value) is None:
+        raise ValueError("claimed_head must be a full commit OID")
+    return value.lower()
+
+
 def _normalize_checkpoint_components(
     value: list[dict[str, str]] | None,
 ) -> list[dict[str, str]] | None:
@@ -321,10 +328,20 @@ def _normalize_checkpoint_components(
         ):
             raise ValueError("invalid checkpoint component value")
         name = name.strip()
+        component_value = component_value.strip()
+        if (
+            _redact(name) != name
+            or _redact(component_value) != component_value
+            or "<REDACTED>" in name
+            or "<REDACTED>" in component_value
+        ):
+            raise ValueError(
+                "checkpoint components requiring redaction cannot be persisted"
+            )
         if name in names:
             raise ValueError("checkpoint component names must be unique")
         names.add(name)
-        normalized.append({"name": name, "value": component_value.strip()})
+        normalized.append({"name": name, "value": component_value})
     return sorted(normalized, key=lambda item: item["name"])
 
 
@@ -500,7 +517,7 @@ def service_status(unit: str) -> dict[str, Any]:
 
 
 def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
-    """Read a service-bound same-UID process tree without argv or mutation authority."""
+    """Read all same-UID members of one service cgroup without argv or mutation authority."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         raise ValueError("pid must be a positive integer")
     if not isinstance(control_group, str) or not control_group.strip():
@@ -514,23 +531,22 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
     parse_complete = False
     if source_complete:
         rows, parse_complete = _parse_process_table(table["stdout"])
-    rows = [row for row in rows if row["uid"] == os.getuid()]
-    descendants = _descendant_rows(rows, pid)
-    processes = [
-        row for row in descendants
-        if _cgroup_within(row["cgroup"], control_group)
-    ]
-    root = next((row for row in processes if row["pid"] == pid), None)
+    cgroup_rows = [row for row in rows if _cgroup_within(row["cgroup"], control_group)]
+    uid_complete = all(row["uid"] == os.getuid() for row in cgroup_rows)
+    same_uid_rows = [row for row in cgroup_rows if row["uid"] == os.getuid()]
+    root = next((row for row in same_uid_rows if row["pid"] == pid), None)
+    complete = source_complete and parse_complete and uid_complete and root is not None
     return {
         "root_pid": pid,
-        "scope": "service_cgroup_same_uid",
+        "scope": "service_cgroup_same_uid_all_members",
         "uid": os.getuid(),
         "control_group": _normalize_cgroup(control_group),
-        "processes": processes,
+        "processes": same_uid_rows if complete else [],
         "source_returncode": table["returncode"],
         "source_truncated": table["stdout_truncated"],
         "parse_complete": parse_complete,
-        "complete": source_complete and parse_complete and root is not None,
+        "uid_complete": uid_complete,
+        "complete": complete,
         "observed_at": _utc_now(),
     }
 
@@ -575,23 +591,33 @@ def service_runtime(unit: str) -> dict[str, Any]:
     socket_lines = [line for line in sockets["stdout"].splitlines() if line.strip()]
     sockets_source_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
     socket_cgroups: list[tuple[str, str]] = []
-    listener_observation_complete = sockets_source_complete
+    unattributed_socket_lines = 0
     if sockets_source_complete:
         for line in socket_lines:
             match = re.search(r"(?:^|\s)cgroup:(\S+)", line)
             if match is None:
-                listener_observation_complete = False
-                break
+                unattributed_socket_lines += 1
+                continue
             socket_cgroups.append((line, match.group(1)))
 
     listeners: list[str] = []
-    if listener_observation_complete and control_group:
+    if sockets_source_complete and control_group:
         listeners = [
             line for line, socket_cgroup in socket_cgroups
             if _cgroup_within(socket_cgroup, control_group)
         ]
-    if not listener_observation_complete:
+    listener_observation_complete = (
+        sockets_source_complete
+        and bool(control_group)
+        and bool(listeners)
+        and unattributed_socket_lines == 0
+    )
+    if not sockets_source_complete or not control_group:
         missing.append("listeners")
+    elif unattributed_socket_lines:
+        missing.append("listeners")
+    elif not listeners:
+        missing.append("listener_absence_not_established")
 
     return {
         "unit": unit,
@@ -600,9 +626,13 @@ def service_runtime(unit: str) -> dict[str, Any]:
         "control_group": _normalize_cgroup(control_group) if control_group else None,
         "processes": process_observation.get("processes", []),
         "listeners": listeners,
+        "listener_scope": "tcp_udp_positive_cgroup_evidence",
         "listener_observation_complete": listener_observation_complete,
+        "listener_unattributed_source_lines": unattributed_socket_lines,
+        "listener_negative_claim_supported": False,
         "missing_evidence": sorted(set(missing)),
         "complete": not missing,
+        "does_not_establish": ["exhaustive_socket_inventory", "absence_of_other_listeners"],
         "observed_at": _utc_now(),
     }
 
@@ -627,7 +657,7 @@ def supervise_work(
     if expect_service_active is not None and unit is None:
         raise ValueError("unit is required when expect_service_active is supplied")
     if claimed_head is not None:
-        _validate_revision(claimed_head)
+        claimed_head = _validate_commit_oid(claimed_head)
 
     dimensions: dict[str, dict[str, Any]] = {}
     contradictions: list[str] = []
@@ -773,8 +803,13 @@ def supervise_work(
     components: list[dict[str, str]] = []
     if actual_head:
         components.append({"name": "local_head", "value": actual_head})
-    if runtime is not None:
+    if expect_clean is not None and clean is not None:
+        components.append({"name": "local_clean", "value": str(clean).lower()})
+    if runtime is not None and runtime.get("complete") is True:
         components.append({"name": "runtime_main_pid", "value": str(runtime["main_pid"])})
+        active_state = runtime["service"].get("ActiveState")
+        if active_state:
+            components.append({"name": "runtime_active_state", "value": active_state})
         if runtime["service"].get("ExecMainStartTimestamp"):
             components.append({"name": "runtime_start", "value": runtime["service"]["ExecMainStartTimestamp"]})
         if runtime["service"].get("NRestarts") is not None:
