@@ -567,6 +567,20 @@ def test_supervise_work_missing_pr_head_is_incomplete(monkeypatch: pytest.Monkey
     assert "github_pr_head" in result["missing_evidence"]
 
 
+def test_enriched_advice_rejects_huge_integer_confidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setattr(server, "STATE_ROOT", state)
+    monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
+    with pytest.raises(ValueError, match="finite number between 0 and 1"):
+        server.submit_finding(
+            subject_kind="work", subject="lane:fixture", severity="medium", status="advice",
+            summary="Huge confidence fixture.", evidence_refs=["fixture:confidence"], confidence=10**10000,
+        )
+    assert list((state / "findings").glob("*.json")) == []
+
+
 @pytest.mark.parametrize("confidence", [float("nan"), float("inf"), float("-inf")])
 def test_enriched_advice_rejects_non_finite_confidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confidence: float

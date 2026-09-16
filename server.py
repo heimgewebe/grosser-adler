@@ -890,7 +890,7 @@ def submit_finding(
     optional_text = {"target_actor": target_actor, "binding": binding, "recommendation": recommendation, "rationale": rationale}
     for field, value in optional_text.items():
         if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > MAX_SUMMARY_CHARS): raise ValueError(f"{field} must be 1..{MAX_SUMMARY_CHARS} characters when supplied")
-    if confidence is not None and (not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not math.isfinite(float(confidence)) or confidence < 0 or confidence > 1): raise ValueError("confidence must be a finite number between 0 and 1")
+    if confidence is not None and (not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or (isinstance(confidence, float) and not math.isfinite(confidence)) or confidence < 0 or confidence > 1): raise ValueError("confidence must be a finite number between 0 and 1")
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
         raise ValueError(f"evidence_refs must contain 1..{MAX_EVIDENCE_REFS} entries")
     cleaned_refs: list[str] = []
