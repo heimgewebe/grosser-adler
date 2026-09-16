@@ -250,71 +250,249 @@ def test_deploy_templates_keep_credentials_separate() -> None:
     assert ".config/grosser-adler/github.env" in mcp
 
 
+def _complete_git_fixture(head: str = "abc123", *, untracked: bool = False) -> dict:
+    return {
+        "repo": "/home/alex/repos/nixer",
+        "head": {"returncode": 0, "stdout": head + "\n", "stdout_truncated": False},
+        "status": {"returncode": 0, "stdout": "## feature\n", "stdout_truncated": False},
+        "untracked_present": untracked,
+        "observation_complete": True,
+        "observed_at": "fixture",
+    }
+
+
 def test_process_descendants_are_bounded_to_requested_root() -> None:
-    rows = [{"pid":10,"ppid":1},{"pid":11,"ppid":10},{"pid":12,"ppid":11},{"pid":20,"ppid":1}]
-    assert [row["pid"] for row in server._descendant_rows(rows,10)] == [10,11,12]
+    rows = [
+        {"pid": 10, "ppid": 1},
+        {"pid": 11, "ppid": 10},
+        {"pid": 12, "ppid": 11},
+        {"pid": 20, "ppid": 1},
+    ]
+    assert [row["pid"] for row in server._descendant_rows(rows, 10)] == [10, 11, 12]
 
 
-def test_service_runtime_correlates_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_process_reader_is_internal_and_cgroup_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert not hasattr(server, "process_snapshot")
+    own_uid = server.os.getuid()
+    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: {
+        "returncode": 0,
+        "stdout": (
+            f"100 1 {own_uid} S 10 512 0.0 0::/user.slice/nixer python\n"
+            f"101 100 {own_uid} S 8 256 0.0 0::/user.slice/nixer/child nix\n"
+            f"102 100 {own_uid} S 8 256 0.0 0::/user.slice/other stray\n"
+        ),
+        "stderr": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+    })
+    result = server._process_snapshot(100, "/user.slice/nixer")
+    assert result["complete"] is True
+    assert [row["pid"] for row in result["processes"]] == [100, 101]
+    assert all("args" not in row for row in result["processes"])
+
+
+def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
-        if argv[0]=="/usr/bin/systemctl" and "show" in argv: return {"returncode":0,"stdout":"LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=100\nNRestarts=2\nControlGroup=/user.slice/nixer\n","stderr":"","stdout_truncated":False,"stderr_truncated":False}
-        if argv[0]=="/usr/bin/ps": return {"returncode":0,"stdout":f"100 1 {own_uid} S 120 2048 1.0 python\n101 100 {own_uid} S 60 1024 0.2 nix\n200 1 {own_uid} S 10 512 0.0 sleep\n","stderr":"","stdout_truncated":False,"stderr_truncated":False}
-        if argv[0]=="/usr/bin/ss": return {"returncode":0,"stdout":'LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* users:(("python",pid=100,fd=3))\n',"stderr":"","stdout_truncated":False,"stderr_truncated":False}
+        if argv[0] == "/usr/bin/systemctl" and "show" in argv:
+            return {
+                "returncode": 0,
+                "stdout": "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=100\nNRestarts=2\nExecMainStartTimestamp=now\nControlGroup=/user.slice/nixer\n",
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+            }
+        if argv[0] == "/usr/bin/ps":
+            return {
+                "returncode": 0,
+                "stdout": (
+                    f"100 1 {own_uid} S 120 2048 1.0 0::/user.slice/nixer python\n"
+                    f"101 100 {own_uid} S 60 1024 0.2 0::/user.slice/nixer/child nix\n"
+                    f"102 100 {own_uid} S 60 1024 0.2 0::/user.slice/other stray\n"
+                ),
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+            }
+        if argv[0] == "/usr/bin/ss":
+            return {
+                "returncode": 0,
+                "stdout": 'LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* users:(("python",pid=100,fd=3))\n',
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+            }
         raise AssertionError(argv)
-    monkeypatch.setattr(server,"_run",fake_run); runtime=server.service_runtime("nixer-mcp.service")
-    assert runtime["main_pid"]==100; assert [row["pid"] for row in runtime["processes"]]==[100,101]; assert "127.0.0.1:18187" in runtime["listeners"][0]; assert runtime["complete"] is True
+    monkeypatch.setattr(server, "_run", fake_run)
+    runtime = server.service_runtime("nixer-mcp.service")
+    assert runtime["main_pid"] == 100
+    assert [row["pid"] for row in runtime["processes"]] == [100, 101]
+    assert "127.0.0.1:18187" in runtime["listeners"][0]
+    assert runtime["complete"] is True
 
 
-def test_supervise_work_confirms_explicit_claim_without_persisting(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server,"git_status",lambda repo:{"repo":repo,"head":{"returncode":0,"stdout":"abc123\n"},"status":{"returncode":0,"stdout":"## feature\n"},"observed_at":"fixture"})
-    result=server.supervise_work(binding_kind="grabowski_lane",binding_id="lane:fixture",repo="/home/alex/repos/nixer",claimed_head="abc123",expect_clean=True)
-    assert result["conclusion"]=="confirmed"; assert result["work_state_authority"] is False; assert result["persisted"] is False
+def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    own_uid = server.os.getuid()
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/systemctl":
+            return {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\nControlGroup=/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        if argv[0] == "/usr/bin/ps":
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 0::/cg python\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
+        if argv[0] == "/usr/bin/ss":
+            return {"returncode": 0, "stdout": "", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
+        raise AssertionError(argv)
+    monkeypatch.setattr(server, "_run", fake_run)
+    runtime = server.service_runtime("nixer-mcp.service")
+    assert runtime["complete"] is False
+    assert "process_tree" in runtime["missing_evidence"]
+    assert "listeners" in runtime["missing_evidence"]
 
 
-def test_supervise_work_preserves_stale_remote_head(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server,"git_status",lambda repo:{"repo":repo,"head":{"returncode":0,"stdout":"newhead\n"},"status":{"returncode":0,"stdout":"## feature\n"},"observed_at":"fixture"})
-    monkeypatch.setattr(server,"github_pr",lambda repo,pr:{"metadata":{"returncode":0,"stdout":json.dumps({"headRefOid":"oldhead","baseRefOid":"basehead"})},"reviews":{"returncode":0,"stdout":"[]"}})
-    result=server.supervise_work(binding_kind="pr",binding_id="heimgewebe/nixer#1",repo="/home/alex/repos/nixer",claimed_head="newhead",github_repo="heimgewebe/nixer",pr=1)
-    assert result["conclusion"]=="stale"; assert result["stale_evidence"]
+def test_supervise_work_keeps_unverified_lane_top_level_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture())
+    result = server.supervise_work(
+        binding_kind="grabowski_lane", binding_id="lane:fixture",
+        repo="/home/alex/repos/nixer", claimed_head="abc123", expect_clean=True,
+    )
+    assert result["evidence_conclusion"] == "confirmed"
+    assert result["conclusion"] == "incomplete"
+    assert result["binding"]["verification"] == "unverified"
+    assert "binding_identity" in result["missing_evidence"]
+    assert result["persisted"] is False
+
+
+def test_supervise_work_manual_claim_can_confirm_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture())
+    result = server.supervise_work(
+        binding_kind="manual", binding_id="manual:fixture",
+        repo="/home/alex/repos/nixer", claimed_head="abc123", expect_clean=True,
+    )
+    assert result["conclusion"] == "confirmed"
+    assert result["binding"]["verification"] == "not_applicable"
+
+
+def test_supervise_work_truncated_git_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = _complete_git_fixture()
+    fixture["observation_complete"] = False
+    fixture["status"]["stdout_truncated"] = True
+    monkeypatch.setattr(server, "git_status", lambda repo: fixture)
+    result = server.supervise_work(
+        binding_kind="manual", binding_id="manual:fixture",
+        repo="/home/alex/repos/nixer", claimed_head="abc123", expect_clean=True,
+    )
+    assert result["conclusion"] == "incomplete"
+    assert result["dimensions"]["cleanliness"]["status"] == "incomplete"
+
+
+def test_supervise_work_missing_active_state_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture())
+    monkeypatch.setattr(server, "service_runtime", lambda unit: {
+        "service": {}, "main_pid": 0, "control_group": None, "processes": [],
+        "listeners": [], "missing_evidence": ["systemd_status"], "complete": False,
+    })
+    result = server.supervise_work(
+        binding_kind="manual", binding_id="manual:fixture", repo="/home/alex/repos/nixer",
+        claimed_head="abc123", unit="nixer-mcp.service", expect_service_active=True,
+    )
+    assert result["conclusion"] == "incomplete"
+    assert result["dimensions"]["runtime_active"]["status"] == "incomplete"
+    assert not result["contradictions"]
+
+
+def test_supervise_work_pr_head_mismatch_is_contradicted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture("newhead"))
+    monkeypatch.setattr(server, "github_pr", lambda repo, pr: {
+        "metadata": {"returncode": 0, "stdout": json.dumps({"number": 1, "headRefOid": "oldhead", "baseRefOid": "basehead"}), "stdout_truncated": False},
+        "reviews": {"returncode": 0, "stdout": "[]"},
+    })
+    result = server.supervise_work(
+        binding_kind="pr", binding_id="heimgewebe/nixer#1", repo="/home/alex/repos/nixer",
+        claimed_head="newhead", github_repo="heimgewebe/nixer", pr=1,
+    )
+    assert result["conclusion"] == "contradicted"
+    assert result["dimensions"]["github_pr_head"]["status"] == "contradicted"
+
+
+def test_supervise_work_missing_pr_head_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture("newhead"))
+    monkeypatch.setattr(server, "github_pr", lambda repo, pr: {
+        "metadata": {"returncode": 0, "stdout": json.dumps({"number": 1, "baseRefOid": "basehead"}), "stdout_truncated": False},
+        "reviews": {"returncode": 0, "stdout": "[]"},
+    })
+    result = server.supervise_work(
+        binding_kind="pr", binding_id="heimgewebe/nixer#1", repo="/home/alex/repos/nixer",
+        claimed_head="newhead", github_repo="heimgewebe/nixer", pr=1,
+    )
+    assert result["conclusion"] == "incomplete"
+    assert "github_pr_head" in result["missing_evidence"]
 
 
 def test_enriched_advice_stays_append_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    state=tmp_path/"state"; findings=state/"findings"; monkeypatch.setattr(server,"STATE_ROOT",state); monkeypatch.setattr(server,"FINDINGS_ROOT",findings)
-    result=server.submit_finding(subject_kind="work",subject="lane:fixture",severity="medium",status="advice",summary="Exact-head evidence is stale.",evidence_refs=["fixture:head"],target_actor="grabowski",binding="lane:fixture",recommendation="Recheck the current head before closeout.",rationale="The reviewed head differs from the current head.",confidence=0.95)
-    payload=json.loads(next(findings.glob("*.json")).read_text(encoding="utf-8")); assert result["automatic_effect"] is False; assert payload["schema_version"]==3; assert payload["status"]=="advice"; assert payload["target_actor"]=="grabowski"; assert payload["confidence"]==0.95
+    state = tmp_path / "state"
+    findings = state / "findings"
+    monkeypatch.setattr(server, "STATE_ROOT", state)
+    monkeypatch.setattr(server, "FINDINGS_ROOT", findings)
+    result = server.submit_finding(
+        subject_kind="work", subject="lane:fixture", severity="medium", status="advice",
+        summary="Exact-head evidence is stale.", evidence_refs=["fixture:head"],
+        target_actor="grabowski", binding="lane:fixture",
+        recommendation="Recheck the current head before closeout.",
+        rationale="The reviewed head differs from the current head.", confidence=0.95,
+    )
+    payload = json.loads(next(findings.glob("*.json")).read_text(encoding="utf-8"))
+    assert result["automatic_effect"] is False
+    assert payload["schema_version"] == 3
+    assert payload["status"] == "advice"
+    assert payload["target_actor"] == "grabowski"
+    assert payload["confidence"] == 0.95
 
 
-def test_status_cleanliness_counts_untracked() -> None:
+def test_relational_advice_keeps_schema_v2_compatibility(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setattr(server, "STATE_ROOT", state)
+    monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
+    server.submit_finding(
+        subject_kind="work", subject="lane:fixture", severity="medium", status="advice",
+        summary="Relational advice.", evidence_refs=["fixture:head"],
+        checkpoint_mode="relational", checkpoint_components=[
+            {"name": "local_head", "value": "head-a"},
+            {"name": "runtime_main_pid", "value": "100"},
+        ], recommendation="Recheck both components.",
+    )
+    payload = json.loads(next((state / "findings").glob("*.json")).read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["checkpoint_mode"] == "relational"
+    assert payload["recommendation"] == "Recheck both components."
+
+
+def test_git_status_hides_untracked_filenames_and_tracks_completeness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(server, "_resolve_repo", lambda repo: tmp_path)
+    def fake_run(argv, **kwargs):
+        if "status" in argv:
+            return {"returncode": 0, "stdout": "## feature\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        if "ls-files" in argv:
+            return {"returncode": 0, "stdout": "private-name.txt\0", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        if "rev-parse" in argv:
+            return {"returncode": 0, "stdout": "abc123\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        raise AssertionError(argv)
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.git_status("fixture")
+    assert result["untracked_present"] is True
+    assert result["observation_complete"] is True
+    assert "private-name.txt" not in json.dumps(result)
+
+
+def test_status_cleanliness_requires_observed_branch_line() -> None:
     assert server._status_is_clean("## feature\n") is True
-    assert server._status_is_clean("## feature\n?? scratch.txt\n") is False
+    assert server._status_is_clean("") is False
+    assert server._status_is_clean("## feature\n M server.py\n") is False
 
 
-def test_process_snapshot_excludes_other_uid(monkeypatch: pytest.MonkeyPatch) -> None:
-    own_uid = server.os.getuid()
-    other_uid = own_uid + 1
-    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: {
-        "returncode": 0,
-        "stdout": f"100 1 {other_uid} S 10 512 0.0 foreign foreign-process\n",
-        "stderr": "",
-        "stdout_truncated": False,
-        "stderr_truncated": False,
-    })
-    result = server.process_snapshot(100)
-    assert result["scope"] == "current_uid"
-    assert result["processes"] == []
-    assert result["complete"] is False
-
-
-def test_process_snapshot_does_not_expose_argv(monkeypatch: pytest.MonkeyPatch) -> None:
-    own_uid = server.os.getuid()
-    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: {
-        "returncode": 0,
-        "stdout": f"100 1 {own_uid} S 10 512 0.0 python\n",
-        "stderr": "",
-        "stdout_truncated": False,
-        "stderr_truncated": False,
-    })
-    result = server.process_snapshot(100)
-    assert result["processes"][0]["comm"] == "python"
-    assert "args" not in result["processes"][0]
+def test_finding_v3_redacts_new_advisory_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setattr(server, "STATE_ROOT", state)
+    monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
+    secret = "token=opaque-sensitive-value"
+    server.submit_finding(
+        subject_kind="work", subject=f"work {secret}", severity="low", status="advice",
+        summary=f"summary {secret}", evidence_refs=[f"evidence:{secret}"],
+        recommendation=f"recommend {secret}",
+    )
+    payload = json.loads(next((state / "findings").glob("*.json")).read_text(encoding="utf-8"))
+    encoded = json.dumps(payload)
+    assert "opaque-sensitive-value" not in encoded
+    assert "<REDACTED>" in encoded

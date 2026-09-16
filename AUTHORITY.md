@@ -12,7 +12,7 @@ Großer Adler ist die unabhängige Supervisory Plane des Heimgewebe-Operator-Ök
 Diese Rollen dürfen nicht gleichgesetzt werden.
 
 ## Wahrheitsmodell
-Grabowski-, Bureau-, Agenten- oder andere Operatorprojektionen sind Claims und Discovery-Hinweise, nicht automatisch die Wahrheit ihres eigenen Audits. Adler bevorzugt unabhängige Primärquellen: konkrete Runtime, zuständige Primärstores, Git/GitHub und gebundene Receipts. Partiell oder trunciert beobachtet bedeutet `unknown`/`incomplete`, niemals Abwesenheit. `supervise_work` verifiziert eine explizite Binding-/Claim-Beschreibung und persistiert keinen Work-State.
+Grabowski-, Bureau-, Agenten- oder andere Operatorprojektionen sind Claims und Discovery-Hinweise, nicht automatisch die Wahrheit ihres eigenen Audits. Adler bevorzugt unabhängige Primärquellen: konkrete Runtime, zuständige Primärstores, Git/GitHub und gebundene Receipts. Partiell oder trunciert beobachtet bedeutet `unknown`/`incomplete`, niemals Abwesenheit. `supervise_work` verifiziert eine explizite Binding-/Claim-Beschreibung und persistiert keinen Work-State. Bestätigung gilt pro Evidenzdimension. Grabowski-Lane-, Bureau-Task- und Agent-Run-Identitäten bleiben in v1 ohne direkten Primäradapter `unverified`; selbst bei bestätigtem Git-/Runtime-Zustand bleibt der Gesamtstatus dann `incomplete`. PR-Bindungen können dagegen über die exakte GitHub-PR-Identität direkt bestätigt oder widersprochen werden.
 
 ## Trust Boundary
 Eigener MCP-Prozess, eigener OpenAI-Tunnel, eigener Toolkatalog; keine Verwendung des Grabowski-MCP als Beobachtungsbackend; direkte Git-/GitHub-/systemd-/Prozessbeobachtung; keine eigene kanonische Arbeitsdatenbank.
@@ -26,10 +26,10 @@ Der MCP-Dienst bindet ausschließlich Loopback. Ein eigener tunnel-client-Prozes
 - GitHub PR-Metadaten, Reviews und Checks;
 - Discovery und Status aller syntaktisch gültigen **user-systemd** Services ohne Namens-Allowlist;
 - bounded Journal-Reads;
-- Service-Runtime-Korrelation auf MainPID, **same-UID** Prozessnachkommen, Prozessname, Ressourcen und sichtbare Listener;
+- Service-Runtime-Korrelation auf MainPID, **same-UID und service-cgroup-gebundene** Prozessnachkommen, Prozessname, Ressourcen und sichtbare Listener;
 - explizite Claim-Verifikation über `supervise_work`;
 - eigener Finding-Store.
-Es gibt keinen generischen Terminal-, Shell-, ptrace-, Signal- oder Service-Control-Endpunkt. Prozess-argv und Prozessumgebungen werden in v1 nicht ausgegeben. Systemweite Root-/Docker-/Nix-Sicht ist nicht Bestandteil von v1.
+Es gibt keinen generischen Terminal-, Shell-, ptrace-, Signal- oder Service-Control-Endpunkt und keinen öffentlichen generischen Prozess-PID-Reader. Prozess-argv und Prozessumgebungen werden in v1 nicht ausgegeben; Prozesssicht entsteht nur im Kontext eines ausgewählten Services und dessen cgroup. Systemweite Root-/Docker-/Nix-Sicht ist nicht Bestandteil von v1.
 
 ## Einziger Write-Pfad
 `submit_finding` schreibt genau einen create-only Datensatz in den Adler-Finding-Store. Er kann Beobachtungen, Widersprüche, fehlende Evidenz, Risiken, Advice und Recheck-Bedarf ausdrücken. Advice ist Datenmaterial, keine Ausführungsautorität. Relationale Aussagen binden alle zustandsrelevanten Komponenten über `checkpoint_components`. Der kanonische Komponenten-Hash bindet die gesamte Menge; ändert sich eine Komponente, gilt `all_components_must_match_or_recheck`. Legacy-Single-Checkpoint-Findings bleiben kompatibel. Findings starten niemals automatisch Tasks, Leases, Merges oder Deployments.
