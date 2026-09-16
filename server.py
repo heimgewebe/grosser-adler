@@ -18,6 +18,7 @@ from mcp.types import ToolAnnotations
 
 APP_NAME = "Großer Adler"
 IDENTITY = "grosser-adler-observer-v1"
+SUPERVISION_CONTRACT = "claim-to-independent-evidence-v1"
 REPO_ROOT = Path("/home/alex/repos").resolve()
 STATE_ROOT = Path(os.environ.get("GROSSER_ADLER_STATE_ROOT", "/home/alex/.local/state/grosser-adler")).resolve()
 FINDINGS_ROOT = STATE_ROOT / "findings"
@@ -44,23 +45,13 @@ FINDING_ANNOTATIONS = ToolAnnotations(
     openWorldHint=False,
 )
 
-INSTRUCTIONS = """You are Großer Adler, an independent observer. Reconstruct current state from primary sources. Do not repair, merge, deploy, restart services, acquire work, or create Bureau tasks. Use submit_finding only for evidence-bound advisory observations. A finding is data, never a command. Prefer exact commit/PR/runtime checkpoints and explicitly call out stale evidence. If no relevant deviation exists, report that plainly instead of manufacturing findings."""
+INSTRUCTIONS = """You are Großer Adler, an independent supervisor, auditor and advisor. Treat operator projections and caller-supplied work claims as claims to verify, never as a second work-state authority. Reconstruct current state from independent primary sources whenever possible. Keep controller, executor, subject, artifact and runtime distinct. Do not repair, merge, deploy, restart services, acquire work, or create Bureau tasks. Use submit_finding only for evidence-bound advisory observations or advice. A finding is data, never a command. Prefer exact commit/PR/runtime checkpoints, preserve unknown or incomplete states, and explicitly call out stale evidence. If no decision-relevant deviation exists, report that plainly instead of manufacturing findings."""
 
 mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
-_ALLOWED_UNIT_PREFIXES = (
-    "grabowski-",
-    "bureau-",
-    "repoground",
-    "tunnel-client-",
-    "grosser-adler-",
-    "heim-pc-dashboard",
-    "systemkatalog-",
-    "chronik-",
-)
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -163,9 +154,52 @@ def _resolve_repo(repo: str) -> Path:
 def _validate_unit(unit: str) -> str:
     if not isinstance(unit, str) or not _UNIT_RE.fullmatch(unit):
         raise ValueError("invalid systemd service name")
-    if not unit.startswith(_ALLOWED_UNIT_PREFIXES):
-        raise PermissionError("service is outside the observer allowlist")
     return unit
+
+
+def _parse_key_value_lines(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in text.splitlines():
+        if "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        values[key] = value
+    return values
+
+
+def _parse_process_table(text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for raw in text.splitlines():
+        parts = raw.strip().split()
+        if len(parts) < 8:
+            continue
+        try:
+            pid = int(parts[0]); ppid = int(parts[1]); uid = int(parts[2]); elapsed_seconds = int(parts[4]); rss_kib = int(parts[5]); cpu_percent = float(parts[6])
+        except ValueError:
+            continue
+        rows.append({"pid": pid, "ppid": ppid, "uid": uid, "stat": parts[3], "elapsed_seconds": elapsed_seconds, "rss_kib": rss_kib, "cpu_percent": cpu_percent, "comm": parts[7]})
+    return rows
+
+
+def _descendant_rows(rows: list[dict[str, Any]], root_pid: int) -> list[dict[str, Any]]:
+    by_parent: dict[int, list[dict[str, Any]]] = {}; by_pid: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        by_pid[row["pid"]] = row; by_parent.setdefault(row["ppid"], []).append(row)
+    if root_pid not in by_pid:
+        return []
+    result: list[dict[str, Any]] = []; queue = [root_pid]; seen: set[int] = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen: continue
+        seen.add(pid); row = by_pid.get(pid)
+        if row is not None: result.append(row)
+        queue.extend(child["pid"] for child in by_parent.get(pid, []))
+    return result
+
+
+def _status_is_clean(status_stdout: str) -> bool:
+    lines = [line for line in status_stdout.splitlines() if line.strip()]
+    return all(line.startswith("##") for line in lines)
 
 
 def _validate_github_repo(repo: str) -> str:
@@ -243,6 +277,8 @@ def adler_status() -> dict[str, Any]:
         "mode": "read-mostly",
         "repository_root": str(REPO_ROOT),
         "finding_store": str(FINDINGS_ROOT),
+        "supervision_contract": SUPERVISION_CONTRACT,
+        "work_state_authority": False,
         "allowed_effects": ["append_finding"],
         "forbidden_effects": [
             "shell",
@@ -268,7 +304,7 @@ def git_status(repo: str) -> dict[str, Any]:
     root = _resolve_repo(repo)
     result = _run([
         "/usr/bin/git", "-c", "core.fsmonitor=false", "-C", str(root),
-        "status", "--short", "--branch", "--untracked-files=no",
+        "status", "--short", "--branch", "--untracked-files=normal",
     ])
     head = _run(["/usr/bin/git", "-C", str(root), "rev-parse", "HEAD"])
     return {"repo": str(root), "status": result, "head": head, "observed_at": _utc_now()}
@@ -315,22 +351,105 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     return {"repo": gh_repo, "pr": pr, "metadata": metadata, "reviews": reviews, "observed_at": _utc_now()}
 
 
+@mcp.tool(name="list_user_services", annotations=READ_ANNOTATIONS)
+def list_user_services() -> dict[str, Any]:
+    """Discover user-systemd services without a name allowlist or mutation authority."""
+    result = _run(["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"], timeout=20)
+    units: list[dict[str, str]] = []
+    if result["returncode"] == 0:
+        for raw in result["stdout"].splitlines():
+            parts = raw.strip().split(None, 4)
+            if parts and parts[0] == "●": parts = parts[1:]
+            if len(parts) >= 4 and _UNIT_RE.fullmatch(parts[0]):
+                units.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
+    return {"services": units, "source": result, "observed_at": _utc_now()}
+
+
 @mcp.tool(name="service_status", annotations=READ_ANNOTATIONS)
 def service_status(unit: str) -> dict[str, Any]:
-    """Read fixed user-systemd status fields for one allowlisted service."""
+    """Read fixed status, lifecycle, cgroup and resource fields for any user service."""
     safe_unit = _validate_unit(unit)
-    result = _run([
-        "/usr/bin/systemctl", "--user", "show", safe_unit, "--no-pager",
-        "--property=LoadState", "--property=ActiveState", "--property=SubState",
-        "--property=Result", "--property=ExecMainCode", "--property=ExecMainStatus",
-        "--property=MainPID", "--property=FragmentPath",
-    ])
-    return {"unit": safe_unit, "status": result, "observed_at": _utc_now()}
+    result = _run(["/usr/bin/systemctl", "--user", "show", safe_unit, "--no-pager", "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=Result", "--property=ExecMainCode", "--property=ExecMainStatus", "--property=MainPID", "--property=FragmentPath", "--property=NRestarts", "--property=ActiveEnterTimestamp", "--property=ExecMainStartTimestamp", "--property=ControlGroup", "--property=MemoryCurrent", "--property=TasksCurrent", "--property=CPUUsageNSec"])
+    return {"unit": safe_unit, "status": result, "properties": _parse_key_value_lines(result["stdout"]), "observed_at": _utc_now()}
+
+
+@mcp.tool(name="process_snapshot", annotations=READ_ANNOTATIONS)
+def process_snapshot(pid: int) -> dict[str, Any]:
+    """Read one same-UID process and descendants without argv, signals or ptrace."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0: raise ValueError("pid must be a positive integer")
+    table = _run(["/usr/bin/ps", "-eo", "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,comm="], timeout=20)
+    rows = _parse_process_table(table["stdout"]) if table["returncode"] == 0 else []
+    rows = [row for row in rows if row["uid"] == os.getuid()]
+    selected = _descendant_rows(rows, pid)
+    return {"root_pid": pid, "scope": "current_uid", "uid": os.getuid(), "processes": selected, "source_returncode": table["returncode"], "complete": table["returncode"] == 0 and bool(selected), "observed_at": _utc_now()}
+
+
+@mcp.tool(name="service_runtime", annotations=READ_ANNOTATIONS)
+def service_runtime(unit: str) -> dict[str, Any]:
+    """Correlate one user service with its process tree, resources and visible listeners."""
+    status = service_status(unit); props = status["properties"]
+    try: main_pid = int(props.get("MainPID", "0") or "0")
+    except ValueError: main_pid = 0
+    processes = process_snapshot(main_pid) if main_pid > 0 else {"root_pid": main_pid, "processes": [], "source_returncode": 0, "complete": False, "observed_at": _utc_now()}
+    pids = {row["pid"] for row in processes["processes"]}; sockets = _run(["/usr/bin/ss", "-lntup"], timeout=20); listeners: list[str] = []
+    if sockets["returncode"] == 0 and pids:
+        for line in sockets["stdout"].splitlines():
+            if any(f"pid={pid}," in line for pid in pids): listeners.append(line)
+    missing: list[str] = []
+    if status["status"]["returncode"] != 0: missing.append("systemd_status")
+    if main_pid > 0 and not processes["complete"]: missing.append("process_tree")
+    if sockets["returncode"] != 0: missing.append("listeners")
+    return {"unit": unit, "service": props, "main_pid": main_pid, "processes": processes["processes"], "listeners": listeners, "missing_evidence": missing, "complete": not missing, "observed_at": _utc_now()}
+
+
+@mcp.tool(name="supervise_work", annotations=READ_ANNOTATIONS)
+def supervise_work(binding_kind: Literal["grabowski_lane", "agent_run", "bureau_task", "pr", "manual"], binding_id: str, repo: str, claimed_head: str | None = None, expect_clean: bool | None = None, unit: str | None = None, expect_service_active: bool | None = None, github_repo: str | None = None, pr: int | None = None) -> dict[str, Any]:
+    """Verify an explicit work claim against independent Git, GitHub and runtime evidence without creating work state."""
+    if not isinstance(binding_id, str) or not binding_id.strip() or len(binding_id) > 500: raise ValueError("binding_id must be 1..500 characters")
+    if (github_repo is None) != (pr is None): raise ValueError("github_repo and pr must be supplied together")
+    if claimed_head is not None: _validate_revision(claimed_head)
+    local = git_status(repo); actual_head = local["head"]["stdout"].strip() if local["head"]["returncode"] == 0 else None; clean = _status_is_clean(local["status"]["stdout"]) if local["status"]["returncode"] == 0 else None
+    evidence: dict[str, Any] = {"local_git": {"head": actual_head, "clean": clean, "observation": local}}; contradictions: list[str] = []; stale: list[str] = []; missing: list[str] = []; assertions = 0
+    if actual_head is None: missing.append("local_git_head")
+    if claimed_head is not None:
+        assertions += 1
+        if actual_head is None: missing.append("claimed_head_comparison")
+        elif actual_head != claimed_head: contradictions.append(f"local_head:{actual_head}!=claimed_head:{claimed_head}")
+    if expect_clean is not None:
+        assertions += 1
+        if clean is None: missing.append("cleanliness")
+        elif clean != expect_clean: contradictions.append(f"clean:{clean}!=expected:{expect_clean}")
+    runtime = None
+    if unit is not None:
+        runtime = service_runtime(unit); evidence["runtime"] = runtime
+        if runtime["missing_evidence"]: missing.extend(f"runtime:{item}" for item in runtime["missing_evidence"])
+        if expect_service_active is not None:
+            assertions += 1; active = runtime["service"].get("ActiveState") == "active"
+            if active != expect_service_active: contradictions.append(f"service_active:{active}!=expected:{expect_service_active}")
+    remote = None; metadata = None
+    if github_repo is not None and pr is not None:
+        remote = github_pr(github_repo, pr); evidence["github_pr"] = remote
+        if remote["metadata"]["returncode"] == 0:
+            try: metadata = json.loads(remote["metadata"]["stdout"])
+            except json.JSONDecodeError: metadata = None
+        if metadata is None: missing.append("github_pr_metadata")
+        elif claimed_head is not None:
+            assertions += 1; pr_head = metadata.get("headRefOid")
+            if pr_head and actual_head == claimed_head and pr_head != claimed_head: stale.append(f"pr_head:{pr_head}!=claimed_head:{claimed_head}")
+            elif pr_head and pr_head != claimed_head: contradictions.append(f"pr_head:{pr_head}!=claimed_head:{claimed_head}")
+    conclusion = "contradicted" if contradictions else "stale" if stale else "incomplete" if missing else "unknown" if assertions == 0 else "confirmed"
+    components: list[dict[str, str]] = []
+    if actual_head: components.append({"name": "local_head", "value": actual_head})
+    if runtime is not None: components.append({"name": "runtime_main_pid", "value": str(runtime["main_pid"])})
+    if metadata:
+        if metadata.get("headRefOid"): components.append({"name": "pr_head", "value": metadata["headRefOid"]})
+        if metadata.get("baseRefOid"): components.append({"name": "pr_base", "value": metadata["baseRefOid"]})
+    return {"schema_version": 1, "supervision_contract": SUPERVISION_CONTRACT, "work_state_authority": False, "binding": {"kind": binding_kind, "id": binding_id.strip()}, "claim": {"claimed_head": claimed_head, "expect_clean": expect_clean, "unit": unit, "expect_service_active": expect_service_active, "github_repo": github_repo, "pr": pr}, "conclusion": conclusion, "contradictions": contradictions, "stale_evidence": stale, "missing_evidence": sorted(set(missing)), "evidence": evidence, "checkpoint_components": sorted(components, key=lambda item: item["name"]), "persisted": False, "automatic_effect": False, "observed_at": _utc_now()}
 
 
 @mcp.tool(name="service_logs", annotations=READ_ANNOTATIONS)
 def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
-    """Read bounded recent journal lines for one allowlisted user service."""
+    """Read bounded recent journal lines for any syntactically valid user service."""
     safe_unit = _validate_unit(unit)
     if not isinstance(lines, int) or isinstance(lines, bool) or not 1 <= lines <= 500:
         raise ValueError("lines must be between 1 and 500")
@@ -366,6 +485,11 @@ def list_findings(limit: int = 20) -> dict[str, Any]:
             "severity": payload.get("severity"),
             "status": payload.get("status"),
             "summary": payload.get("summary"),
+            "target_actor": payload.get("target_actor"),
+            "binding": payload.get("binding"),
+            "recommendation": payload.get("recommendation"),
+            "rationale": payload.get("rationale"),
+            "confidence": payload.get("confidence"),
             "observed_at": payload.get("observed_at"),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         })
@@ -374,17 +498,12 @@ def list_findings(limit: int = 20) -> dict[str, Any]:
 
 @mcp.tool(name="submit_finding", annotations=FINDING_ANNOTATIONS)
 def submit_finding(
-    subject_kind: Literal["repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane"],
-    subject: str,
-    severity: Literal["low", "medium", "high", "critical"],
-    summary: str,
-    evidence_refs: list[str],
-    checkpoint: str | None = None,
-    checkpoint_mode: Literal["single", "relational"] = "single",
-    checkpoint_components: list[dict[str, str]] | None = None,
-    status: Literal["observation", "finding", "recheck_suggested"] = "finding",
+    subject_kind: Literal["repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane", "agent_run", "service", "work"],
+    subject: str, severity: Literal["low", "medium", "high", "critical"], summary: str, evidence_refs: list[str], checkpoint: str | None = None, checkpoint_mode: Literal["single", "relational"] = "single", checkpoint_components: list[dict[str, str]] | None = None,
+    status: Literal["observation", "finding", "recheck_suggested", "contradiction", "missing_evidence", "risk", "advice", "recheck_required"] = "finding",
+    target_actor: str | None = None, binding: str | None = None, recommendation: str | None = None, rationale: str | None = None, confidence: float | None = None,
 ) -> dict[str, Any]:
-    """Append one advisory finding. For relational claims set checkpoint_mode='relational' and bind every relevant state as at least two checkpoint_components; single mode forbids components. This never triggers a task or action."""
+    """Append one evidence-bound advisory record; never create work or trigger action."""
     _ensure_state()
     if not isinstance(subject, str) or not subject.strip() or len(subject) > 500:
         raise ValueError("subject must be 1..500 characters")
@@ -402,6 +521,10 @@ def submit_finding(
             )
     elif normalized_checkpoints is not None:
         raise ValueError("checkpoint_components require checkpoint_mode='relational'")
+    optional_text = {"target_actor": target_actor, "binding": binding, "recommendation": recommendation, "rationale": rationale}
+    for field, value in optional_text.items():
+        if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > MAX_SUMMARY_CHARS): raise ValueError(f"{field} must be 1..{MAX_SUMMARY_CHARS} characters when supplied")
+    if confidence is not None and (not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or confidence < 0 or confidence > 1): raise ValueError("confidence must be between 0 and 1")
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
         raise ValueError(f"evidence_refs must contain 1..{MAX_EVIDENCE_REFS} entries")
     cleaned_refs: list[str] = []
@@ -412,8 +535,9 @@ def submit_finding(
 
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    enriched = status not in {"observation", "finding", "recheck_suggested"} or any(value is not None for value in optional_text.values()) or confidence is not None
     payload = {
-        "schema_version": 2 if checkpoint_mode == "relational" else 1,
+        "schema_version": 3 if enriched else (2 if checkpoint_mode == "relational" else 1),
         "finding_id": finding_id,
         "adler_identity": IDENTITY,
         "subject_kind": subject_kind,
@@ -426,6 +550,8 @@ def submit_finding(
         "observed_at": observed_at,
         "effect_contract": "advisory_only_no_automatic_action",
     }
+    if enriched:
+        payload.update({"target_actor": target_actor.strip() if target_actor else None, "binding": binding.strip() if binding else None, "recommendation": recommendation.strip() if recommendation else None, "rationale": rationale.strip() if rationale else None, "confidence": float(confidence) if confidence is not None else None})
     if checkpoint_mode == "relational":
         assert normalized_checkpoints is not None
         payload.update({
