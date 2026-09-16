@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -1168,38 +1169,69 @@ def _validate_worktree_inbox_pointer(worktree: Path, lane_id: str) -> Path:
     return expected
 
 
-def _read_secure_state_inbox(dir_fd: int, name: str) -> bytes | None:
+def _read_secure_state_inbox(
+    dir_fd: int, name: str
+) -> tuple[bytes, tuple[int, int]] | None:
     try:
-        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        before = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1:
         raise RuntimeError("unsafe existing external inbox file")
-    if stat.S_IMODE(st.st_mode) & 0o077:
+    if stat.S_IMODE(before.st_mode) & 0o077:
         raise RuntimeError("unsafe external inbox file permissions")
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(name, flags, dir_fd=dir_fd)
     try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError("external inbox changed during open")
         raw = os.read(fd, MAX_OUTPUT_BYTES + 1)
     finally:
         os.close(fd)
     if len(raw) > MAX_OUTPUT_BYTES:
         raise RuntimeError("external inbox is unexpectedly large")
-    return raw
+    return raw, (opened.st_dev, opened.st_ino)
 
 
-def _secure_existing_state_inbox(dir_fd: int, name: str) -> None:
-    raw = _read_secure_state_inbox(dir_fd, name)
-    if raw is None:
-        return
+def _secure_existing_state_inbox(dir_fd: int, name: str) -> tuple[int, int] | None:
+    observed = _read_secure_state_inbox(dir_fd, name)
+    if observed is None:
+        return None
+    raw, identity = observed
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("existing external inbox is not Adler-owned JSON") from exc
     if payload.get("writer_identity") != IDENTITY or payload.get("contract") != SIDECAR_CONTRACT:
         raise RuntimeError("existing external inbox is not Adler-owned")
+    return identity
+
+
+def _rename_exchange(dir_fd: int, left: str, right: str) -> None:
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic inbox exchange is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        dir_fd,
+        os.fsencode(left),
+        dir_fd,
+        os.fsencode(right),
+        2,  # RENAME_EXCHANGE
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), right)
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -1212,12 +1244,13 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _atomic_write_inbox(dir_fd: int, name: str, encoded: bytes) -> None:
-    _secure_existing_state_inbox(dir_fd, name)
+    existing_identity = _secure_existing_state_inbox(dir_fd, name)
     tmp_name = f".{name}.{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+    our_temp_at_tmp = True
     try:
         _write_all(fd, encoded)
         os.fsync(fd)
@@ -1227,20 +1260,57 @@ def _atomic_write_inbox(dir_fd: int, name: str, encoded: bytes) -> None:
     except BaseException:
         try:
             os.unlink(tmp_name, dir_fd=dir_fd)
+            our_temp_at_tmp = False
         finally:
             os.close(fd)
         raise
     else:
         os.close(fd)
+
     try:
-        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-    except BaseException:
-        try:
+        if existing_identity is None:
+            os.link(
+                tmp_name,
+                name,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+                follow_symlinks=False,
+            )
+            os.fsync(dir_fd)
             os.unlink(tmp_name, dir_fd=dir_fd)
-        except FileNotFoundError:
-            pass
-        raise
-    os.fsync(dir_fd)
+            our_temp_at_tmp = False
+            os.fsync(dir_fd)
+            return
+
+        _rename_exchange(dir_fd, tmp_name, name)
+        our_temp_at_tmp = False
+        try:
+            displaced = os.stat(tmp_name, dir_fd=dir_fd, follow_symlinks=False)
+            secure_displaced = (
+                stat.S_ISREG(displaced.st_mode)
+                and displaced.st_uid == os.getuid()
+                and displaced.st_nlink == 1
+                and not (stat.S_IMODE(displaced.st_mode) & 0o077)
+            )
+            if (displaced.st_dev, displaced.st_ino) != existing_identity or not secure_displaced:
+                raise RuntimeError("external inbox changed before atomic publication")
+        except BaseException:
+            try:
+                _rename_exchange(dir_fd, tmp_name, name)
+                our_temp_at_tmp = True
+            except BaseException as rollback_exc:
+                raise RuntimeError("external inbox changed and atomic rollback failed") from rollback_exc
+            raise
+
+        os.fsync(dir_fd)
+        os.unlink(tmp_name, dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    finally:
+        if our_temp_at_tmp:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
 
 
 def _publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
