@@ -351,7 +351,7 @@ def adler_status() -> dict[str, Any]:
         "finding_store": str(FINDINGS_ROOT),
         "inbox_store": str(INBOX_ROOT),
         "work_lane_store": str(GRABOWSKI_WORK_LANES_ROOT),
-        "worktree_observation_root": str(WORKTREE_ROOT),
+        "worktree_delivery_root": str(WORKTREE_ROOT),
         "work_state_authority": False,
         "allowed_effects": ["append_finding", "publish_worktree_inbox"],
         "forbidden_effects": [
@@ -1379,7 +1379,15 @@ def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
                 raise RuntimeError("unsafe finding temporary file")
         finally:
             os.close(fd)
-        os.rename(tmp_name, target_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.link(
+            tmp_name,
+            target_name,
+            src_dir_fd=dir_fd,
+            dst_dir_fd=dir_fd,
+            follow_symlinks=False,
+        )
+        os.fsync(dir_fd)
+        os.unlink(tmp_name, dir_fd=dir_fd)
         tmp_created = False
         os.fsync(dir_fd)
     finally:
