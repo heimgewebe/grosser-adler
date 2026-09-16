@@ -7,7 +7,7 @@
 | PR-HEAD / Base / CI / Reviews | GitHub | `github_pr` | primär für GitHub |
 | User-Servicezustand | user-systemd | `service_status` | primär für Servicezustand |
 | Service-Prozessbaum | Prozesssicht + systemd MainPID/ControlGroup | `service_runtime` | aktuelle same-UID, cgroup-gebundene Hostbeobachtung |
-| sichtbare Listener | `ss` | `service_runtime` | bounded; fehlende Rechte => incomplete |
+| sichtbare Listener | `ss` mit cgroup-Metadaten | `service_runtime` | cgroup-korreliert; fehlende/truncierte Attribution => incomplete |
 | Grabowski Work/Lane | Grabowski Stores/Projektionen | caller claim in v1 | Claim/Discovery, nicht Adler-Autorität |
 | Bureau Task/Run | Bureau StateStore | caller claim in v1 | Claim bis direkter Adapter nötig/belegt |
 | Agent Run | Agent/Workspace-Store | caller claim in v1 | Claim bis direkter Adapter nötig/belegt |

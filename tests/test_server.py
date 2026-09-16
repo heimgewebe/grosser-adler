@@ -274,21 +274,39 @@ def test_process_descendants_are_bounded_to_requested_root() -> None:
 def test_process_reader_is_internal_and_cgroup_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not hasattr(server, "process_snapshot")
     own_uid = server.os.getuid()
-    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: {
-        "returncode": 0,
-        "stdout": (
-            f"100 1 {own_uid} S 10 512 0.0 0::/user.slice/nixer python\n"
-            f"101 100 {own_uid} S 8 256 0.0 0::/user.slice/nixer/child nix\n"
-            f"102 100 {own_uid} S 8 256 0.0 0::/user.slice/other stray\n"
-        ),
-        "stderr": "",
-        "stdout_truncated": False,
-        "stderr_truncated": False,
-    })
+
+    def fake_run(argv, **kwargs):
+        assert argv[:3] == ["/usr/bin/ps", "-ww", "-eo"]
+        assert argv[3].endswith("comm=,cgroup=")
+        return {
+            "returncode": 0,
+            "stdout": (
+                f"100 1 {own_uid} S 10 512 0.0 python 0::/user.slice/nixer\n"
+                f"101 100 {own_uid} S 8 256 0.0 nix 0::/user.slice/nixer/child\n"
+                f"102 100 {own_uid} S 8 256 0.0 stray 0::/user.slice/other\n"
+            ),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+    monkeypatch.setattr(server, "_run", fake_run)
     result = server._process_snapshot(100, "/user.slice/nixer")
     assert result["complete"] is True
     assert [row["pid"] for row in result["processes"]] == [100, 101]
     assert all("args" not in row for row in result["processes"])
+
+
+def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    observations = [
+        {"returncode": 0, "stdout": "nixer-mcp.service loaded active running Nixer\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False},
+        {"returncode": 1, "stdout": "", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False},
+    ]
+    for observation in observations:
+        monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
+        result = server.list_user_services()
+        assert result["observation_complete"] is False
+        assert result["services"] == []
 
 
 def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -304,16 +322,16 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
             return {
                 "returncode": 0,
                 "stdout": (
-                    f"100 1 {own_uid} S 120 2048 1.0 0::/user.slice/nixer python\n"
-                    f"101 100 {own_uid} S 60 1024 0.2 0::/user.slice/nixer/child nix\n"
-                    f"102 100 {own_uid} S 60 1024 0.2 0::/user.slice/other stray\n"
+                    f"100 1 {own_uid} S 120 2048 1.0 python 0::/user.slice/nixer\n"
+                    f"101 100 {own_uid} S 60 1024 0.2 nix 0::/user.slice/nixer/child\n"
+                    f"102 100 {own_uid} S 60 1024 0.2 stray 0::/user.slice/other\n"
                 ),
                 "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
             }
         if argv[0] == "/usr/bin/ss":
             return {
                 "returncode": 0,
-                "stdout": 'LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* users:(("python",pid=100,fd=3))\n',
+                "stdout": f'tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/user.slice/nixer <->\n',
                 "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
             }
         raise AssertionError(argv)
@@ -322,7 +340,26 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
     assert runtime["main_pid"] == 100
     assert [row["pid"] for row in runtime["processes"]] == [100, 101]
     assert "127.0.0.1:18187" in runtime["listeners"][0]
+    assert runtime["listener_observation_complete"] is True
     assert runtime["complete"] is True
+
+
+def test_service_runtime_marks_successful_unattributed_socket_source_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    own_uid = server.os.getuid()
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/systemctl":
+            return {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\nControlGroup=/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        if argv[0] == "/usr/bin/ps":
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        if argv[0] == "/usr/bin/ss":
+            return {"returncode": 0, "stdout": "tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:*\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        raise AssertionError(argv)
+    monkeypatch.setattr(server, "_run", fake_run)
+    runtime = server.service_runtime("nixer-mcp.service")
+    assert runtime["listener_observation_complete"] is False
+    assert runtime["complete"] is False
+    assert runtime["listeners"] == []
+    assert "listeners" in runtime["missing_evidence"]
 
 
 def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -331,7 +368,7 @@ def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(mo
         if argv[0] == "/usr/bin/systemctl":
             return {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\nControlGroup=/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ps":
-            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 0::/cg python\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
             return {"returncode": 0, "stdout": "", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
         raise AssertionError(argv)
@@ -363,6 +400,7 @@ def test_supervise_work_manual_claim_can_confirm_evidence(monkeypatch: pytest.Mo
     )
     assert result["conclusion"] == "confirmed"
     assert result["binding"]["verification"] == "not_applicable"
+    assert "stale_evidence" not in result
 
 
 def test_supervise_work_truncated_git_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -441,7 +479,7 @@ def test_enriched_advice_stays_append_only(tmp_path: Path, monkeypatch: pytest.M
     assert payload["confidence"] == 0.95
 
 
-def test_relational_advice_keeps_schema_v2_compatibility(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_relational_enriched_advice_uses_schema_v3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = tmp_path / "state"
     monkeypatch.setattr(server, "STATE_ROOT", state)
     monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
@@ -454,7 +492,7 @@ def test_relational_advice_keeps_schema_v2_compatibility(tmp_path: Path, monkeyp
         ], recommendation="Recheck both components.",
     )
     payload = json.loads(next((state / "findings").glob("*.json")).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["checkpoint_mode"] == "relational"
     assert payload["recommendation"] == "Recheck both components."
 

@@ -40,7 +40,7 @@ Kein File-Writer außerhalb des Finding-Stores, kein Commit/Push/Merge, keine Gi
 ## Supervisor-Ablauf
 1. Eine bestehende Authority oder der Aufrufer liefert eine starke Binding-Identität und eine konkrete Behauptung.
 2. Adler liest unabhängige Primärquellen.
-3. Adler antwortet `confirmed`, `contradicted`, `stale`, `incomplete` oder `unknown`.
+3. Adler antwortet in `supervise_work` `confirmed`, `contradicted`, `incomplete` oder `unknown`; Staleness wird nur dort behauptet, wo eine Quelle sie eigenständig belegt.
 4. Nur eine entscheidungsrelevante Abweichung rechtfertigt ein Finding/Advice.
 5. Der zuständige Controller entscheidet über jede Aktion.
 

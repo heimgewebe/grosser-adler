@@ -190,8 +190,8 @@ def _parse_process_table(text: str) -> list[dict[str, Any]]:
             "elapsed_seconds": elapsed_seconds,
             "rss_kib": rss_kib,
             "cpu_percent": cpu_percent,
-            "cgroup": _normalize_cgroup(parts[7]),
-            "comm": parts[8],
+            "cgroup": _normalize_cgroup(parts[8]),
+            "comm": parts[7],
         })
     return rows
 
@@ -405,14 +405,20 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
 def list_user_services() -> dict[str, Any]:
     """Discover user-systemd services without a name allowlist or mutation authority."""
     result = _run(["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"], timeout=20)
+    observation_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     units: list[dict[str, str]] = []
-    if result["returncode"] == 0:
+    if observation_complete:
         for raw in result["stdout"].splitlines():
             parts = raw.strip().split(None, 4)
             if parts and parts[0] == "●": parts = parts[1:]
             if len(parts) >= 4 and _UNIT_RE.fullmatch(parts[0]):
                 units.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
-    return {"services": units, "source": result, "observed_at": _utc_now()}
+    return {
+        "services": units,
+        "observation_complete": observation_complete,
+        "source": result,
+        "observed_at": _utc_now(),
+    }
 
 
 @mcp.tool(name="service_status", annotations=READ_ANNOTATIONS)
@@ -430,8 +436,8 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
     if not isinstance(control_group, str) or not control_group.strip():
         raise ValueError("control_group must be non-empty")
     table = _run([
-        "/usr/bin/ps", "-eo",
-        "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,cgroup=,comm=",
+        "/usr/bin/ps", "-ww", "-eo",
+        "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,comm=,cgroup=",
     ], timeout=20)
     source_complete = table["returncode"] == 0 and not table["stdout_truncated"]
     rows = _parse_process_table(table["stdout"]) if source_complete else []
@@ -494,15 +500,26 @@ def service_runtime(unit: str) -> dict[str, Any]:
         if not process_observation["complete"]:
             missing.append("process_tree")
 
-    pids = {row["pid"] for row in process_observation.get("processes", [])}
-    sockets = _run(["/usr/bin/ss", "-lntup"], timeout=20)
-    sockets_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
+    sockets = _run(["/usr/bin/ss", "-H", "-lntupe"], timeout=20)
+    socket_lines = [line for line in sockets["stdout"].splitlines() if line.strip()]
+    sockets_source_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
+    socket_cgroups: list[tuple[str, str]] = []
+    listener_observation_complete = sockets_source_complete
+    if sockets_source_complete:
+        for line in socket_lines:
+            match = re.search(r"(?:^|\s)cgroup:(\S+)", line)
+            if match is None:
+                listener_observation_complete = False
+                break
+            socket_cgroups.append((line, match.group(1)))
+
     listeners: list[str] = []
-    if sockets_complete and pids:
-        for line in sockets["stdout"].splitlines():
-            if any(f"pid={pid}," in line for pid in pids):
-                listeners.append(line)
-    if not sockets_complete:
+    if listener_observation_complete and control_group:
+        listeners = [
+            line for line, socket_cgroup in socket_cgroups
+            if _cgroup_within(socket_cgroup, control_group)
+        ]
+    if not listener_observation_complete:
         missing.append("listeners")
 
     return {
@@ -512,6 +529,7 @@ def service_runtime(unit: str) -> dict[str, Any]:
         "control_group": _normalize_cgroup(control_group) if control_group else None,
         "processes": process_observation.get("processes", []),
         "listeners": listeners,
+        "listener_observation_complete": listener_observation_complete,
         "missing_evidence": sorted(set(missing)),
         "complete": not missing,
         "observed_at": _utc_now(),
@@ -541,7 +559,6 @@ def supervise_work(
     dimensions: dict[str, dict[str, Any]] = {}
     contradictions: list[str] = []
     missing: list[str] = []
-    stale: list[str] = []
 
     local = git_status(repo)
     evidence: dict[str, Any] = {"local_git": local}
@@ -673,8 +690,6 @@ def supervise_work(
 
     if contradictions:
         conclusion = "contradicted"
-    elif stale:
-        conclusion = "stale"
     elif binding_status in {"unverified", "incomplete"} or missing:
         conclusion = "incomplete"
     elif evidence_conclusion == "confirmed" and binding_status in {"confirmed", "not_applicable"}:
@@ -716,7 +731,6 @@ def supervise_work(
         "evidence_conclusion": evidence_conclusion,
         "dimensions": dimensions,
         "contradictions": contradictions,
-        "stale_evidence": stale,
         "missing_evidence": sorted(set(missing)),
         "evidence": evidence,
         "checkpoint_components": sorted(components, key=lambda item: item["name"]),
@@ -826,7 +840,7 @@ def submit_finding(
         or confidence is not None
     )
     payload = {
-        "schema_version": 2 if checkpoint_mode == "relational" else (3 if enriched else 1),
+        "schema_version": 3 if enriched else (2 if checkpoint_mode == "relational" else 1),
         "finding_id": finding_id,
         "adler_identity": IDENTITY,
         "subject_kind": subject_kind,
