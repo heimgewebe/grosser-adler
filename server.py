@@ -958,7 +958,14 @@ def _atomic_write_inbox(dir_fd: int, encoded: bytes) -> None:
         raise
     else:
         os.close(fd)
-    os.replace(tmp_name, "inbox.json", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    try:
+        os.replace(tmp_name, "inbox.json", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        raise
     os.fsync(dir_fd)
 
 
