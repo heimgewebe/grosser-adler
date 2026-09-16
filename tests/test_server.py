@@ -16,6 +16,7 @@ def test_status_declares_read_mostly_boundary() -> None:
     assert status["allowed_effects"] == ["append_finding"]
     assert "file_write" in status["forbidden_effects"]
     assert "bureau_mutation" in status["forbidden_effects"]
+    assert "agent_start" in status["forbidden_effects"]
 
 
 def test_repo_path_escape_is_rejected(tmp_path: Path) -> None:
@@ -35,6 +36,8 @@ def test_service_validation_is_syntax_bound_not_name_allowlisted() -> None:
 def test_bad_revision_is_rejected() -> None:
     with pytest.raises(ValueError):
         server._validate_revision("HEAD;touch /tmp/nope")
+    with pytest.raises(ValueError):
+        server._validate_revision("--textconv")
 
 
 def test_finding_is_create_only_and_advisory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -333,6 +336,20 @@ def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkey
         assert result["services"] == []
 
 
+def test_list_user_services_fails_closed_on_unparseable_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: {
+        "returncode": 0,
+        "stdout": "nixer-mcp.service loaded active running Nixer\nmalformed-row\n",
+        "stderr": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+    })
+    result = server.list_user_services()
+    assert result["parse_complete"] is False
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+
+
 def test_service_status_fails_closed_on_truncated_or_failed_show(monkeypatch: pytest.MonkeyPatch) -> None:
     observations = [
         {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False},
@@ -470,6 +487,14 @@ def test_supervise_work_truncated_git_is_incomplete(monkeypatch: pytest.MonkeyPa
     )
     assert result["conclusion"] == "incomplete"
     assert result["dimensions"]["cleanliness"]["status"] == "incomplete"
+
+
+def test_supervise_work_service_expectation_requires_unit() -> None:
+    with pytest.raises(ValueError, match="unit is required"):
+        server.supervise_work(
+            binding_kind="manual", binding_id="manual:fixture",
+            repo="/home/alex/repos/nixer", expect_service_active=True,
+        )
 
 
 def test_supervise_work_missing_active_state_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:

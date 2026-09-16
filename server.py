@@ -254,7 +254,11 @@ def _validate_github_repo(repo: str) -> str:
 
 
 def _validate_revision(revision: str) -> str:
-    if not isinstance(revision, str) or not _REV_RE.fullmatch(revision):
+    if (
+        not isinstance(revision, str)
+        or revision.startswith("-")
+        or not _REV_RE.fullmatch(revision)
+    ):
         raise ValueError("invalid Git revision")
     return revision
 
@@ -337,6 +341,7 @@ def adler_status() -> dict[str, Any]:
             "process_signal",
             "bureau_mutation",
             "work_or_lease_acquisition",
+            "agent_start",
             "secret_reveal",
         ],
         "observed_at": _utc_now(),
@@ -414,17 +419,27 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
 def list_user_services() -> dict[str, Any]:
     """Discover user-systemd services without a name allowlist or mutation authority."""
     result = _run(["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"], timeout=20)
-    observation_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    parse_complete = source_complete
     units: list[dict[str, str]] = []
-    if observation_complete:
+    if source_complete:
         for raw in result["stdout"].splitlines():
+            if not raw.strip():
+                continue
             parts = raw.strip().split(None, 4)
-            if parts and parts[0] == "●": parts = parts[1:]
-            if len(parts) >= 4 and _UNIT_RE.fullmatch(parts[0]):
-                units.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
+            if parts and parts[0] == "●":
+                parts = parts[1:]
+            if len(parts) < 4 or not _UNIT_RE.fullmatch(parts[0]):
+                parse_complete = False
+                continue
+            units.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
+    observation_complete = source_complete and parse_complete
+    if not observation_complete:
+        units = []
     return {
         "services": units,
         "observation_complete": observation_complete,
+        "parse_complete": parse_complete,
         "source": result,
         "observed_at": _utc_now(),
     }
@@ -570,6 +585,8 @@ def supervise_work(
         raise ValueError("binding_id must be 1..500 characters")
     if (github_repo is None) != (pr is None):
         raise ValueError("github_repo and pr must be supplied together")
+    if expect_service_active is not None and unit is None:
+        raise ValueError("unit is required when expect_service_active is supplied")
     if claimed_head is not None:
         _validate_revision(claimed_head)
 

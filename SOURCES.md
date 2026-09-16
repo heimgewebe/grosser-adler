@@ -20,3 +20,4 @@
 4. Keine negative Existenzaussage aus partieller Beobachtung.
 5. Neue Adapter nur, wenn ein realer Pilotfall mit bestehenden Reads nicht sinnvoll prüfbar ist.
 6. Cross-Work-Konflikte später nur über starke gemeinsame Schlüssel.
+7. `claimed_head` ist eine exakte Identität; für Git-/PR-Vergleiche den vollständigen Commit-OID verwenden, keine abgekürzte SHA.
