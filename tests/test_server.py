@@ -1,7 +1,9 @@
 # Großer-Adler authority-boundary regression tests.
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -725,3 +727,60 @@ def test_delivery_failure_keeps_finding_durable_and_does_not_claim_absence(tmp_p
     assert result["delivery"]["finding_remains_durable"] is True
     assert (state / "findings" / f"{result['finding_id']}.json").exists()
     assert list(outside.iterdir()) == []
+
+def test_finding_install_is_atomic_when_final_rename_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    real_rename = server.os.rename
+    def fail_final_rename(*args, **kwargs):
+        raise OSError("fixture rename failure")
+    monkeypatch.setattr(server.os, "rename", fail_final_rename)
+    with pytest.raises(OSError, match="fixture rename failure"):
+        server.submit_finding(**_finding_args())
+    findings = state / "findings"
+    assert list(findings.glob("*.json")) == []
+    assert list(findings.glob(".finding-*.tmp")) == []
+    monkeypatch.setattr(server.os, "rename", real_rename)
+
+
+def test_inbox_snapshot_waits_for_sidecar_publication_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"; worktree.mkdir()
+    sidecar = worktree / ".adler"; sidecar.mkdir(mode=0o700)
+    lane_id = "b" * 32
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    entered_projection = threading.Event()
+    real_projection = server._current_lane_findings
+    def observed_projection(lane: str, checkpoint: str):
+        entered_projection.set()
+        return real_projection(lane, checkpoint)
+    monkeypatch.setattr(server, "_current_lane_findings", observed_projection)
+    lock_fd = server.os.open(sidecar, server.os.O_RDONLY | server.os.O_DIRECTORY | server.os.O_CLOEXEC)
+    server.fcntl.flock(lock_fd, server.fcntl.LOCK_EX)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(server.publish_worktree_inbox, lane_id)
+            assert entered_projection.wait(0.1) is False
+            assert not (sidecar / "inbox.json").exists()
+            server.fcntl.flock(lock_fd, server.fcntl.LOCK_UN)
+            result = future.result(timeout=2)
+    finally:
+        server.os.close(lock_fd)
+    assert entered_projection.is_set()
+    assert result["state"] == "published"
+
+
+def test_recheck_chain_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    root = server.submit_finding(**_finding_args(subject="repo:fixture"))
+    recheck = server.submit_finding(**_finding_args(
+        kind="observation", severity="low", subject="repo:fixture", checkpoint=OID_B,
+        recheck_of=root["finding_id"], conclusion="still_current",
+    ))
+    with pytest.raises(ValueError, match="root finding"):
+        server.submit_finding(**_finding_args(
+            kind="observation", severity="low", subject="repo:fixture", checkpoint=OID_C,
+            recheck_of=recheck["finding_id"], conclusion="still_current",
+        ))

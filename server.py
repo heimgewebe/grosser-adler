@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -962,53 +963,60 @@ def _atomic_write_inbox(dir_fd: int, encoded: bytes) -> None:
 
 
 def _publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
-    target = _read_work_target(lane_id)
-    worktree = Path(target["worktree"])
+    initial_target = _read_work_target(lane_id)
+    worktree = Path(initial_target["worktree"])
     try:
         worktree.relative_to(WORKTREE_WRITE_ROOT)
     except ValueError as exc:
         raise PermissionError("lane worktree is outside Adler's sidecar write root") from exc
-    findings = _current_lane_findings(lane_id, target["checkpoint"])
-    payload = {
-        "schema_version": 1,
-        "contract": SIDECAR_CONTRACT,
-        "writer_identity": IDENTITY,
-        "lane_id": lane_id,
-        "repository": target["repository"],
-        "worktree": target["worktree"],
-        "branch": target["branch"],
-        "checkpoint": target["checkpoint"],
-        "source_complete": True,
-        "source_store": str(FINDINGS_ROOT),
-        "findings": findings,
-        "generated_at": _utc_now(),
-        "effect_contract": "advisory_only_no_automatic_action",
-        "does_not_establish": [
-            "absence_of_findings_after_generated_at",
-            "work_state_authority",
-            "decision_authority",
-            "effect_permission",
-        ],
-    }
-    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
-    if len(encoded) > MAX_OUTPUT_BYTES:
-        raise RuntimeError("worktree inbox exceeds bounded size")
     dir_fd = _ensure_sidecar_dir(worktree)
+    locked = False
     try:
+        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        locked = True
+        target = _read_work_target(lane_id)
+        if Path(target["worktree"]) != worktree:
+            raise RuntimeError("lane worktree changed during inbox publication")
+        findings = _current_lane_findings(lane_id, target["checkpoint"])
+        payload = {
+            "schema_version": 1,
+            "contract": SIDECAR_CONTRACT,
+            "writer_identity": IDENTITY,
+            "lane_id": lane_id,
+            "repository": target["repository"],
+            "worktree": target["worktree"],
+            "branch": target["branch"],
+            "checkpoint": target["checkpoint"],
+            "source_complete": True,
+            "source_store": str(FINDINGS_ROOT),
+            "findings": findings,
+            "generated_at": _utc_now(),
+            "effect_contract": "advisory_only_no_automatic_action",
+            "does_not_establish": [
+                "absence_of_findings_after_generated_at",
+                "work_state_authority",
+                "decision_authority",
+                "effect_permission",
+            ],
+        }
+        encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        if len(encoded) > MAX_OUTPUT_BYTES:
+            raise RuntimeError("worktree inbox exceeds bounded size")
         _ensure_sidecar_gitignore(dir_fd)
         _atomic_write_inbox(dir_fd, encoded)
     finally:
+        if locked:
+            fcntl.flock(dir_fd, fcntl.LOCK_UN)
         os.close(dir_fd)
     return {
         "state": "published",
         "lane_id": lane_id,
         "checkpoint": target["checkpoint"],
         "finding_count": len(findings),
-        "sidecar": str(Path(target["worktree"]) / ".adler" / "inbox.json"),
+        "sidecar": str(worktree / ".adler" / "inbox.json"),
         "source_complete": True,
         "observed_at": _utc_now(),
     }
-
 
 @mcp.tool(name="publish_worktree_inbox", annotations=SIDECAR_ANNOTATIONS)
 def publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
@@ -1056,28 +1064,46 @@ def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
     payload = dict(payload)
     payload["finding_sha256"] = finding_sha256
     encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
-    target = FINDINGS_ROOT / f"{payload['finding_id']}.json"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(target, flags, 0o600)
-    try:
-        with os.fdopen(fd, "wb", closefd=True) as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        try:
-            target.unlink(missing_ok=True)
-        finally:
-            raise
+    target_name = f"{payload['finding_id']}.json"
+    tmp_name = f".finding-{payload['finding_id']}-{uuid.uuid4().hex}.tmp"
     dir_fd = os.open(FINDINGS_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    locked = False
+    tmp_created = False
     try:
+        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        locked = True
+        try:
+            os.stat(target_name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"finding already exists: {target_name}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+        tmp_created = True
+        try:
+            os.write(fd, encoded)
+            os.fsync(fd)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+                raise RuntimeError("unsafe finding temporary file")
+        finally:
+            os.close(fd)
+        os.rename(tmp_name, target_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_created = False
         os.fsync(dir_fd)
     finally:
+        if tmp_created:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        if locked:
+            fcntl.flock(dir_fd, fcntl.LOCK_UN)
         os.close(dir_fd)
     return finding_sha256, hashlib.sha256(encoded).hexdigest()
-
 
 @mcp.tool(name="submit_finding", annotations=FINDING_ANNOTATIONS)
 def submit_finding(
@@ -1126,6 +1152,10 @@ def submit_finding(
         if not parent_path.exists():
             raise ValueError("recheck_of finding does not exist")
         parent = _read_json_file_no_symlink(parent_path)
+        if parent.get("finding_contract") != FINDING_CONTRACT:
+            raise ValueError("recheck_of must reference a V1 finding")
+        if parent.get("recheck_of") is not None:
+            raise ValueError("recheck_of must reference a root finding")
         if parent.get("subject") != subject_clean:
             raise ValueError("recheck subject must match original finding")
 
