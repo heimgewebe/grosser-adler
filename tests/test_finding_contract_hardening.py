@@ -40,7 +40,56 @@ def _v1_payload(**overrides):
         "effect_contract": "advisory_only_no_automatic_action",
     }
     payload.update(overrides)
+    payload.pop("finding_sha256", None)
     payload["finding_sha256"] = server._sha256_json(payload)
+    return payload
+
+
+def _legacy_payload(
+    schema_version: int,
+    *,
+    finding_id: str,
+    status: str | None = None,
+) -> dict:
+    if status is None:
+        status = "advice" if schema_version == 3 else "finding"
+    payload = {
+        "schema_version": schema_version,
+        "finding_id": finding_id,
+        "adler_identity": server.IDENTITY,
+        "subject_kind": "work",
+        "subject": "legacy-subject",
+        "checkpoint": "legacy-checkpoint",
+        "severity": "medium",
+        "status": status,
+        "summary": "legacy",
+        "evidence_refs": ["fixture:legacy"],
+        "observed_at": "2026-09-16T00:00:00Z",
+        "effect_contract": "advisory_only_no_automatic_action",
+    }
+    if schema_version == 2:
+        components = [
+            {"name": "git_head", "value": "a" * 40},
+            {"name": "pr_head", "value": "b" * 40},
+        ]
+        payload.update(
+            {
+                "checkpoint_mode": "relational",
+                "checkpoint_components": components,
+                "checkpoint_set_sha256": server._sha256_json(components),
+                "checkpoint_contract": "all_components_must_match_or_recheck",
+            }
+        )
+    if schema_version == 3:
+        payload.update(
+            {
+                "target_actor": None,
+                "binding": None,
+                "recommendation": None,
+                "rationale": None,
+                "confidence": None,
+            }
+        )
     return payload
 
 
@@ -82,32 +131,63 @@ def test_missing_v1_contract_is_not_silently_treated_as_legacy(
 
 
 @pytest.mark.parametrize("schema_version", [1, 2, 3])
-def test_explicit_historical_legacy_records_remain_readable(
+def test_exact_historical_legacy_schemas_remain_readable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema_version: int
 ) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     finding_id = f"ga-20260916T00000{schema_version}Z-{schema_version:012x}"
-    legacy = {
-        "schema_version": schema_version,
-        "finding_id": finding_id,
-        "adler_identity": server.IDENTITY,
-        "subject_kind": "work",
-        "subject": "legacy-subject",
-        "checkpoint": "legacy-checkpoint",
-        "severity": "medium",
-        "status": "advice",
-        "summary": "legacy",
-        "evidence_refs": ["fixture:legacy"],
-        "observed_at": "2026-09-16T00:00:00Z",
-        "effect_contract": "advisory_only_no_automatic_action",
-    }
+    legacy = _legacy_payload(schema_version, finding_id=finding_id)
     _write_payload(state / "findings" / f"{finding_id}.json", legacy)
 
     listing = server.list_findings(limit=10)
     assert listing["source_complete"] is True
     assert listing["count"] == 1
-    assert listing["findings"][0]["legacy"] is True
-    assert listing["findings"][0]["kind"] == "advice"
+    item = listing["findings"][0]
+    assert item["legacy"] is True
+    assert item["status"] == legacy["status"]
+    assert item["kind"] == legacy["status"]
+    assert item["subject_kind"] == "work"
+
+
+@pytest.mark.parametrize("status", ["finding", "recheck_suggested", "recheck_required"])
+def test_legacy_status_semantics_are_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    finding_id = f"ga-20260916T000010Z-{len(status):012x}"
+    schema_version = 3 if status == "recheck_required" else 1
+    legacy = _legacy_payload(schema_version, finding_id=finding_id, status=status)
+    _write_payload(state / "findings" / f"{finding_id}.json", legacy)
+
+    item = server.list_findings(limit=10)["findings"][0]
+    assert item["legacy"] is True
+    assert item["status"] == status
+    assert item["kind"] == status
+
+
+def test_fragment_is_not_accepted_as_legacy_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    _write_payload(state / "findings" / f"{FINDING_ID}.json", {"status": "risk"})
+
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is False
+    assert listing["source_error_count"] == 1
+    assert listing["findings"] == []
+
+
+def test_legacy_filename_identity_mismatch_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    legacy = _legacy_payload(1, finding_id=FINDING_ID)
+    wrong_path = state / "findings" / "ga-20260916T000001Z-bbbbbbbbbbbb.json"
+    _write_payload(wrong_path, legacy)
+
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is False
+    assert listing["findings"] == []
 
 
 @pytest.mark.parametrize(
@@ -152,6 +232,69 @@ def test_digest_covers_full_stored_core_including_extra_unicode(
     payload["extra"]["note"] = "mutated"
     with pytest.raises(RuntimeError, match="digest mismatch"):
         server._validate_v1_finding_payload(payload, path)
+
+
+def test_orphaned_persisted_recheck_marks_store_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    orphan_id = "ga-20260916T000020Z-bbbbbbbbbbbb"
+    orphan = _v1_payload(
+        finding_id=orphan_id,
+        recheck_of="ga-20260916T000019Z-cccccccccccc",
+        conclusion="still_current",
+    )
+    _write_payload(state / "findings" / f"{orphan_id}.json", orphan)
+
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is False
+    assert listing["source_error_count"] == 1
+
+
+def test_chained_persisted_recheck_marks_store_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    root_id = FINDING_ID
+    first_recheck_id = "ga-20260916T000021Z-bbbbbbbbbbbb"
+    chained_id = "ga-20260916T000022Z-cccccccccccc"
+    root = _v1_payload(finding_id=root_id)
+    first_recheck = _v1_payload(
+        finding_id=first_recheck_id,
+        recheck_of=root_id,
+        conclusion="still_current",
+    )
+    chained = _v1_payload(
+        finding_id=chained_id,
+        recheck_of=first_recheck_id,
+        conclusion="still_current",
+    )
+    for payload in (root, first_recheck, chained):
+        _write_payload(state / "findings" / f"{payload['finding_id']}.json", payload)
+
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is False
+    assert listing["source_error_count"] == 1
+
+
+def test_persisted_recheck_subject_mismatch_marks_store_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    root = _v1_payload(finding_id=FINDING_ID, subject="repo:one")
+    recheck_id = "ga-20260916T000023Z-bbbbbbbbbbbb"
+    recheck = _v1_payload(
+        finding_id=recheck_id,
+        subject="repo:two",
+        recheck_of=FINDING_ID,
+        conclusion="still_current",
+    )
+    for payload in (root, recheck):
+        _write_payload(state / "findings" / f"{payload['finding_id']}.json", payload)
+
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is False
+    assert listing["source_error_count"] == 1
 
 
 def test_recheck_rejects_corrupted_parent_even_with_recomputed_digest(
