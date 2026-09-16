@@ -282,8 +282,10 @@ def test_process_reader_is_internal_and_cgroup_bound(monkeypatch: pytest.MonkeyP
             "returncode": 0,
             "stdout": (
                 f"100 1 {own_uid} S 10 512 0.0 python 0::/user.slice/nixer\n"
-                f"101 100 {own_uid} S 8 256 0.0 nix 0::/user.slice/nixer/child\n"
+                f"101 100 {own_uid} S 8 256 0.0 Web Content 0::/user.slice/nixer/child\n"
                 f"102 100 {own_uid} S 8 256 0.0 stray 0::/user.slice/other\n"
+                f"103 100 {own_uid + 1} S 8 256 0.0 foreign 0::/user.slice/nixer/foreign\n"
+                f"104 100 {own_uid} S 8 256 0.0 prefix 0::/user.slice/nixer-other\n"
             ),
             "stderr": "",
             "stdout_truncated": False,
@@ -293,8 +295,30 @@ def test_process_reader_is_internal_and_cgroup_bound(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(server, "_run", fake_run)
     result = server._process_snapshot(100, "/user.slice/nixer")
     assert result["complete"] is True
+    assert result["parse_complete"] is True
     assert [row["pid"] for row in result["processes"]] == [100, 101]
+    assert result["processes"][1]["comm"] == "Web Content"
     assert all("args" not in row for row in result["processes"])
+    assert server._cgroup_within("/foo", "/foo") is True
+    assert server._cgroup_within("/foo/child", "/foo") is True
+    assert server._cgroup_within("/foobar", "/foo") is False
+
+
+def test_process_reader_marks_unparseable_rows_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    own_uid = server.os.getuid()
+    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: {
+        "returncode": 0,
+        "stdout": (
+            f"100 1 {own_uid} S 10 512 0.0 python 0::/user.slice/nixer\n"
+            "malformed process row\n"
+        ),
+        "stderr": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+    })
+    result = server._process_snapshot(100, "/user.slice/nixer")
+    assert result["parse_complete"] is False
+    assert result["complete"] is False
 
 
 def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -307,6 +331,18 @@ def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkey
         result = server.list_user_services()
         assert result["observation_complete"] is False
         assert result["services"] == []
+
+
+def test_service_status_fails_closed_on_truncated_or_failed_show(monkeypatch: pytest.MonkeyPatch) -> None:
+    observations = [
+        {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False},
+        {"returncode": 1, "stdout": "ActiveState=active\n", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False},
+    ]
+    for observation in observations:
+        monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
+        result = server.service_status("nixer-mcp.service")
+        assert result["observation_complete"] is False
+        assert result["properties"] == {}
 
 
 def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -329,6 +365,8 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
                 "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
             }
         if argv[0] == "/usr/bin/ss":
+            assert argv == ["/usr/bin/ss", "-H", "-lntue"]
+            assert all("p" not in argument for argument in argv[1:])
             return {
                 "returncode": 0,
                 "stdout": f'tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/user.slice/nixer <->\n',
@@ -341,6 +379,24 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
     assert [row["pid"] for row in runtime["processes"]] == [100, 101]
     assert "127.0.0.1:18187" in runtime["listeners"][0]
     assert runtime["listener_observation_complete"] is True
+    assert runtime["complete"] is True
+
+
+def test_service_runtime_complete_zero_listener_match_is_valid_negative_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    own_uid = server.os.getuid()
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/systemctl":
+            return {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\nControlGroup=/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        if argv[0] == "/usr/bin/ps":
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        if argv[0] == "/usr/bin/ss":
+            assert argv == ["/usr/bin/ss", "-H", "-lntue"]
+            return {"returncode": 0, "stdout": f"tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:* uid:{own_uid} ino:9 cgroup:/other <->\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+        raise AssertionError(argv)
+    monkeypatch.setattr(server, "_run", fake_run)
+    runtime = server.service_runtime("nixer-mcp.service")
+    assert runtime["listener_observation_complete"] is True
+    assert runtime["listeners"] == []
     assert runtime["complete"] is True
 
 

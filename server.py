@@ -167,11 +167,15 @@ def _parse_key_value_lines(text: str) -> dict[str, str]:
     return values
 
 
-def _parse_process_table(text: str) -> list[dict[str, Any]]:
+def _parse_process_table(text: str) -> tuple[list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
+    complete = True
     for raw in text.splitlines():
+        if not raw.strip():
+            continue
         parts = raw.strip().split()
         if len(parts) < 9:
+            complete = False
             continue
         try:
             pid = int(parts[0])
@@ -181,6 +185,11 @@ def _parse_process_table(text: str) -> list[dict[str, Any]]:
             rss_kib = int(parts[5])
             cpu_percent = float(parts[6])
         except ValueError:
+            complete = False
+            continue
+        comm_parts = parts[7:-1]
+        if not comm_parts:
+            complete = False
             continue
         rows.append({
             "pid": pid,
@@ -190,10 +199,10 @@ def _parse_process_table(text: str) -> list[dict[str, Any]]:
             "elapsed_seconds": elapsed_seconds,
             "rss_kib": rss_kib,
             "cpu_percent": cpu_percent,
-            "cgroup": _normalize_cgroup(parts[8]),
-            "comm": parts[7],
+            "cgroup": _normalize_cgroup(parts[-1]),
+            "comm": " ".join(comm_parts),
         })
-    return rows
+    return rows, complete
 
 
 def _normalize_cgroup(value: str) -> str:
@@ -426,7 +435,14 @@ def service_status(unit: str) -> dict[str, Any]:
     """Read fixed status, lifecycle, cgroup and resource fields for any user service."""
     safe_unit = _validate_unit(unit)
     result = _run(["/usr/bin/systemctl", "--user", "show", safe_unit, "--no-pager", "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=Result", "--property=ExecMainCode", "--property=ExecMainStatus", "--property=MainPID", "--property=FragmentPath", "--property=NRestarts", "--property=ActiveEnterTimestamp", "--property=ExecMainStartTimestamp", "--property=ControlGroup", "--property=MemoryCurrent", "--property=TasksCurrent", "--property=CPUUsageNSec"])
-    return {"unit": safe_unit, "status": result, "properties": _parse_key_value_lines(result["stdout"]), "observed_at": _utc_now()}
+    observation_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    return {
+        "unit": safe_unit,
+        "status": result,
+        "properties": _parse_key_value_lines(result["stdout"]) if observation_complete else {},
+        "observation_complete": observation_complete,
+        "observed_at": _utc_now(),
+    }
 
 
 def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
@@ -440,7 +456,10 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
         "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,comm=,cgroup=",
     ], timeout=20)
     source_complete = table["returncode"] == 0 and not table["stdout_truncated"]
-    rows = _parse_process_table(table["stdout"]) if source_complete else []
+    rows: list[dict[str, Any]] = []
+    parse_complete = False
+    if source_complete:
+        rows, parse_complete = _parse_process_table(table["stdout"])
     rows = [row for row in rows if row["uid"] == os.getuid()]
     descendants = _descendant_rows(rows, pid)
     processes = [
@@ -456,7 +475,8 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
         "processes": processes,
         "source_returncode": table["returncode"],
         "source_truncated": table["stdout_truncated"],
-        "complete": source_complete and root is not None,
+        "parse_complete": parse_complete,
+        "complete": source_complete and parse_complete and root is not None,
         "observed_at": _utc_now(),
     }
 
@@ -466,10 +486,7 @@ def service_runtime(unit: str) -> dict[str, Any]:
     """Correlate one user service with its cgroup-bound process tree and listeners."""
     status = service_status(unit)
     props = status["properties"]
-    status_complete = (
-        status["status"]["returncode"] == 0
-        and not status["status"]["stdout_truncated"]
-    )
+    status_complete = status["observation_complete"]
     missing: list[str] = []
     if not status_complete:
         missing.append("systemd_status")
@@ -500,7 +517,7 @@ def service_runtime(unit: str) -> dict[str, Any]:
         if not process_observation["complete"]:
             missing.append("process_tree")
 
-    sockets = _run(["/usr/bin/ss", "-H", "-lntupe"], timeout=20)
+    sockets = _run(["/usr/bin/ss", "-H", "-lntue"], timeout=20)
     socket_lines = [line for line in sockets["stdout"].splitlines() if line.strip()]
     sockets_source_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
     socket_cgroups: list[tuple[str, str]] = []
