@@ -796,6 +796,25 @@ def _finding_record_view(payload: dict[str, Any], path: Path) -> dict[str, Any]:
     }
 
 
+def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
+    if payload.get("finding_contract") != FINDING_CONTRACT:
+        return
+    supplied = payload.get("finding_sha256")
+    if not isinstance(supplied, str) or not re.fullmatch(r"[0-9a-f]{64}", supplied):
+        raise RuntimeError("V1 finding digest is missing or invalid")
+    core = dict(payload)
+    core.pop("finding_sha256", None)
+    encoded = json.dumps(
+        core, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    expected = hashlib.sha256(encoded).hexdigest()
+    if supplied != expected:
+        raise RuntimeError("V1 finding digest mismatch")
+    finding_id = payload.get("finding_id")
+    if not isinstance(finding_id, str) or path.name != f"{finding_id}.json":
+        raise RuntimeError("V1 finding file identity mismatch")
+
+
 def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[str]]:
     _ensure_state()
     records: list[tuple[Path, dict[str, Any]]] = []
@@ -803,6 +822,7 @@ def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[st
     for path in sorted(FINDINGS_ROOT.glob("*.json")):
         try:
             payload = _read_json_file_no_symlink(path)
+            _validate_v1_finding_payload(payload, path)
         except Exception as exc:
             errors.append(type(exc).__name__)
             continue
@@ -937,6 +957,15 @@ def _secure_existing_state_inbox(dir_fd: int, name: str) -> None:
         raise RuntimeError("existing external inbox is not Adler-owned")
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write made no progress")
+        view = view[written:]
+
+
 def _atomic_write_inbox(dir_fd: int, name: str, encoded: bytes) -> None:
     _secure_existing_state_inbox(dir_fd, name)
     tmp_name = f".{name}.{uuid.uuid4().hex}.tmp"
@@ -945,7 +974,7 @@ def _atomic_write_inbox(dir_fd: int, name: str, encoded: bytes) -> None:
         flags |= os.O_NOFOLLOW
     fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
     try:
-        os.write(fd, encoded)
+        _write_all(fd, encoded)
         os.fsync(fd)
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
@@ -1098,7 +1127,7 @@ def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
         fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
         tmp_created = True
         try:
-            os.write(fd, encoded)
+            _write_all(fd, encoded)
             os.fsync(fd)
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:

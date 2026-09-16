@@ -227,6 +227,37 @@ def test_external_foreign_inbox_is_never_overwritten(tmp_path: Path, monkeypatch
     assert target.read_bytes() == foreign
 
 
+def test_inbox_short_write_does_not_replace_valid_view_with_truncated_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox_dir = tmp_path / "inboxes"
+    inbox_dir.mkdir(mode=0o700)
+    name = "lane.json"
+    old = (json.dumps({"writer_identity": server.IDENTITY, "contract": server.SIDECAR_CONTRACT}) + "\n").encode()
+    path = inbox_dir / name
+    path.write_bytes(old)
+    path.chmod(0o600)
+    new = (json.dumps({
+        "writer_identity": server.IDENTITY,
+        "contract": server.SIDECAR_CONTRACT,
+        "findings": [{"finding_id": "fixture"}],
+    }, sort_keys=True) + "\n").encode()
+    real_write = server.os.write
+
+    def short_write(fd: int, data) -> int:
+        raw = bytes(data)
+        if len(raw) > 1:
+            raw = raw[: max(1, len(raw) // 2)]
+        return real_write(fd, raw)
+
+    monkeypatch.setattr(server.os, "write", short_write)
+    dir_fd = os.open(inbox_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        server._atomic_write_inbox(dir_fd, name, new)
+    finally:
+        os.close(dir_fd)
+    assert path.read_bytes() == new
+    assert json.loads(path.read_text(encoding="utf-8"))["findings"] == [{"finding_id": "fixture"}]
+
+
 def test_failed_external_atomic_replace_preserves_old_and_cleans_temp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     inbox_dir = tmp_path / "inboxes"
     inbox_dir.mkdir(mode=0o700)

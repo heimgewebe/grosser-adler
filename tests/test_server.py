@@ -725,6 +725,48 @@ def test_delivery_failure_keeps_finding_durable_and_does_not_create_pointer(tmp_
     assert not (worktree / ".adler").exists()
 
 
+def test_finding_short_write_does_not_install_truncated_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    real_write = server.os.write
+
+    def short_write(fd: int, data) -> int:
+        raw = bytes(data)
+        if len(raw) > 1:
+            raw = raw[: max(1, len(raw) // 2)]
+        return real_write(fd, raw)
+
+    monkeypatch.setattr(server.os, "write", short_write)
+    result = server.submit_finding(**_finding_args())
+    path = state / "findings" / f"{result['finding_id']}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["finding_sha256"] == result["finding_sha256"]
+    server._validate_v1_finding_payload(payload, path)
+
+
+def test_finding_digest_mismatch_cannot_be_published_as_complete_empty_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "c" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    submitted = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}", checkpoint=OID_A))
+    before_inbox = target.read_bytes()
+    finding = state / "findings" / f"{submitted['finding_id']}.json"
+    payload = json.loads(finding.read_text(encoding="utf-8"))
+    payload["checkpoint"] = OID_B
+    finding.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    finding.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="finding store observation is incomplete"):
+        server.publish_worktree_inbox(lane_id)
+    assert target.read_bytes() == before_inbox
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is False
+
+
 def test_finding_install_is_atomic_when_final_rename_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     real_rename = server.os.rename
