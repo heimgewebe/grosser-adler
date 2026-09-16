@@ -256,9 +256,10 @@ def test_process_descendants_are_bounded_to_requested_root() -> None:
 
 
 def test_service_runtime_correlates_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
+    own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0]=="/usr/bin/systemctl" and "show" in argv: return {"returncode":0,"stdout":"LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=100\nNRestarts=2\nControlGroup=/user.slice/nixer\n","stderr":"","stdout_truncated":False,"stderr_truncated":False}
-        if argv[0]=="/usr/bin/ps": return {"returncode":0,"stdout":"100 1 1000 S 120 2048 1.0 python python server.py\n101 100 1000 S 60 1024 0.2 nix nix build .#nixer\n200 1 1000 S 10 512 0.0 sleep sleep 10\n","stderr":"","stdout_truncated":False,"stderr_truncated":False}
+        if argv[0]=="/usr/bin/ps": return {"returncode":0,"stdout":f"100 1 {own_uid} S 120 2048 1.0 python\n101 100 {own_uid} S 60 1024 0.2 nix\n200 1 {own_uid} S 10 512 0.0 sleep\n","stderr":"","stdout_truncated":False,"stderr_truncated":False}
         if argv[0]=="/usr/bin/ss": return {"returncode":0,"stdout":'LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* users:(("python",pid=100,fd=3))\n',"stderr":"","stdout_truncated":False,"stderr_truncated":False}
         raise AssertionError(argv)
     monkeypatch.setattr(server,"_run",fake_run); runtime=server.service_runtime("nixer-mcp.service")
