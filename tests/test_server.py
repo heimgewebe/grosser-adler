@@ -439,6 +439,7 @@ def test_status_cleanliness_requires_observed_branch_line() -> None:
 
 def _configure_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     state = tmp_path / "state"
+    state.mkdir(mode=0o700)
     monkeypatch.setattr(server, "STATE_ROOT", state)
     monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
     monkeypatch.setattr(server, "WORKTREE_WRITE_ROOT", tmp_path.resolve())
@@ -511,7 +512,7 @@ def test_finding_rejects_invalid_confidence(tmp_path: Path, monkeypatch: pytest.
 def test_legacy_finding_remains_readable_without_driving_v1_semantics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     findings = state / "findings"
-    findings.mkdir(parents=True)
+    findings.mkdir(mode=0o700)
     legacy = {
         "schema_version": 3,
         "finding_id": "ga-20260916T000000Z-aaaaaaaaaaaa",
@@ -681,7 +682,7 @@ def test_incomplete_finding_store_refuses_complete_sidecar(tmp_path: Path, monke
     state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"; worktree.mkdir()
     lane_id = "9" * 32
-    findings = state / "findings"; findings.mkdir(parents=True)
+    findings = state / "findings"; findings.mkdir(mode=0o700)
     bad = findings / "broken.json"; bad.write_text("{broken", encoding="utf-8"); bad.chmod(0o600)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
