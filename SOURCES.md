@@ -23,3 +23,4 @@
 7. `claimed_head` ist eine exakte Identität; für Git-/PR-Vergleiche den vollständigen Commit-OID verwenden, keine abgekürzte SHA.
 
 8. Listener-Beobachtung v1 belegt nur positiv zugeordnete TCP/UDP-Listener; ein leeres Match ist keine Abwesenheitsbehauptung und bleibt `incomplete`.
+9. Relationale Checkpoint-Komponenten müssen ohne Redaction persistierbar sein; Namen oder Werte, die Secret-Redaction benötigen oder bereits `<REDACTED>` enthalten, werden fail-closed abgewiesen statt identitätskollabierend gehasht.

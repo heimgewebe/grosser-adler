@@ -215,25 +215,24 @@ def test_relational_checkpoint_binds_every_component(tmp_path: Path, monkeypatch
     assert server._checkpoint_set_sha256(changed) != payload["checkpoint_set_sha256"]
 
 
-def test_relational_checkpoint_redacts_component_values_before_persisting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_relational_checkpoint_rejects_components_requiring_redaction_before_persisting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = tmp_path / "state"
     findings = state / "findings"
     monkeypatch.setattr(server, "STATE_ROOT", state)
     monkeypatch.setattr(server, "FINDINGS_ROOT", findings)
-    secret = "sk-proj-" + "A" * 24
-    server.submit_finding(
-        subject_kind="work", subject="fixture", severity="medium", summary="fixture",
-        evidence_refs=["fixture:redaction"], checkpoint_mode="relational",
-        checkpoint_components=[
-            {"name": "local_head", "value": "a" * 40},
-            {"name": "runtime_token", "value": secret},
-        ],
-    )
-    raw = next(findings.glob("*.json")).read_text(encoding="utf-8")
-    payload = json.loads(raw)
-    assert secret not in raw
-    component = next(item for item in payload["checkpoint_components"] if item["name"] == "runtime_token")
-    assert component["value"] == "<REDACTED>"
+
+    for sensitive_value in ("sk-proj-" + "A" * 24, "sk-proj-" + "B" * 24):
+        with pytest.raises(ValueError, match="requiring redaction"):
+            server.submit_finding(
+                subject_kind="work", subject="fixture", severity="medium", summary="fixture",
+                evidence_refs=["fixture:redaction"], checkpoint_mode="relational",
+                checkpoint_components=[
+                    {"name": "local_head", "value": "a" * 40},
+                    {"name": "runtime_token", "value": sensitive_value},
+                ],
+            )
+
+    assert list(findings.glob("*.json")) == []
 
 
 def test_relational_checkpoint_rejects_incomplete_component_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

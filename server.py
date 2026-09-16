@@ -327,8 +327,17 @@ def _normalize_checkpoint_components(
             or len(component_value) > MAX_CHECKPOINT_VALUE_CHARS
         ):
             raise ValueError("invalid checkpoint component value")
-        name = _redact(name.strip())
-        component_value = _redact(component_value.strip())
+        name = name.strip()
+        component_value = component_value.strip()
+        if (
+            _redact(name) != name
+            or _redact(component_value) != component_value
+            or "<REDACTED>" in name
+            or "<REDACTED>" in component_value
+        ):
+            raise ValueError(
+                "checkpoint components requiring redaction cannot be persisted"
+            )
         if name in names:
             raise ValueError("checkpoint component names must be unique")
         names.add(name)
