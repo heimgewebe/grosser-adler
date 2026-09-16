@@ -796,23 +796,115 @@ def _finding_record_view(payload: dict[str, Any], path: Path) -> dict[str, Any]:
     }
 
 
+def _is_explicit_legacy_finding_payload(payload: dict[str, Any]) -> bool:
+    v1_markers = {
+        "finding_contract", "finding_sha256", "kind", "binding_strength",
+        "recheck_of", "conclusion", "affected_effects",
+    }
+    if any(key in payload for key in v1_markers):
+        return False
+    return isinstance(payload.get("status"), str) or isinstance(payload.get("subject_kind"), str)
+
+
 def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
     if payload.get("finding_contract") != FINDING_CONTRACT:
-        return
+        if _is_explicit_legacy_finding_payload(payload):
+            return
+        raise RuntimeError("finding contract is invalid or ambiguous")
+
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
+        raise RuntimeError("V1 finding schema version is invalid")
+    if payload.get("adler_identity") != IDENTITY:
+        raise RuntimeError("V1 finding Adler identity is invalid")
+    if payload.get("effect_contract") != "advisory_only_no_automatic_action":
+        raise RuntimeError("V1 finding effect contract is invalid")
+
+    finding_id = payload.get("finding_id")
+    if (
+        not isinstance(finding_id, str)
+        or _FINDING_ID_RE.fullmatch(finding_id) is None
+        or path.name != f"{finding_id}.json"
+    ):
+        raise RuntimeError("V1 finding file identity mismatch")
+
+    if payload.get("kind") not in {"observation", "risk", "contradiction", "missing_evidence", "advice"}:
+        raise RuntimeError("V1 finding kind is invalid")
+    if payload.get("severity") not in {"low", "medium", "high", "critical"}:
+        raise RuntimeError("V1 finding severity is invalid")
+    if payload.get("binding_strength") not in {"exact", "strong", "heuristic", "unbound"}:
+        raise RuntimeError("V1 finding binding strength is invalid")
+
+    confidence = payload.get("confidence")
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not math.isfinite(float(confidence))
+        or not 0 <= float(confidence) <= 1
+    ):
+        raise RuntimeError("V1 finding confidence is invalid")
+
+    for field in ("subject", "checkpoint"):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > 500:
+            raise RuntimeError(f"V1 finding {field} is invalid")
+        clean = value.strip()
+        if clean != value or _redact(clean) != clean or "<REDACTED>" in clean:
+            raise RuntimeError(f"V1 finding {field} is invalid")
+
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
+        raise RuntimeError("V1 finding summary is invalid")
+
+    evidence_refs = payload.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
+        raise RuntimeError("V1 finding evidence refs are invalid")
+    if any(
+        not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_EVIDENCE_REF_CHARS
+        for ref in evidence_refs
+    ):
+        raise RuntimeError("V1 finding evidence refs are invalid")
+
+    recommendation = payload.get("recommendation")
+    if recommendation is not None and (
+        not isinstance(recommendation, str)
+        or not recommendation.strip()
+        or len(recommendation) > MAX_SUMMARY_CHARS
+    ):
+        raise RuntimeError("V1 finding recommendation is invalid")
+
+    affected_effects = payload.get("affected_effects")
+    if affected_effects is not None:
+        if not isinstance(affected_effects, list) or len(affected_effects) > MAX_AFFECTED_EFFECTS:
+            raise RuntimeError("V1 finding affected effects are invalid")
+        for effect in affected_effects:
+            if not isinstance(effect, str) or not effect.strip() or len(effect) > MAX_AFFECTED_EFFECT_CHARS:
+                raise RuntimeError("V1 finding affected effects are invalid")
+            clean = effect.strip()
+            if clean != effect or _redact(clean) != clean or "<REDACTED>" in clean:
+                raise RuntimeError("V1 finding affected effects are invalid")
+
+    observed_at = payload.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at.strip() or len(observed_at) > 100:
+        raise RuntimeError("V1 finding observed_at is invalid")
+
+    recheck_of = payload.get("recheck_of")
+    conclusion = payload.get("conclusion")
+    if (recheck_of is None) != (conclusion is None):
+        raise RuntimeError("V1 finding recheck fields are incomplete")
+    if recheck_of is not None:
+        if not isinstance(recheck_of, str) or _FINDING_ID_RE.fullmatch(recheck_of) is None:
+            raise RuntimeError("V1 finding recheck target is invalid")
+        if conclusion not in {"still_current", "no_longer_reproduced"}:
+            raise RuntimeError("V1 finding recheck conclusion is invalid")
+
     supplied = payload.get("finding_sha256")
     if not isinstance(supplied, str) or not re.fullmatch(r"[0-9a-f]{64}", supplied):
         raise RuntimeError("V1 finding digest is missing or invalid")
     core = dict(payload)
     core.pop("finding_sha256", None)
-    encoded = json.dumps(
-        core, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    expected = hashlib.sha256(encoded).hexdigest()
-    if supplied != expected:
+    if supplied != _sha256_json(core):
         raise RuntimeError("V1 finding digest mismatch")
-    finding_id = payload.get("finding_id")
-    if not isinstance(finding_id, str) or path.name != f"{finding_id}.json":
-        raise RuntimeError("V1 finding file identity mismatch")
 
 
 def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[str]]:
@@ -1102,12 +1194,12 @@ def _clean_optional_text(value: str | None, field: str) -> str | None:
 
 
 def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
-    core_encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    finding_sha256 = hashlib.sha256(core_encoded).hexdigest()
+    finding_sha256 = _sha256_json(payload)
     payload = dict(payload)
     payload["finding_sha256"] = finding_sha256
-    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     target_name = f"{payload['finding_id']}.json"
+    _validate_v1_finding_payload(payload, FINDINGS_ROOT / target_name)
+    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     tmp_name = f".finding-{payload['finding_id']}-{uuid.uuid4().hex}.tmp"
     dir_fd = os.open(FINDINGS_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     locked = False
@@ -1147,6 +1239,7 @@ def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
             fcntl.flock(dir_fd, fcntl.LOCK_UN)
         os.close(dir_fd)
     return finding_sha256, hashlib.sha256(encoded).hexdigest()
+
 
 @mcp.tool(name="submit_finding", annotations=FINDING_ANNOTATIONS)
 def submit_finding(
@@ -1195,6 +1288,10 @@ def submit_finding(
         if not parent_path.exists():
             raise ValueError("recheck_of finding does not exist")
         parent = _read_json_file_no_symlink(parent_path)
+        try:
+            _validate_v1_finding_payload(parent, parent_path)
+        except (RuntimeError, ValueError) as exc:
+            raise ValueError("recheck_of must reference a valid V1 finding") from exc
         if parent.get("finding_contract") != FINDING_CONTRACT:
             raise ValueError("recheck_of must reference a V1 finding")
         if parent.get("recheck_of") is not None:
