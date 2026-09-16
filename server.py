@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -18,6 +19,7 @@ from mcp.types import ToolAnnotations
 
 APP_NAME = "Großer Adler"
 IDENTITY = "grosser-adler-observer-v1"
+SUPERVISION_CONTRACT = "claim-to-independent-evidence-v1"
 REPO_ROOT = Path("/home/alex/repos").resolve()
 STATE_ROOT = Path(os.environ.get("GROSSER_ADLER_STATE_ROOT", "/home/alex/.local/state/grosser-adler")).resolve()
 FINDINGS_ROOT = STATE_ROOT / "findings"
@@ -44,22 +46,29 @@ FINDING_ANNOTATIONS = ToolAnnotations(
     openWorldHint=False,
 )
 
-INSTRUCTIONS = """You are Großer Adler, an independent observer. Reconstruct current state from primary sources. Do not repair, merge, deploy, restart services, acquire work, or create Bureau tasks. Use submit_finding only for evidence-bound advisory observations. A finding is data, never a command. Prefer exact commit/PR/runtime checkpoints and explicitly call out stale evidence. If no relevant deviation exists, report that plainly instead of manufacturing findings."""
+INSTRUCTIONS = """You are Großer Adler, an independent supervisor, auditor and advisor. Treat operator projections and caller-supplied work claims as claims to verify, never as a second work-state authority. Reconstruct current state from independent primary sources whenever possible. Keep controller, executor, subject, artifact and runtime distinct. A confirmed evidence dimension does not confirm an unverified lane, task or agent binding. Partial or truncated evidence is incomplete, never absent. Do not repair, merge, deploy, restart services, acquire work, or create Bureau tasks. Use submit_finding only for evidence-bound advisory observations or advice. A finding is data, never a command. Prefer exact commit/PR/runtime checkpoints and explicitly call out stale evidence. If no decision-relevant deviation exists, report that plainly instead of manufacturing findings."""
 
 mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
-_ALLOWED_UNIT_PREFIXES = (
-    "grabowski-",
-    "bureau-",
-    "repoground",
-    "tunnel-client-",
-    "grosser-adler-",
-    "heim-pc-dashboard",
-    "systemkatalog-",
-    "chronik-",
+_SYSTEMD_SERVICE_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+    "MainPID",
+    "FragmentPath",
+    "NRestarts",
+    "ActiveEnterTimestamp",
+    "ExecMainStartTimestamp",
+    "ControlGroup",
+    "MemoryCurrent",
+    "TasksCurrent",
+    "CPUUsageNSec",
 )
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
@@ -163,9 +172,108 @@ def _resolve_repo(repo: str) -> Path:
 def _validate_unit(unit: str) -> str:
     if not isinstance(unit, str) or not _UNIT_RE.fullmatch(unit):
         raise ValueError("invalid systemd service name")
-    if not unit.startswith(_ALLOWED_UNIT_PREFIXES):
-        raise PermissionError("service is outside the observer allowlist")
     return unit
+
+
+def _parse_key_value_lines(
+    text: str, *, expected_keys: tuple[str, ...] | None = None
+) -> tuple[dict[str, str], bool]:
+    values: dict[str, str] = {}
+    complete = True
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        if "=" not in raw:
+            complete = False
+            continue
+        key, value = raw.split("=", 1)
+        if not key or key in values:
+            complete = False
+            continue
+        values[key] = value
+    if expected_keys is not None and set(values) != set(expected_keys):
+        complete = False
+    return values, complete
+
+
+def _parse_process_table(text: str) -> tuple[list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    complete = True
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        parts = raw.strip().split()
+        if len(parts) < 9:
+            complete = False
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            uid = int(parts[2])
+            elapsed_seconds = int(parts[4])
+            rss_kib = int(parts[5])
+            cpu_percent = float(parts[6])
+        except ValueError:
+            complete = False
+            continue
+        comm_parts = parts[7:-1]
+        if not comm_parts:
+            complete = False
+            continue
+        rows.append({
+            "pid": pid,
+            "ppid": ppid,
+            "uid": uid,
+            "stat": parts[3],
+            "elapsed_seconds": elapsed_seconds,
+            "rss_kib": rss_kib,
+            "cpu_percent": cpu_percent,
+            "cgroup": _normalize_cgroup(parts[-1]),
+            "comm": " ".join(comm_parts),
+        })
+    return rows, complete
+
+
+def _normalize_cgroup(value: str) -> str:
+    if "::" in value:
+        value = value.split("::", 1)[1]
+    if not value.startswith("/"):
+        value = "/" + value.lstrip("/")
+    return value.rstrip("/") or "/"
+
+
+def _cgroup_within(process_cgroup: str, service_cgroup: str) -> bool:
+    process = _normalize_cgroup(process_cgroup)
+    service = _normalize_cgroup(service_cgroup)
+    return process == service or process.startswith(service.rstrip("/") + "/")
+
+
+def _descendant_rows(rows: list[dict[str, Any]], root_pid: int) -> list[dict[str, Any]]:
+    by_parent: dict[int, list[dict[str, Any]]] = {}
+    by_pid: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        by_pid[row["pid"]] = row
+        by_parent.setdefault(row["ppid"], []).append(row)
+    if root_pid not in by_pid:
+        return []
+    result: list[dict[str, Any]] = []
+    queue = [root_pid]
+    seen: set[int] = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        row = by_pid.get(pid)
+        if row is not None:
+            result.append(row)
+        queue.extend(child["pid"] for child in by_parent.get(pid, []))
+    return result
+
+
+def _status_is_clean(status_stdout: str) -> bool:
+    lines = [line for line in status_stdout.splitlines() if line.strip()]
+    return bool(lines) and all(line.startswith("##") for line in lines)
 
 
 def _validate_github_repo(repo: str) -> str:
@@ -175,7 +283,11 @@ def _validate_github_repo(repo: str) -> str:
 
 
 def _validate_revision(revision: str) -> str:
-    if not isinstance(revision, str) or not _REV_RE.fullmatch(revision):
+    if (
+        not isinstance(revision, str)
+        or revision.startswith("-")
+        or not _REV_RE.fullmatch(revision)
+    ):
         raise ValueError("invalid Git revision")
     return revision
 
@@ -243,6 +355,8 @@ def adler_status() -> dict[str, Any]:
         "mode": "read-mostly",
         "repository_root": str(REPO_ROOT),
         "finding_store": str(FINDINGS_ROOT),
+        "supervision_contract": SUPERVISION_CONTRACT,
+        "work_state_authority": False,
         "allowed_effects": ["append_finding"],
         "forbidden_effects": [
             "shell",
@@ -256,6 +370,7 @@ def adler_status() -> dict[str, Any]:
             "process_signal",
             "bureau_mutation",
             "work_or_lease_acquisition",
+            "agent_start",
             "secret_reveal",
         ],
         "observed_at": _utc_now(),
@@ -264,14 +379,28 @@ def adler_status() -> dict[str, Any]:
 
 @mcp.tool(name="git_status", annotations=READ_ANNOTATIONS)
 def git_status(repo: str) -> dict[str, Any]:
-    """Read current branch/head/worktree status for one repository under /home/alex/repos."""
+    """Read branch/head/cleanliness without exposing untracked filenames."""
     root = _resolve_repo(repo)
-    result = _run([
+    status = _run([
         "/usr/bin/git", "-c", "core.fsmonitor=false", "-C", str(root),
         "status", "--short", "--branch", "--untracked-files=no",
     ])
-    head = _run(["/usr/bin/git", "-C", str(root), "rev-parse", "HEAD"])
-    return {"repo": str(root), "status": result, "head": head, "observed_at": _utc_now()}
+    untracked = _run([
+        "/usr/bin/git", "-c", "core.fsmonitor=false", "-C", str(root),
+        "ls-files", "--others", "--exclude-standard", "-z",
+    ])
+    head = _run(["/usr/bin/git", "-C", str(root), "rev-parse", "HEAD"] )
+    status_complete = status["returncode"] == 0 and not status["stdout_truncated"]
+    untracked_complete = untracked["returncode"] == 0 and not untracked["stdout_truncated"]
+    head_complete = head["returncode"] == 0 and not head["stdout_truncated"]
+    return {
+        "repo": str(root),
+        "status": status,
+        "head": head,
+        "untracked_present": bool(untracked["stdout"]) if untracked_complete else None,
+        "observation_complete": status_complete and untracked_complete and head_complete,
+        "observed_at": _utc_now(),
+    }
 
 
 @mcp.tool(name="git_log", annotations=READ_ANNOTATIONS)
@@ -315,22 +444,378 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     return {"repo": gh_repo, "pr": pr, "metadata": metadata, "reviews": reviews, "observed_at": _utc_now()}
 
 
+@mcp.tool(name="list_user_services", annotations=READ_ANNOTATIONS)
+def list_user_services() -> dict[str, Any]:
+    """Discover user-systemd services without a name allowlist or mutation authority."""
+    result = _run(["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"], timeout=20)
+    source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    parse_complete = source_complete
+    units: list[dict[str, str]] = []
+    if source_complete:
+        for raw in result["stdout"].splitlines():
+            if not raw.strip():
+                continue
+            parts = raw.strip().split(None, 4)
+            if parts and parts[0] == "●":
+                parts = parts[1:]
+            if len(parts) < 4 or not _UNIT_RE.fullmatch(parts[0]):
+                parse_complete = False
+                continue
+            units.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
+    observation_complete = source_complete and parse_complete
+    if not observation_complete:
+        units = []
+    return {
+        "services": units,
+        "observation_complete": observation_complete,
+        "parse_complete": parse_complete,
+        "source": result,
+        "observed_at": _utc_now(),
+    }
+
+
 @mcp.tool(name="service_status", annotations=READ_ANNOTATIONS)
 def service_status(unit: str) -> dict[str, Any]:
-    """Read fixed user-systemd status fields for one allowlisted service."""
+    """Read fixed status, lifecycle, cgroup and resource fields for any user service."""
     safe_unit = _validate_unit(unit)
-    result = _run([
-        "/usr/bin/systemctl", "--user", "show", safe_unit, "--no-pager",
-        "--property=LoadState", "--property=ActiveState", "--property=SubState",
-        "--property=Result", "--property=ExecMainCode", "--property=ExecMainStatus",
-        "--property=MainPID", "--property=FragmentPath",
-    ])
-    return {"unit": safe_unit, "status": result, "observed_at": _utc_now()}
+    result = _run(["/usr/bin/systemctl", "--user", "show", safe_unit, "--no-pager", "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=Result", "--property=ExecMainCode", "--property=ExecMainStatus", "--property=MainPID", "--property=FragmentPath", "--property=NRestarts", "--property=ActiveEnterTimestamp", "--property=ExecMainStartTimestamp", "--property=ControlGroup", "--property=MemoryCurrent", "--property=TasksCurrent", "--property=CPUUsageNSec"])
+    source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    properties: dict[str, str] = {}
+    parse_complete = False
+    if source_complete:
+        properties, parse_complete = _parse_key_value_lines(
+            result["stdout"], expected_keys=_SYSTEMD_SERVICE_PROPERTIES
+        )
+    observation_complete = source_complete and parse_complete
+    if not observation_complete:
+        properties = {}
+    return {
+        "unit": safe_unit,
+        "status": result,
+        "properties": properties,
+        "parse_complete": parse_complete,
+        "observation_complete": observation_complete,
+        "observed_at": _utc_now(),
+    }
+
+
+def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
+    """Read a service-bound same-UID process tree without argv or mutation authority."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    if not isinstance(control_group, str) or not control_group.strip():
+        raise ValueError("control_group must be non-empty")
+    table = _run([
+        "/usr/bin/ps", "-ww", "-eo",
+        "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,comm=,cgroup=",
+    ], timeout=20)
+    source_complete = table["returncode"] == 0 and not table["stdout_truncated"]
+    rows: list[dict[str, Any]] = []
+    parse_complete = False
+    if source_complete:
+        rows, parse_complete = _parse_process_table(table["stdout"])
+    rows = [row for row in rows if row["uid"] == os.getuid()]
+    descendants = _descendant_rows(rows, pid)
+    processes = [
+        row for row in descendants
+        if _cgroup_within(row["cgroup"], control_group)
+    ]
+    root = next((row for row in processes if row["pid"] == pid), None)
+    return {
+        "root_pid": pid,
+        "scope": "service_cgroup_same_uid",
+        "uid": os.getuid(),
+        "control_group": _normalize_cgroup(control_group),
+        "processes": processes,
+        "source_returncode": table["returncode"],
+        "source_truncated": table["stdout_truncated"],
+        "parse_complete": parse_complete,
+        "complete": source_complete and parse_complete and root is not None,
+        "observed_at": _utc_now(),
+    }
+
+
+@mcp.tool(name="service_runtime", annotations=READ_ANNOTATIONS)
+def service_runtime(unit: str) -> dict[str, Any]:
+    """Correlate one user service with its cgroup-bound process tree and listeners."""
+    status = service_status(unit)
+    props = status["properties"]
+    status_complete = status["observation_complete"]
+    missing: list[str] = []
+    if not status_complete:
+        missing.append("systemd_status")
+
+    active_state = props.get("ActiveState")
+    if status_complete and active_state is None:
+        missing.append("active_state")
+
+    try:
+        main_pid = int(props.get("MainPID", "0") or "0")
+    except ValueError:
+        main_pid = 0
+        missing.append("main_pid")
+    control_group = props.get("ControlGroup", "").strip()
+    if active_state == "active" and main_pid <= 0:
+        missing.append("main_pid")
+    if main_pid > 0 and not control_group:
+        missing.append("control_group")
+
+    process_observation: dict[str, Any] = {
+        "root_pid": main_pid,
+        "scope": "service_cgroup_same_uid",
+        "processes": [],
+        "complete": False,
+    }
+    if main_pid > 0 and control_group:
+        process_observation = _process_snapshot(main_pid, control_group)
+        if not process_observation["complete"]:
+            missing.append("process_tree")
+
+    sockets = _run(["/usr/bin/ss", "-H", "-lntue"], timeout=20)
+    socket_lines = [line for line in sockets["stdout"].splitlines() if line.strip()]
+    sockets_source_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
+    socket_cgroups: list[tuple[str, str]] = []
+    listener_observation_complete = sockets_source_complete
+    if sockets_source_complete:
+        for line in socket_lines:
+            match = re.search(r"(?:^|\s)cgroup:(\S+)", line)
+            if match is None:
+                listener_observation_complete = False
+                break
+            socket_cgroups.append((line, match.group(1)))
+
+    listeners: list[str] = []
+    if listener_observation_complete and control_group:
+        listeners = [
+            line for line, socket_cgroup in socket_cgroups
+            if _cgroup_within(socket_cgroup, control_group)
+        ]
+    if not listener_observation_complete:
+        missing.append("listeners")
+
+    return {
+        "unit": unit,
+        "service": props,
+        "main_pid": main_pid,
+        "control_group": _normalize_cgroup(control_group) if control_group else None,
+        "processes": process_observation.get("processes", []),
+        "listeners": listeners,
+        "listener_observation_complete": listener_observation_complete,
+        "missing_evidence": sorted(set(missing)),
+        "complete": not missing,
+        "observed_at": _utc_now(),
+    }
+
+
+@mcp.tool(name="supervise_work", annotations=READ_ANNOTATIONS)
+def supervise_work(
+    binding_kind: Literal["grabowski_lane", "agent_run", "bureau_task", "pr", "manual"],
+    binding_id: str,
+    repo: str,
+    claimed_head: str | None = None,
+    expect_clean: bool | None = None,
+    unit: str | None = None,
+    expect_service_active: bool | None = None,
+    github_repo: str | None = None,
+    pr: int | None = None,
+) -> dict[str, Any]:
+    """Verify explicit claim dimensions without claiming ownership of work identity."""
+    if not isinstance(binding_id, str) or not binding_id.strip() or len(binding_id) > 500:
+        raise ValueError("binding_id must be 1..500 characters")
+    if (github_repo is None) != (pr is None):
+        raise ValueError("github_repo and pr must be supplied together")
+    if expect_service_active is not None and unit is None:
+        raise ValueError("unit is required when expect_service_active is supplied")
+    if claimed_head is not None:
+        _validate_revision(claimed_head)
+
+    dimensions: dict[str, dict[str, Any]] = {}
+    contradictions: list[str] = []
+    missing: list[str] = []
+
+    local = git_status(repo)
+    evidence: dict[str, Any] = {"local_git": local}
+    actual_head = (
+        local["head"]["stdout"].strip()
+        if local.get("observation_complete") and local["head"]["returncode"] == 0
+        else None
+    )
+    clean: bool | None = None
+    if local.get("observation_complete"):
+        tracked_clean = _status_is_clean(local["status"]["stdout"])
+        clean = tracked_clean and local.get("untracked_present") is False
+
+    if claimed_head is not None:
+        if actual_head is None:
+            dimensions["local_git_head"] = {"status": "incomplete"}
+            missing.append("local_git_head")
+        elif actual_head == claimed_head:
+            dimensions["local_git_head"] = {"status": "confirmed", "observed": actual_head}
+        else:
+            dimensions["local_git_head"] = {"status": "contradicted", "observed": actual_head}
+            contradictions.append(f"local_head:{actual_head}!=claimed_head:{claimed_head}")
+    else:
+        dimensions["local_git_head"] = {"status": "not_requested", "observed": actual_head}
+
+    if expect_clean is not None:
+        if clean is None:
+            dimensions["cleanliness"] = {"status": "incomplete"}
+            missing.append("cleanliness")
+        elif clean == expect_clean:
+            dimensions["cleanliness"] = {"status": "confirmed", "observed": clean}
+        else:
+            dimensions["cleanliness"] = {"status": "contradicted", "observed": clean}
+            contradictions.append(f"clean:{clean}!=expected:{expect_clean}")
+    else:
+        dimensions["cleanliness"] = {"status": "not_requested", "observed": clean}
+
+    runtime = None
+    if unit is not None:
+        runtime = service_runtime(unit)
+        evidence["runtime"] = runtime
+        missing.extend(f"runtime:{item}" for item in runtime["missing_evidence"])
+        if expect_service_active is not None:
+            active_state = runtime["service"].get("ActiveState")
+            if "systemd_status" in runtime["missing_evidence"] or active_state is None:
+                dimensions["runtime_active"] = {"status": "incomplete"}
+                missing.append("runtime:active_state")
+            else:
+                active = active_state == "active"
+                if active == expect_service_active:
+                    dimensions["runtime_active"] = {"status": "confirmed", "observed": active}
+                else:
+                    dimensions["runtime_active"] = {"status": "contradicted", "observed": active}
+                    contradictions.append(f"service_active:{active}!=expected:{expect_service_active}")
+        else:
+            dimensions["runtime_active"] = {"status": "not_requested"}
+    else:
+        dimensions["runtime_active"] = {"status": "not_requested"}
+
+    remote = None
+    metadata: dict[str, Any] | None = None
+    if github_repo is not None and pr is not None:
+        remote = github_pr(github_repo, pr)
+        evidence["github_pr"] = remote
+        if remote["metadata"]["returncode"] == 0 and not remote["metadata"].get("stdout_truncated", False):
+            try:
+                parsed = json.loads(remote["metadata"]["stdout"])
+                metadata = parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                metadata = None
+        observed_pr_number = metadata.get("number") if metadata is not None else None
+        if metadata is None or observed_pr_number is None:
+            dimensions["github_pr"] = {"status": "incomplete"}
+            missing.append("github_pr_metadata")
+        elif observed_pr_number != pr:
+            dimensions["github_pr"] = {"status": "contradicted", "number": observed_pr_number}
+            contradictions.append(f"pr_number:{observed_pr_number}!=requested:{pr}")
+        else:
+            dimensions["github_pr"] = {"status": "confirmed", "number": observed_pr_number}
+            if claimed_head is not None:
+                pr_head = metadata.get("headRefOid")
+                if not pr_head:
+                    dimensions["github_pr_head"] = {"status": "incomplete"}
+                    missing.append("github_pr_head")
+                elif pr_head == claimed_head:
+                    dimensions["github_pr_head"] = {"status": "confirmed", "observed": pr_head}
+                else:
+                    dimensions["github_pr_head"] = {"status": "contradicted", "observed": pr_head}
+                    contradictions.append(f"pr_head:{pr_head}!=claimed_head:{claimed_head}")
+            else:
+                dimensions["github_pr_head"] = {"status": "not_requested"}
+    else:
+        dimensions["github_pr"] = {"status": "not_requested"}
+        dimensions["github_pr_head"] = {"status": "not_requested"}
+
+    if binding_kind == "manual":
+        binding_status = "not_applicable"
+    elif binding_kind == "pr":
+        expected_binding = f"{github_repo}#{pr}" if github_repo is not None and pr is not None else None
+        if (
+            metadata is None
+            or metadata.get("number") != pr
+            or expected_binding is None
+        ):
+            binding_status = "incomplete"
+            missing.append("binding_identity")
+        elif binding_id.strip() != expected_binding:
+            binding_status = "contradicted"
+            contradictions.append(f"binding:{binding_id.strip()}!=observed:{expected_binding}")
+        else:
+            binding_status = "confirmed"
+    else:
+        binding_status = "unverified"
+        missing.append("binding_identity")
+    dimensions["binding_identity"] = {"status": binding_status}
+
+    requested = [
+        value["status"] for name, value in dimensions.items()
+        if name != "binding_identity" and value["status"] != "not_requested"
+    ]
+    if any(status == "contradicted" for status in requested):
+        evidence_conclusion = "contradicted"
+    elif any(status == "incomplete" for status in requested):
+        evidence_conclusion = "incomplete"
+    elif requested and all(status == "confirmed" for status in requested):
+        evidence_conclusion = "confirmed"
+    else:
+        evidence_conclusion = "unknown"
+
+    if contradictions:
+        conclusion = "contradicted"
+    elif binding_status in {"unverified", "incomplete"} or missing:
+        conclusion = "incomplete"
+    elif evidence_conclusion == "confirmed" and binding_status in {"confirmed", "not_applicable"}:
+        conclusion = "confirmed"
+    else:
+        conclusion = evidence_conclusion
+
+    components: list[dict[str, str]] = []
+    if actual_head:
+        components.append({"name": "local_head", "value": actual_head})
+    if runtime is not None:
+        components.append({"name": "runtime_main_pid", "value": str(runtime["main_pid"])})
+        if runtime["service"].get("ExecMainStartTimestamp"):
+            components.append({"name": "runtime_start", "value": runtime["service"]["ExecMainStartTimestamp"]})
+        if runtime["service"].get("NRestarts") is not None:
+            components.append({"name": "runtime_restarts", "value": runtime["service"].get("NRestarts", "")})
+        if runtime.get("control_group"):
+            components.append({"name": "runtime_cgroup", "value": runtime["control_group"]})
+    if metadata:
+        if metadata.get("headRefOid"):
+            components.append({"name": "pr_head", "value": metadata["headRefOid"]})
+        if metadata.get("baseRefOid"):
+            components.append({"name": "pr_base", "value": metadata["baseRefOid"]})
+
+    return {
+        "schema_version": 2,
+        "supervision_contract": SUPERVISION_CONTRACT,
+        "work_state_authority": False,
+        "binding": {"kind": binding_kind, "id": binding_id.strip(), "verification": binding_status},
+        "claim": {
+            "claimed_head": claimed_head,
+            "expect_clean": expect_clean,
+            "unit": unit,
+            "expect_service_active": expect_service_active,
+            "github_repo": github_repo,
+            "pr": pr,
+        },
+        "conclusion": conclusion,
+        "evidence_conclusion": evidence_conclusion,
+        "dimensions": dimensions,
+        "contradictions": contradictions,
+        "missing_evidence": sorted(set(missing)),
+        "evidence": evidence,
+        "checkpoint_components": sorted(components, key=lambda item: item["name"]),
+        "persisted": False,
+        "automatic_effect": False,
+        "observed_at": _utc_now(),
+    }
 
 
 @mcp.tool(name="service_logs", annotations=READ_ANNOTATIONS)
 def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
-    """Read bounded recent journal lines for one allowlisted user service."""
+    """Read bounded recent journal lines for any syntactically valid user service."""
     safe_unit = _validate_unit(unit)
     if not isinstance(lines, int) or isinstance(lines, bool) or not 1 <= lines <= 500:
         raise ValueError("lines must be between 1 and 500")
@@ -366,6 +851,11 @@ def list_findings(limit: int = 20) -> dict[str, Any]:
             "severity": payload.get("severity"),
             "status": payload.get("status"),
             "summary": payload.get("summary"),
+            "target_actor": payload.get("target_actor"),
+            "binding": payload.get("binding"),
+            "recommendation": payload.get("recommendation"),
+            "rationale": payload.get("rationale"),
+            "confidence": payload.get("confidence"),
             "observed_at": payload.get("observed_at"),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         })
@@ -374,17 +864,12 @@ def list_findings(limit: int = 20) -> dict[str, Any]:
 
 @mcp.tool(name="submit_finding", annotations=FINDING_ANNOTATIONS)
 def submit_finding(
-    subject_kind: Literal["repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane"],
-    subject: str,
-    severity: Literal["low", "medium", "high", "critical"],
-    summary: str,
-    evidence_refs: list[str],
-    checkpoint: str | None = None,
-    checkpoint_mode: Literal["single", "relational"] = "single",
-    checkpoint_components: list[dict[str, str]] | None = None,
-    status: Literal["observation", "finding", "recheck_suggested"] = "finding",
+    subject_kind: Literal["repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane", "agent_run", "service", "work"],
+    subject: str, severity: Literal["low", "medium", "high", "critical"], summary: str, evidence_refs: list[str], checkpoint: str | None = None, checkpoint_mode: Literal["single", "relational"] = "single", checkpoint_components: list[dict[str, str]] | None = None,
+    status: Literal["observation", "finding", "recheck_suggested", "contradiction", "missing_evidence", "risk", "advice", "recheck_required"] = "finding",
+    target_actor: str | None = None, binding: str | None = None, recommendation: str | None = None, rationale: str | None = None, confidence: float | None = None,
 ) -> dict[str, Any]:
-    """Append one advisory finding. For relational claims set checkpoint_mode='relational' and bind every relevant state as at least two checkpoint_components; single mode forbids components. This never triggers a task or action."""
+    """Append one evidence-bound advisory record; never create work or trigger action."""
     _ensure_state()
     if not isinstance(subject, str) or not subject.strip() or len(subject) > 500:
         raise ValueError("subject must be 1..500 characters")
@@ -402,30 +887,53 @@ def submit_finding(
             )
     elif normalized_checkpoints is not None:
         raise ValueError("checkpoint_components require checkpoint_mode='relational'")
+    optional_text = {"target_actor": target_actor, "binding": binding, "recommendation": recommendation, "rationale": rationale}
+    for field, value in optional_text.items():
+        if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > MAX_SUMMARY_CHARS): raise ValueError(f"{field} must be 1..{MAX_SUMMARY_CHARS} characters when supplied")
+    if confidence is not None and (not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or (isinstance(confidence, float) and not math.isfinite(confidence)) or confidence < 0 or confidence > 1): raise ValueError("confidence must be a finite number between 0 and 1")
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
         raise ValueError(f"evidence_refs must contain 1..{MAX_EVIDENCE_REFS} entries")
     cleaned_refs: list[str] = []
     for ref in evidence_refs:
         if not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_EVIDENCE_REF_CHARS:
             raise ValueError("invalid evidence reference")
-        cleaned_refs.append(ref.strip())
+        cleaned_refs.append(_redact(ref.strip()))
+    subject_clean = _redact(subject.strip())
+    summary_clean = _redact(summary.strip())
+    optional_clean = {
+        field: _redact(value.strip()) if value is not None else None
+        for field, value in optional_text.items()
+    }
 
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    enriched = (
+        status not in {"observation", "finding", "recheck_suggested"}
+        or any(value is not None for value in optional_text.values())
+        or confidence is not None
+    )
     payload = {
-        "schema_version": 2 if checkpoint_mode == "relational" else 1,
+        "schema_version": 3 if enriched else (2 if checkpoint_mode == "relational" else 1),
         "finding_id": finding_id,
         "adler_identity": IDENTITY,
         "subject_kind": subject_kind,
-        "subject": subject.strip(),
-        "checkpoint": checkpoint,
+        "subject": subject_clean,
+        "checkpoint": _redact(checkpoint) if checkpoint is not None else None,
         "severity": severity,
         "status": status,
-        "summary": summary.strip(),
+        "summary": summary_clean,
         "evidence_refs": cleaned_refs,
         "observed_at": observed_at,
         "effect_contract": "advisory_only_no_automatic_action",
     }
+    if enriched:
+        payload.update({
+            "target_actor": optional_clean["target_actor"],
+            "binding": optional_clean["binding"],
+            "recommendation": optional_clean["recommendation"],
+            "rationale": optional_clean["rationale"],
+            "confidence": float(confidence) if confidence is not None else None,
+        })
     if checkpoint_mode == "relational":
         assert normalized_checkpoints is not None
         payload.update({
