@@ -18,8 +18,21 @@ def _configure_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     state.mkdir(mode=0o700)
     monkeypatch.setattr(server, "STATE_ROOT", state)
     monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
-    monkeypatch.setattr(server, "WORKTREE_WRITE_ROOT", tmp_path.resolve())
+    monkeypatch.setattr(server, "INBOX_ROOT", state / "worktree-inboxes")
+    monkeypatch.setattr(server, "WORKTREE_ROOT", tmp_path.resolve())
     return state
+
+
+def _install_pointer(worktree: Path, state: Path, lane_id: str) -> Path:
+    worktree.mkdir(parents=True, exist_ok=True)
+    sidecar = worktree / ".adler"
+    sidecar.mkdir(mode=0o700)
+    gitignore = sidecar / ".gitignore"
+    gitignore.write_bytes(b"*\n")
+    gitignore.chmod(0o600)
+    target = state / "worktree-inboxes" / f"{lane_id}.json"
+    (sidecar / "inbox.json").symlink_to(target)
+    return target
 
 
 def _finding_args(**overrides):
@@ -156,130 +169,142 @@ def test_registered_head_drift_is_rejected(tmp_path: Path, monkeypatch: pytest.M
         server.get_work_target(lane_id)
 
 
-def test_foreign_inbox_is_never_overwritten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
+def test_missing_grabowski_pointer_is_not_created_by_adler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
-    sidecar = worktree / ".adler"
-    sidecar.mkdir(parents=True, mode=0o700)
-    (sidecar / ".gitignore").write_bytes(b"*\n")
-    (sidecar / ".gitignore").chmod(0o600)
-    foreign = json.dumps({"writer_identity": "someone-else", "contract": server.SIDECAR_CONTRACT}).encode()
-    (sidecar / "inbox.json").write_bytes(foreign)
-    (sidecar / "inbox.json").chmod(0o600)
+    worktree.mkdir()
     lane_id = "e" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
-    with pytest.raises(RuntimeError, match="not Adler-owned"):
+    with pytest.raises(RuntimeError, match="sidecar directory is missing"):
         server.publish_worktree_inbox(lane_id)
-    assert (sidecar / "inbox.json").read_bytes() == foreign
+    assert not (worktree / ".adler").exists()
+    assert not (state / "worktree-inboxes").exists()
 
 
-def test_sidecar_directory_wrong_owner_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wrong_pointer_target_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
-    sidecar = worktree / ".adler"
-    sidecar.mkdir(parents=True, mode=0o700)
-    real_uid = os.getuid()
-    monkeypatch.setattr(server.os, "getuid", lambda: real_uid + 1)
-    with pytest.raises(RuntimeError, match="unsafe .adler sidecar directory"):
-        server._ensure_sidecar_dir(worktree)
-
-
-def test_sidecar_directory_unsafe_permissions_are_rejected(tmp_path: Path) -> None:
-    worktree = tmp_path / "worktree"
-    sidecar = worktree / ".adler"
-    sidecar.mkdir(parents=True, mode=0o700)
-    sidecar.chmod(0o755)
-    with pytest.raises(RuntimeError, match="unsafe .adler directory permissions"):
-        server._ensure_sidecar_dir(worktree)
-
-
-def test_existing_inbox_unsafe_permissions_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"
-    sidecar = worktree / ".adler"
-    sidecar.mkdir(parents=True, mode=0o700)
-    (sidecar / ".gitignore").write_bytes(b"*\n")
-    (sidecar / ".gitignore").chmod(0o600)
-    payload = {"writer_identity": server.IDENTITY, "contract": server.SIDECAR_CONTRACT}
-    (sidecar / "inbox.json").write_text(json.dumps(payload), encoding="utf-8")
-    (sidecar / "inbox.json").chmod(0o644)
+    worktree.mkdir()
     lane_id = "f" * 32
-    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
-    with pytest.raises(RuntimeError, match="unsafe sidecar file permissions"):
-        server.publish_worktree_inbox(lane_id)
-
-
-def test_hardlinked_gitignore_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"
     sidecar = worktree / ".adler"
-    sidecar.mkdir(parents=True, mode=0o700)
-    outside = tmp_path / "outside-gitignore"
-    outside.write_bytes(b"*\n")
-    outside.chmod(0o600)
-    (sidecar / ".gitignore").hardlink_to(outside)
-    lane_id = "a" * 32
-    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
-    with pytest.raises(RuntimeError, match="unsafe existing sidecar file"):
-        server.publish_worktree_inbox(lane_id)
-
-
-def test_failed_atomic_replace_keeps_old_inbox_and_cleans_tempfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    sidecar = tmp_path / ".adler"
     sidecar.mkdir(mode=0o700)
-    old = (json.dumps({"writer_identity": server.IDENTITY, "contract": server.SIDECAR_CONTRACT}) + "\n").encode()
-    (sidecar / "inbox.json").write_bytes(old)
-    (sidecar / "inbox.json").chmod(0o600)
-    dir_fd = os.open(sidecar, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    monkeypatch.setattr(server.os, "replace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")))
-    try:
-        with pytest.raises(OSError, match="replace failed"):
-            server._atomic_write_inbox(dir_fd, b"new\n")
-    finally:
-        os.close(dir_fd)
-    assert (sidecar / "inbox.json").read_bytes() == old
-    assert list(sidecar.glob(".inbox-*.tmp")) == []
+    (sidecar / "inbox.json").symlink_to(state / "wrong.json")
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
+    with pytest.raises(RuntimeError, match="wrong Adler inbox"):
+        server.publish_worktree_inbox(lane_id)
+    assert not (state / "worktree-inboxes").exists()
 
 
-def test_sidecar_size_limit_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
+def test_regular_worktree_inbox_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     lane_id = "1" * 32
+    sidecar = worktree / ".adler"
+    sidecar.mkdir(mode=0o700)
+    regular = sidecar / "inbox.json"
+    regular.write_text("foreign", encoding="utf-8")
+    before = regular.read_bytes()
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
+    with pytest.raises(RuntimeError, match="unsafe .adler/inbox.json pointer"):
+        server.publish_worktree_inbox(lane_id)
+    assert regular.read_bytes() == before
+    assert not (state / "worktree-inboxes").exists()
+
+
+def test_external_foreign_inbox_is_never_overwritten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "2" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    target.parent.mkdir(mode=0o700)
+    foreign = (json.dumps({"writer_identity": "someone-else", "contract": server.SIDECAR_CONTRACT}) + "\n").encode()
+    target.write_bytes(foreign)
+    target.chmod(0o600)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
+    with pytest.raises(RuntimeError, match="not Adler-owned"):
+        server.publish_worktree_inbox(lane_id)
+    assert target.read_bytes() == foreign
+
+
+def test_failed_external_atomic_replace_preserves_old_and_cleans_temp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox_dir = tmp_path / "inboxes"
+    inbox_dir.mkdir(mode=0o700)
+    name = "lane.json"
+    old = (json.dumps({"writer_identity": server.IDENTITY, "contract": server.SIDECAR_CONTRACT}) + "\n").encode()
+    (inbox_dir / name).write_bytes(old)
+    (inbox_dir / name).chmod(0o600)
+    dir_fd = os.open(inbox_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    monkeypatch.setattr(server.os, "replace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")))
+    try:
+        with pytest.raises(OSError, match="replace failed"):
+            server._atomic_write_inbox(dir_fd, name, b"new\n")
+    finally:
+        os.close(dir_fd)
+    assert (inbox_dir / name).read_bytes() == old
+    assert list(inbox_dir.glob(f".{name}.*.tmp")) == []
+
+
+def test_publish_changes_only_external_inbox_not_worktree_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "3" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    sidecar = worktree / ".adler"
+    link_before = os.lstat(sidecar / "inbox.json")
+    gitignore_before = (sidecar / ".gitignore").read_bytes()
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
+    result = server.publish_worktree_inbox(lane_id)
+    link_after = os.lstat(sidecar / "inbox.json")
+    assert result["state"] == "published"
+    assert target.exists()
+    assert os.readlink(sidecar / "inbox.json") == str(target)
+    assert (link_before.st_dev, link_before.st_ino, link_before.st_mtime_ns) == (link_after.st_dev, link_after.st_ino, link_after.st_mtime_ns)
+    assert (sidecar / ".gitignore").read_bytes() == gitignore_before
+
+
+def test_sidecar_size_limit_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "4" * 32
+    target = _install_pointer(worktree, state, lane_id)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
     monkeypatch.setattr(server, "MAX_OUTPUT_BYTES", 64)
     with pytest.raises(RuntimeError, match="inbox exceeds bounded size"):
         server.publish_worktree_inbox(lane_id)
-    assert not (worktree / ".adler" / "inbox.json").exists()
+    assert not target.exists()
 
 
 def test_other_checkpoint_is_not_projected_as_current(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
+    state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    lane_id = "2" * 32
+    lane_id = "5" * 32
+    target = _install_pointer(worktree, state, lane_id)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane, checkpoint=OID_B))
     result = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}", checkpoint=OID_A))
     assert result["delivery"]["state"] == "published"
-    inbox = json.loads((worktree / ".adler" / "inbox.json").read_text(encoding="utf-8"))
+    inbox = json.loads(target.read_text(encoding="utf-8"))
     assert inbox["checkpoint"] == OID_B
     assert inbox["findings"] == []
+    assert (worktree / ".adler" / "inbox.json").read_text(encoding="utf-8") == target.read_text(encoding="utf-8")
 
 
 def test_free_text_secrets_are_redacted_before_persistence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     secret = "sk-proj-" + "A" * 24
-    result = server.submit_finding(**_finding_args(
-        summary=f"observed {secret}",
-        evidence_refs=[f"fixture:{secret}"],
-    ))
+    result = server.submit_finding(**_finding_args(summary=f"observed {secret}", evidence_refs=[f"fixture:{secret}"]))
     raw = (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
     assert secret not in raw
     assert "<REDACTED>" in raw
 
 
-def test_minimal_surface_has_no_general_file_writer() -> None:
+def test_minimal_surface_has_no_worktree_write_authority() -> None:
     status = server.adler_status()
     assert status["allowed_effects"] == ["append_finding", "publish_worktree_inbox"]
     assert "general_file_write" in status["forbidden_effects"]
+    assert "worktree_write_root" not in status
+    assert "inbox_store" in status
+    assert not hasattr(server, "_ensure_sidecar_dir")
+    assert not hasattr(server, "_ensure_sidecar_gitignore")
     assert not hasattr(server, "adler_probe")
     assert not hasattr(server, "write_file")

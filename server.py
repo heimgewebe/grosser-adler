@@ -26,8 +26,9 @@ ARCHITECTURE_CONTRACT = "observer-evidence-finding-delivery-v1"
 REPO_ROOT = Path("/home/alex/repos").resolve()
 STATE_ROOT = Path(os.environ.get("GROSSER_ADLER_STATE_ROOT", "/home/alex/.local/state/grosser-adler")).resolve()
 FINDINGS_ROOT = STATE_ROOT / "findings"
+INBOX_ROOT = STATE_ROOT / "worktree-inboxes"
 GRABOWSKI_WORK_LANES_ROOT = Path(os.environ.get("GROSSER_ADLER_WORK_LANES_ROOT", "/home/alex/.local/state/grabowski/work-lanes")).resolve()
-WORKTREE_WRITE_ROOT = Path(os.environ.get("GROSSER_ADLER_WORKTREE_ROOT", "/home/alex/repos/.grabowski-worktrees")).resolve()
+WORKTREE_ROOT = Path(os.environ.get("GROSSER_ADLER_WORKTREE_ROOT", "/home/alex/repos/.grabowski-worktrees")).resolve()
 MAX_OUTPUT_BYTES = 160_000
 MAX_JSON_SOURCE_BYTES = 1_000_000
 MAX_SUMMARY_CHARS = 4_000
@@ -58,7 +59,7 @@ SIDECAR_ANNOTATIONS = ToolAnnotations(
     openWorldHint=False,
 )
 
-INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and advisor. Reconstruct relevant state from primary evidence whenever possible. You do not own work state, decisions, execution, admission or lifecycle. Your only writes are immutable advisory findings in your own store and a narrowly confined current-view sidecar under a Grabowski-registered worktree .adler directory. Findings are facts or advice, never commands. Never create work, acquire leases, edit product files, commit, push, merge, deploy, control services, signal processes or mutate credentials. Partial evidence is incomplete, never absence. Prefer exact checkpoints and explicit uncertainty; do not manufacture findings."""
+INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and advisor. Reconstruct relevant state from primary evidence whenever possible. You do not own work state, decisions, execution, admission or lifecycle. Your only writes are immutable advisory findings and computed inbox files inside your own state root. Grabowski owns the worktree-local .adler/inbox.json symlink that points at the exact external inbox file. Findings are facts or advice, never commands. Never create work, acquire leases, edit worktree or product files, commit, push, merge, deploy, control services, signal processes or mutate credentials. Partial evidence is incomplete, never absence. Prefer exact checkpoints and explicit uncertainty; do not manufacture findings."""
 
 mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
@@ -310,7 +311,8 @@ def _validate_revision(revision: str) -> str:
 def _ensure_state() -> None:
     STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     FINDINGS_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for path in (STATE_ROOT, FINDINGS_ROOT):
+    INBOX_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for path in (STATE_ROOT, FINDINGS_ROOT, INBOX_ROOT):
         mode = stat.S_IMODE(path.stat().st_mode)
         if mode & 0o077:
             raise RuntimeError(f"unsafe state directory permissions: {path}")
@@ -330,8 +332,9 @@ def adler_status() -> dict[str, Any]:
         "worktree_sidecar_contract": SIDECAR_CONTRACT,
         "repository_root": str(REPO_ROOT),
         "finding_store": str(FINDINGS_ROOT),
+        "inbox_store": str(INBOX_ROOT),
         "work_lane_store": str(GRABOWSKI_WORK_LANES_ROOT),
-        "worktree_write_root": str(WORKTREE_WRITE_ROOT),
+        "worktree_observation_root": str(WORKTREE_ROOT),
         "work_state_authority": False,
         "allowed_effects": ["append_finding", "publish_worktree_inbox"],
         "forbidden_effects": [
@@ -848,15 +851,67 @@ def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]
     return current
 
 
-def _read_secure_sidecar_file(dir_fd: int, name: str) -> bytes | None:
+def _worktree_inbox_path(lane_id: str) -> Path:
+    return INBOX_ROOT / f"{lane_id}.json"
+
+
+def _validate_worktree_inbox_pointer(worktree: Path, lane_id: str) -> Path:
+    try:
+        worktree.relative_to(WORKTREE_ROOT)
+    except ValueError as exc:
+        raise PermissionError("lane worktree is outside Adler's observed worktree root") from exc
+
+    expected = _worktree_inbox_path(lane_id)
+    worktree_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        worktree_flags |= os.O_NOFOLLOW
+    root_fd = os.open(worktree, worktree_flags)
+    try:
+        try:
+            sidecar_st = os.stat(".adler", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError("Grabowski-owned .adler sidecar directory is missing") from exc
+        if not stat.S_ISDIR(sidecar_st.st_mode) or sidecar_st.st_uid != os.getuid():
+            raise RuntimeError("unsafe .adler sidecar directory")
+        if stat.S_IMODE(sidecar_st.st_mode) & 0o077:
+            raise RuntimeError("unsafe .adler directory permissions")
+        sidecar_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            sidecar_flags |= os.O_NOFOLLOW
+        dir_fd = os.open(".adler", sidecar_flags, dir_fd=root_fd)
+        try:
+            unexpected = set(os.listdir(dir_fd)) - {"inbox.json", ".gitignore"}
+            if unexpected:
+                raise RuntimeError(".adler contains files outside the inbox pointer contract")
+            try:
+                inbox_st = os.stat("inbox.json", dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise RuntimeError("Grabowski-owned .adler/inbox.json pointer is missing") from exc
+            if (
+                not stat.S_ISLNK(inbox_st.st_mode)
+                or inbox_st.st_uid != os.getuid()
+                or inbox_st.st_nlink != 1
+            ):
+                raise RuntimeError("unsafe .adler/inbox.json pointer")
+            target = os.readlink("inbox.json", dir_fd=dir_fd)
+            if target != str(expected):
+                raise RuntimeError(".adler/inbox.json pointer targets the wrong Adler inbox")
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+    return expected
+
+
+def _read_secure_state_inbox(dir_fd: int, name: str) -> bytes | None:
     try:
         st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
-        raise RuntimeError(f"unsafe existing sidecar file: {name}")
+        raise RuntimeError("unsafe existing external inbox file")
     if stat.S_IMODE(st.st_mode) & 0o077:
-        raise RuntimeError(f"unsafe sidecar file permissions: {name}")
+        raise RuntimeError("unsafe external inbox file permissions")
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -866,80 +921,25 @@ def _read_secure_sidecar_file(dir_fd: int, name: str) -> bytes | None:
     finally:
         os.close(fd)
     if len(raw) > MAX_OUTPUT_BYTES:
-        raise RuntimeError(f"sidecar file is unexpectedly large: {name}")
+        raise RuntimeError("external inbox is unexpectedly large")
     return raw
 
 
-def _secure_existing_inbox(dir_fd: int) -> None:
-    raw = _read_secure_sidecar_file(dir_fd, "inbox.json")
+def _secure_existing_state_inbox(dir_fd: int, name: str) -> None:
+    raw = _read_secure_state_inbox(dir_fd, name)
     if raw is None:
         return
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("existing inbox is not Adler-owned JSON") from exc
+        raise RuntimeError("existing external inbox is not Adler-owned JSON") from exc
     if payload.get("writer_identity") != IDENTITY or payload.get("contract") != SIDECAR_CONTRACT:
-        raise RuntimeError("existing inbox is not Adler-owned")
+        raise RuntimeError("existing external inbox is not Adler-owned")
 
 
-def _ensure_sidecar_gitignore(dir_fd: int) -> None:
-    raw = _read_secure_sidecar_file(dir_fd, ".gitignore")
-    if raw is not None:
-        if raw != b"*\n":
-            raise RuntimeError("existing .adler/.gitignore is not Adler-owned")
-        return
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(".gitignore", flags, 0o600, dir_fd=dir_fd)
-    try:
-        os.write(fd, b"*\n")
-        os.fsync(fd)
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
-            raise RuntimeError("unsafe sidecar gitignore file")
-    except BaseException:
-        try:
-            os.unlink(".gitignore", dir_fd=dir_fd)
-        finally:
-            os.close(fd)
-        raise
-    else:
-        os.close(fd)
-    os.fsync(dir_fd)
-
-
-def _ensure_sidecar_dir(worktree: Path) -> int:
-    worktree_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        worktree_flags |= os.O_NOFOLLOW
-    root_fd = os.open(worktree, worktree_flags)
-    try:
-        try:
-            os.mkdir(".adler", 0o700, dir_fd=root_fd)
-        except FileExistsError:
-            pass
-        st = os.stat(".adler", dir_fd=root_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-            raise RuntimeError("unsafe .adler sidecar directory")
-        if stat.S_IMODE(st.st_mode) & 0o077:
-            raise RuntimeError("unsafe .adler directory permissions")
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        dir_fd = os.open(".adler", flags, dir_fd=root_fd)
-        unexpected = set(os.listdir(dir_fd)) - {"inbox.json", ".gitignore"}
-        if unexpected:
-            os.close(dir_fd)
-            raise RuntimeError(".adler contains files not owned by the inbox contract")
-    finally:
-        os.close(root_fd)
-    return dir_fd
-
-
-def _atomic_write_inbox(dir_fd: int, encoded: bytes) -> None:
-    _secure_existing_inbox(dir_fd)
-    tmp_name = f".inbox-{uuid.uuid4().hex}.tmp"
+def _atomic_write_inbox(dir_fd: int, name: str, encoded: bytes) -> None:
+    _secure_existing_state_inbox(dir_fd, name)
+    tmp_name = f".{name}.{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -949,7 +949,7 @@ def _atomic_write_inbox(dir_fd: int, encoded: bytes) -> None:
         os.fsync(fd)
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
-            raise RuntimeError("unsafe sidecar temporary file")
+            raise RuntimeError("unsafe external inbox temporary file")
     except BaseException:
         try:
             os.unlink(tmp_name, dir_fd=dir_fd)
@@ -959,7 +959,7 @@ def _atomic_write_inbox(dir_fd: int, encoded: bytes) -> None:
     else:
         os.close(fd)
     try:
-        os.replace(tmp_name, "inbox.json", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
         try:
             os.unlink(tmp_name, dir_fd=dir_fd)
@@ -972,23 +972,27 @@ def _atomic_write_inbox(dir_fd: int, encoded: bytes) -> None:
 def _publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
     initial_target = _read_work_target(lane_id)
     worktree = Path(initial_target["worktree"])
-    try:
-        worktree.relative_to(WORKTREE_WRITE_ROOT)
-    except ValueError as exc:
-        raise PermissionError("lane worktree is outside Adler's sidecar write root") from exc
-    dir_fd = _ensure_sidecar_dir(worktree)
+    inbox_path = _validate_worktree_inbox_pointer(worktree, lane_id)
+    _ensure_state()
+    inbox_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        inbox_flags |= os.O_NOFOLLOW
+    inbox_dir_fd = os.open(INBOX_ROOT, inbox_flags)
     locked = False
     try:
-        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        fcntl.flock(inbox_dir_fd, fcntl.LOCK_EX)
         locked = True
         target = _read_work_target(lane_id)
         if Path(target["worktree"]) != worktree:
             raise RuntimeError("lane worktree changed during inbox publication")
+        if _validate_worktree_inbox_pointer(worktree, lane_id) != inbox_path:
+            raise RuntimeError("worktree inbox pointer changed during publication")
         findings = _current_lane_findings(lane_id, target["checkpoint"])
         payload = {
             "schema_version": 1,
             "contract": SIDECAR_CONTRACT,
             "writer_identity": IDENTITY,
+            "delivery_mode": "grabowski_owned_symlink_to_adler_state",
             "lane_id": lane_id,
             "repository": target["repository"],
             "worktree": target["worktree"],
@@ -996,6 +1000,7 @@ def _publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
             "checkpoint": target["checkpoint"],
             "source_complete": True,
             "source_store": str(FINDINGS_ROOT),
+            "inbox_store": str(inbox_path),
             "findings": findings,
             "generated_at": _utc_now(),
             "effect_contract": "advisory_only_no_automatic_action",
@@ -1009,21 +1014,23 @@ def _publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
         encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
         if len(encoded) > MAX_OUTPUT_BYTES:
             raise RuntimeError("worktree inbox exceeds bounded size")
-        _ensure_sidecar_gitignore(dir_fd)
-        _atomic_write_inbox(dir_fd, encoded)
+        _atomic_write_inbox(inbox_dir_fd, inbox_path.name, encoded)
+        _validate_worktree_inbox_pointer(worktree, lane_id)
     finally:
         if locked:
-            fcntl.flock(dir_fd, fcntl.LOCK_UN)
-        os.close(dir_fd)
+            fcntl.flock(inbox_dir_fd, fcntl.LOCK_UN)
+        os.close(inbox_dir_fd)
     return {
         "state": "published",
         "lane_id": lane_id,
         "checkpoint": target["checkpoint"],
         "finding_count": len(findings),
         "sidecar": str(worktree / ".adler" / "inbox.json"),
+        "inbox_store": str(inbox_path),
         "source_complete": True,
         "observed_at": _utc_now(),
     }
+
 
 @mcp.tool(name="publish_worktree_inbox", annotations=SIDECAR_ANNOTATIONS)
 def publish_worktree_inbox(lane_id: str) -> dict[str, Any]:

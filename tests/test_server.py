@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -444,8 +445,21 @@ def _configure_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     state.mkdir(mode=0o700)
     monkeypatch.setattr(server, "STATE_ROOT", state)
     monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
-    monkeypatch.setattr(server, "WORKTREE_WRITE_ROOT", tmp_path.resolve())
+    monkeypatch.setattr(server, "INBOX_ROOT", state / "worktree-inboxes")
+    monkeypatch.setattr(server, "WORKTREE_ROOT", tmp_path.resolve())
     return state
+
+
+def _install_pointer(worktree: Path, state: Path, lane_id: str) -> Path:
+    worktree.mkdir(parents=True, exist_ok=True)
+    sidecar = worktree / ".adler"
+    sidecar.mkdir(mode=0o700)
+    gitignore = sidecar / ".gitignore"
+    gitignore.write_bytes(b"*\n")
+    gitignore.chmod(0o600)
+    target = state / "worktree-inboxes" / f"{lane_id}.json"
+    (sidecar / "inbox.json").symlink_to(target)
+    return target
 
 
 def _seal_lane(lane: dict) -> dict:
@@ -599,10 +613,11 @@ def test_work_target_rejects_tampered_lane_receipt(tmp_path: Path, monkeypatch: 
         server.get_work_target(lane_id)
 
 
-def test_lane_finding_automatically_publishes_current_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; worktree.mkdir()
+def test_lane_finding_automatically_publishes_external_current_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
     lane_id = "3" * 32
+    target = _install_pointer(worktree, state, lane_id)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": str(tmp_path / "repo"), "worktree": str(worktree),
         "branch": "feature/minimal", "purpose": "fixture", "base_head": OID_B,
@@ -610,16 +625,14 @@ def test_lane_finding_automatically_publishes_current_sidecar(tmp_path: Path, mo
     })
     result = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}"))
     assert result["delivery"]["state"] == "published"
-    inbox = json.loads((worktree / ".adler" / "inbox.json").read_text(encoding="utf-8"))
+    assert result["delivery"]["inbox_store"] == str(target)
+    inbox = json.loads(target.read_text(encoding="utf-8"))
     assert inbox["contract"] == "adler-worktree-inbox-v1"
     assert inbox["writer_identity"] == server.IDENTITY
+    assert inbox["delivery_mode"] == "grabowski_owned_symlink_to_adler_state"
     assert inbox["checkpoint"] == OID_A
     assert [item["finding_id"] for item in inbox["findings"]] == [result["finding_id"]]
-    assert sorted(path.name for path in (worktree / ".adler").iterdir()) == [".gitignore", "inbox.json"]
-    assert (worktree / ".adler" / ".gitignore").read_bytes() == b"*\n"
-    assert (worktree / ".adler").stat().st_mode & 0o777 == 0o700
-    assert (worktree / ".adler" / ".gitignore").stat().st_mode & 0o777 == 0o600
-    assert (worktree / ".adler" / "inbox.json").stat().st_mode & 0o777 == 0o600
+    assert os.readlink(worktree / ".adler" / "inbox.json") == str(target)
 
 
 def test_sidecar_rejects_symlink_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -637,28 +650,11 @@ def test_sidecar_rejects_symlink_escape(tmp_path: Path, monkeypatch: pytest.Monk
     assert list(outside.iterdir()) == []
 
 
-def test_sidecar_rejects_hardlinked_inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; sidecar = worktree / ".adler"
-    sidecar.mkdir(parents=True, mode=0o700)
-    (sidecar / ".gitignore").write_bytes(b"*\n"); (sidecar / ".gitignore").chmod(0o600)
-    outside = tmp_path / "outside-inbox"
-    outside.write_text(json.dumps({"writer_identity": server.IDENTITY, "contract": server.SIDECAR_CONTRACT}), encoding="utf-8")
-    outside.chmod(0o600)
-    (sidecar / "inbox.json").hardlink_to(outside)
-    lane_id = "5" * 32
-    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
-        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
-        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
-    })
-    with pytest.raises(RuntimeError, match="unsafe existing sidecar file"):
-        server.publish_worktree_inbox(lane_id)
-
-
 def test_recheck_preserves_history_and_removes_no_longer_current_finding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; worktree.mkdir()
+    worktree = tmp_path / "worktree"
     lane_id = "6" * 32
+    target = _install_pointer(worktree, state, lane_id)
     checkpoint = {"value": OID_A}
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
@@ -675,15 +671,16 @@ def test_recheck_preserves_history_and_removes_no_longer_current_finding(tmp_pat
     assert second["delivery"]["state"] == "published"
     assert original_path.read_bytes() == before
     assert len(list((state / "findings").glob("*.json"))) == 2
-    inbox = json.loads((worktree / ".adler" / "inbox.json").read_text(encoding="utf-8"))
+    inbox = json.loads(target.read_text(encoding="utf-8"))
     assert inbox["checkpoint"] == OID_B
     assert inbox["findings"] == []
 
 
-def test_incomplete_finding_store_refuses_complete_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; worktree.mkdir()
+    worktree = tmp_path / "worktree"
     lane_id = "9" * 32
+    target = _install_pointer(worktree, state, lane_id)
     findings = state / "findings"; findings.mkdir(mode=0o700)
     bad = findings / "broken.json"; bad.write_text("{broken", encoding="utf-8"); bad.chmod(0o600)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
@@ -692,29 +689,28 @@ def test_incomplete_finding_store_refuses_complete_sidecar(tmp_path: Path, monke
     })
     with pytest.raises(RuntimeError, match="finding store observation is incomplete"):
         server.publish_worktree_inbox(lane_id)
-    assert not (worktree / ".adler" / "inbox.json").exists()
+    assert not target.exists()
 
 
-def test_sidecar_write_root_is_narrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
+def test_worktree_root_is_observation_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
     allowed = tmp_path / "allowed"; allowed.mkdir()
     worktree = tmp_path / "outside"; worktree.mkdir()
-    monkeypatch.setattr(server, "WORKTREE_WRITE_ROOT", allowed.resolve())
+    monkeypatch.setattr(server, "WORKTREE_ROOT", allowed.resolve())
     lane_id = "a" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
         "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
     })
-    with pytest.raises(PermissionError, match="outside Adler's sidecar write root"):
+    with pytest.raises(PermissionError, match="outside Adler's observed worktree root"):
         server.publish_worktree_inbox(lane_id)
     assert not (worktree / ".adler").exists()
+    assert not (state / "worktree-inboxes").exists()
 
 
-def test_delivery_failure_keeps_finding_durable_and_does_not_claim_absence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_delivery_failure_keeps_finding_durable_and_does_not_create_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"; worktree.mkdir()
-    outside = tmp_path / "outside"; outside.mkdir()
-    (worktree / ".adler").symlink_to(outside, target_is_directory=True)
     lane_id = "7" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
@@ -726,7 +722,8 @@ def test_delivery_failure_keeps_finding_durable_and_does_not_claim_absence(tmp_p
     assert result["delivery"]["source_complete"] is False
     assert result["delivery"]["finding_remains_durable"] is True
     assert (state / "findings" / f"{result['finding_id']}.json").exists()
-    assert list(outside.iterdir()) == []
+    assert not (worktree / ".adler").exists()
+
 
 def test_finding_install_is_atomic_when_final_rename_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
@@ -742,11 +739,12 @@ def test_finding_install_is_atomic_when_final_rename_fails(tmp_path: Path, monke
     monkeypatch.setattr(server.os, "rename", real_rename)
 
 
-def test_inbox_snapshot_waits_for_sidecar_publication_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; worktree.mkdir()
-    sidecar = worktree / ".adler"; sidecar.mkdir(mode=0o700)
+def test_inbox_snapshot_waits_for_external_inbox_store_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
     lane_id = "b" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    target.parent.mkdir(mode=0o700)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
         "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
@@ -757,13 +755,13 @@ def test_inbox_snapshot_waits_for_sidecar_publication_lock(tmp_path: Path, monke
         entered_projection.set()
         return real_projection(lane, checkpoint)
     monkeypatch.setattr(server, "_current_lane_findings", observed_projection)
-    lock_fd = server.os.open(sidecar, server.os.O_RDONLY | server.os.O_DIRECTORY | server.os.O_CLOEXEC)
+    lock_fd = server.os.open(target.parent, server.os.O_RDONLY | server.os.O_DIRECTORY | server.os.O_CLOEXEC)
     server.fcntl.flock(lock_fd, server.fcntl.LOCK_EX)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(server.publish_worktree_inbox, lane_id)
             assert entered_projection.wait(0.1) is False
-            assert not (sidecar / "inbox.json").exists()
+            assert not target.exists()
             server.fcntl.flock(lock_fd, server.fcntl.LOCK_UN)
             result = future.result(timeout=2)
     finally:
