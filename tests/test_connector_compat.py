@@ -128,6 +128,70 @@ def test_legacy_lane_submission_rejects_stale_checkpoint(
     assert not (state / "findings").exists() or list((state / "findings").glob("*.json")) == []
 
 
+def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "c" * 32
+    inbox_path = _install_pointer(worktree, state, lane_id)
+    targets = iter([
+        _target(worktree, lane_id),
+        {**_target(worktree, lane_id), "checkpoint": OID_B},
+    ])
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: next(targets))
+
+    result = server.submit_finding_legacy(
+        subject_kind="grabowski_lane",
+        subject=lane_id,
+        severity="medium",
+        summary="checkpoint race fixture",
+        evidence_refs=["fixture:checkpoint-race"],
+    )
+    assert result["accepted"] is True
+    assert result["delivery"]["state"] == "delivery_failed"
+    assert result["delivery"]["error_type"] == "RuntimeError"
+    assert result["delivery"]["finding_remains_durable"] is True
+    payload = json.loads(
+        (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
+    )
+    assert payload["checkpoint"] == OID_A
+    assert not inbox_path.exists()
+
+
+def test_strict_v1_lane_delivery_fails_closed_if_checkpoint_has_advanced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "d" * 32
+    inbox_path = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(
+        server,
+        "_read_work_target",
+        lambda lane: {**_target(worktree, lane), "checkpoint": OID_B},
+    )
+
+    result = server.submit_finding(
+        kind="risk",
+        severity="medium",
+        confidence=0.9,
+        subject=f"lane:{lane_id}",
+        checkpoint=OID_A,
+        binding_strength="exact",
+        summary="strict V1 checkpoint race fixture",
+        evidence_refs=["fixture:v1-checkpoint-race"],
+    )
+    assert result["accepted"] is True
+    assert result["delivery"]["state"] == "delivery_failed"
+    assert result["delivery"]["error_type"] == "RuntimeError"
+    payload = json.loads(
+        (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
+    )
+    assert payload["checkpoint"] == OID_A
+    assert not inbox_path.exists()
+
+
 def test_strict_v1_entry_remains_available_as_python_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

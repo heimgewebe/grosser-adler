@@ -1481,8 +1481,12 @@ def _atomic_write_inbox(dir_fd: int, name: str, encoded: bytes) -> None:
             os.close(existing_fd)
 
 
-def _publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
+def _publish_worktree_inbox(
+    lane_id: str, *, expected_checkpoint: str | None = None
+) -> dict[str, Any]:
     initial_target = _read_work_target(lane_id)
+    if expected_checkpoint is not None and initial_target["checkpoint"] != expected_checkpoint:
+        raise RuntimeError("lane checkpoint changed before inbox publication")
     worktree = Path(initial_target["worktree"])
     inbox_path = _validate_worktree_inbox_pointer(worktree, lane_id)
     _ensure_state()
@@ -1497,6 +1501,8 @@ def _publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
         target = _read_work_target(lane_id)
         if Path(target["worktree"]) != worktree:
             raise RuntimeError("lane worktree changed during inbox publication")
+        if expected_checkpoint is not None and target["checkpoint"] != expected_checkpoint:
+            raise RuntimeError("lane checkpoint changed during inbox publication")
         if _validate_worktree_inbox_pointer(worktree, lane_id) != inbox_path:
             raise RuntimeError("worktree inbox pointer changed during publication")
         findings = _current_lane_findings(lane_id, target["checkpoint"])
@@ -1726,7 +1732,10 @@ def submit_finding(
     lane_match = _LANE_SUBJECT_RE.fullmatch(subject_clean)
     if lane_match is not None:
         try:
-            delivery = _publish_worktree_inbox(lane_match.group(1))
+            delivery = _publish_worktree_inbox(
+                lane_match.group(1),
+                expected_checkpoint=checkpoint_clean,
+            )
         except Exception as exc:
             delivery = {
                 "state": "delivery_failed",
@@ -1817,7 +1826,9 @@ def submit_finding_legacy(
     delivery: dict[str, Any] = {"state": "not_applicable"}
     if lane_id is not None:
         try:
-            delivery = _publish_worktree_inbox(lane_id)
+            delivery = _publish_worktree_inbox(
+                lane_id, expected_checkpoint=checkpoint_clean
+            )
         except Exception as exc:
             delivery = {
                 "state": "delivery_failed",
