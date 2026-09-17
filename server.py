@@ -1861,6 +1861,7 @@ def submit_finding_legacy(
         "finding_id": finding_id,
         "finding_sha256": finding_sha256,
         "record_sha256": record_sha256,
+        "sha256": record_sha256,
         "legacy": True,
         "compatibility_contract": LEGACY_CONNECTOR_CONTRACT,
         "observed_at": observed_at,

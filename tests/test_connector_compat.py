@@ -60,6 +60,7 @@ def test_legacy_connector_record_does_not_invent_v1_confidence(
     )
     assert result["accepted"] is True
     assert result["legacy"] is True
+    assert result["sha256"] == result["record_sha256"]
     payload = json.loads(
         (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
     )
