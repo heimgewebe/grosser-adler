@@ -1775,11 +1775,12 @@ def submit_finding_legacy(
         raise ValueError("unsupported legacy status")
 
     subject_clean = _clean_required_identity_text(subject, "subject")
-    checkpoint_clean = (
-        _clean_required_identity_text(checkpoint, "checkpoint")
-        if checkpoint is not None
-        else None
-    )
+    if checkpoint is None or checkpoint == "":
+        checkpoint_clean = None
+    elif not isinstance(checkpoint, str) or len(checkpoint) > 500:
+        raise ValueError("checkpoint must be a string of at most 500 characters")
+    else:
+        checkpoint_clean = checkpoint
     if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
         raise ValueError(f"summary must be 1..{MAX_SUMMARY_CHARS} characters")
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
