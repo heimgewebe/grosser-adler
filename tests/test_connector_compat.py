@@ -100,7 +100,7 @@ def test_legacy_checkpoint_is_redacted_before_persistence(
 
 
 @pytest.mark.parametrize("checkpoint", [None, ""])
-def test_legacy_lane_submission_resolves_current_checkpoint_and_publishes(
+def test_legacy_lane_submission_preserves_blank_checkpoint_without_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint: str | None
 ) -> None:
     state = _configure_state(tmp_path, monkeypatch)
@@ -115,8 +115,36 @@ def test_legacy_lane_submission_resolves_current_checkpoint_and_publishes(
         checkpoint=checkpoint,
         severity="high",
         status="recheck_suggested",
-        summary="verify the separately imported helper",
-        evidence_refs=["fixture:runner-import"],
+        summary="preserve the historical checkpoint-free request",
+        evidence_refs=["fixture:blank-checkpoint"],
+    )
+    assert result["accepted"] is True
+    assert result["delivery"]["state"] == "not_applicable"
+    payload = json.loads(
+        (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
+    )
+    assert payload["subject"] == lane_id
+    assert payload["checkpoint"] == checkpoint
+    assert not inbox_path.exists()
+
+
+def test_legacy_lane_submission_with_explicit_checkpoint_publishes_raw_subject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "a" * 32
+    inbox_path = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
+
+    result = server.submit_finding_legacy(
+        subject_kind="grabowski_lane",
+        subject=lane_id,
+        checkpoint=OID_A,
+        severity="high",
+        status="recheck_suggested",
+        summary="deliver the explicitly checkpoint-bound legacy finding",
+        evidence_refs=["fixture:explicit-checkpoint"],
     )
     assert result["delivery"]["state"] == "published"
     inbox = json.loads(inbox_path.read_text(encoding="utf-8"))
@@ -124,7 +152,7 @@ def test_legacy_lane_submission_resolves_current_checkpoint_and_publishes(
     assert len(inbox["findings"]) == 1
     finding = inbox["findings"][0]
     assert finding["legacy"] is True
-    assert finding["subject"] == f"lane:{lane_id}"
+    assert finding["subject"] == lane_id
     assert finding["checkpoint"] == OID_A
     assert finding["status"] == "recheck_suggested"
     assert finding["compatibility_contract"] == server.LEGACY_CONNECTOR_CONTRACT
@@ -186,15 +214,8 @@ def test_legacy_lane_submission_persists_stale_checkpoint_and_fails_delivery(
     assert not inbox_path.exists()
 
 
-@pytest.mark.parametrize(
-    ("checkpoint", "stored_checkpoint"),
-    [(None, None), ("", None), (OID_A, OID_A)],
-)
 def test_legacy_lane_submission_persists_when_lane_cannot_be_resolved(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    checkpoint: str | None,
-    stored_checkpoint: str | None,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     lane_id = "e" * 32
@@ -207,7 +228,7 @@ def test_legacy_lane_submission_persists_when_lane_cannot_be_resolved(
     result = server.submit_finding_legacy(
         subject_kind="grabowski_lane",
         subject=lane_id,
-        checkpoint=checkpoint,
+        checkpoint=OID_A,
         severity="medium",
         summary="preserve finding even when delivery target is unavailable",
         evidence_refs=["fixture:unresolved-lane"],
@@ -220,8 +241,8 @@ def test_legacy_lane_submission_persists_when_lane_cannot_be_resolved(
     payload = json.loads(
         (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
     )
-    assert payload["subject"] == f"lane:{lane_id}"
-    assert payload["checkpoint"] == stored_checkpoint
+    assert payload["subject"] == lane_id
+    assert payload["checkpoint"] == OID_A
     assert payload["compatibility_contract"] == server.LEGACY_CONNECTOR_CONTRACT
     assert "confidence" not in payload
     assert "binding_strength" not in payload
@@ -235,7 +256,6 @@ def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_persist(
     lane_id = "c" * 32
     inbox_path = _install_pointer(worktree, state, lane_id)
     targets = iter([
-        _target(worktree, lane_id),
         {**_target(worktree, lane_id), "checkpoint": OID_B},
     ])
     monkeypatch.setattr(server, "_read_work_target", lambda lane: next(targets))
@@ -243,6 +263,7 @@ def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_persist(
     result = server.submit_finding_legacy(
         subject_kind="grabowski_lane",
         subject=lane_id,
+        checkpoint=OID_A,
         severity="medium",
         summary="checkpoint race fixture",
         evidence_refs=["fixture:checkpoint-race"],
@@ -254,6 +275,7 @@ def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_persist(
     payload = json.loads(
         (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
     )
+    assert payload["subject"] == lane_id
     assert payload["checkpoint"] == OID_A
     assert not inbox_path.exists()
 
@@ -268,7 +290,6 @@ def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_inbox_wr
     targets = iter([
         _target(worktree, lane_id),
         _target(worktree, lane_id),
-        _target(worktree, lane_id),
         {**_target(worktree, lane_id), "checkpoint": OID_B},
     ])
     monkeypatch.setattr(server, "_read_work_target", lambda lane: next(targets))
@@ -276,6 +297,7 @@ def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_inbox_wr
     result = server.submit_finding_legacy(
         subject_kind="grabowski_lane",
         subject=lane_id,
+        checkpoint=OID_A,
         severity="medium",
         summary="post-write checkpoint race fixture",
         evidence_refs=["fixture:post-write-checkpoint-race"],
