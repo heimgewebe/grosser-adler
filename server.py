@@ -1772,7 +1772,7 @@ def submit_finding_legacy(
     checkpoint: str | None = None,
     status: Literal["observation", "finding", "recheck_suggested"] = "finding",
 ) -> dict[str, Any]:
-    """Accept the historical connector shape; grabowski_lane subjects are exact lane ids or lane:<id>."""
+    """Persist the historical connector shape; only exact lane ids are eligible for optional delivery."""
     _ensure_state()
     if subject_kind not in {"repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane"}:
         raise ValueError("unsupported legacy subject_kind")
