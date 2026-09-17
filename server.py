@@ -105,6 +105,8 @@ _SYSTEMD_SERVICE_PROPERTIES = (
     "CPUUsageNSec",
 )
 _SYSTEMD_SCOPES: tuple[Literal["user", "system"], ...] = ("user", "system")
+_SYSTEMD_RUNNING_ACTIVE_STATES = frozenset({"active", "reloading"})
+_SYSTEMD_TRANSITIONAL_ACTIVE_STATES = frozenset({"activating", "deactivating"})
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -543,16 +545,23 @@ def _resolve_service_scope(unit: str) -> dict[str, Any]:
             item for item in observations
             if item["properties"].get("LoadState") != "not-found"
         ]
-        active = [
+        running = [
             item for item in loaded
-            if item["properties"].get("ActiveState") == "active"
+            if item["properties"].get("ActiveState") in _SYSTEMD_RUNNING_ACTIVE_STATES
         ]
-        if len(active) == 1:
-            selected = active[0]
-            reason = "single-active-scope"
-        elif len(active) > 1:
+        transitional = [
+            item for item in loaded
+            if item["properties"].get("ActiveState") in _SYSTEMD_TRANSITIONAL_ACTIVE_STATES
+        ]
+        if transitional and len(loaded) > 1:
             ambiguous = True
-            reason = "multiple-active-scopes"
+            reason = "loaded-transition-scope-conflict"
+        elif len(running) == 1:
+            selected = running[0]
+            reason = "single-running-scope"
+        elif len(running) > 1:
+            ambiguous = True
+            reason = "multiple-running-scopes"
         elif len(loaded) == 1:
             selected = loaded[0]
             reason = "single-loaded-scope"

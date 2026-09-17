@@ -23,4 +23,4 @@
 6. V1 besitzt keinen `supervise_work`-Lifecycle, kein Adler-current_work, keine Delivery Queue, keine ACKs und keine Admission Engine.
 7. Listener-Beobachtung belegt nur positiv zugeordnete TCP/UDP-Listener; ein leeres oder unvollständig attribuiertes Ergebnis ist keine Abwesenheitsbehauptung.
 8. Identity-Felder, die Secret-Redaction benötigen würden, werden fail-closed abgewiesen statt identitätskollabierend gespeichert.
-9. Gleichnamige User- und System-Units werden gemeinsam beobachtet. Genau ein aktiver Scope gewinnt; ohne aktiven Scope darf nur genau eine geladene Unit gewählt werden. Mehrdeutigkeit bleibt fail-closed.
+9. Gleichnamige User- und System-Units werden gemeinsam beobachtet. `active` und `reloading` gelten als laufend; konkurrierende `activating`-/`deactivating`-Zustände bleiben mehrdeutig. Genau ein laufender Scope gewinnt nur ohne konkurrierenden Übergang; sonst darf nur genau eine geladene Unit gewählt werden. Mehrdeutigkeit bleibt fail-closed.

@@ -344,7 +344,7 @@ def test_service_status_selects_system_scope_when_user_shadow_is_inactive(monkey
     result = server.service_status("grabowski-operator.service")
     assert result["observation_complete"] is True
     assert result["scope"] == "system"
-    assert result["scope_selection_reason"] == "single-active-scope"
+    assert result["scope_selection_reason"] == "single-running-scope"
     assert result["scope_ambiguous"] is False
     assert result["properties"]["MainPID"] == "653103"
     assert result["properties"]["ControlGroup"] == "/system.slice/grabowski-operator.service"
@@ -363,8 +363,77 @@ def test_service_status_fails_closed_when_same_name_is_active_in_both_scopes(mon
     assert result["observation_complete"] is False
     assert result["scope"] is None
     assert result["scope_ambiguous"] is True
-    assert result["scope_selection_reason"] == "multiple-active-scopes"
+    assert result["scope_selection_reason"] == "multiple-running-scopes"
     assert result["properties"] == {}
+
+
+@pytest.mark.parametrize(
+    ("user_state", "system_state", "expected_reason"),
+    [
+        ("active", "reloading", "multiple-running-scopes"),
+        ("reloading", "active", "multiple-running-scopes"),
+        ("active", "activating", "loaded-transition-scope-conflict"),
+        ("activating", "active", "loaded-transition-scope-conflict"),
+        ("active", "deactivating", "loaded-transition-scope-conflict"),
+        ("deactivating", "active", "loaded-transition-scope-conflict"),
+    ],
+)
+def test_service_status_fails_closed_for_competing_running_or_transition_states(
+    monkeypatch: pytest.MonkeyPatch,
+    user_state: str,
+    system_state: str,
+    expected_reason: str,
+) -> None:
+    def fake_run(argv, **kwargs):
+        if "--user" in argv:
+            stdout = _complete_service_show_fixture(
+                main_pid=101,
+                control_group="/user.slice/competing.service",
+                active_state=user_state,
+            )
+        else:
+            stdout = _complete_service_show_fixture(
+                main_pid=202,
+                control_group="/system.slice/competing.service",
+                active_state=system_state,
+                fragment_path="/etc/systemd/system/competing.service",
+            )
+        return {
+            "returncode": 0,
+            "stdout": stdout,
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_status("competing.service")
+    assert result["observation_complete"] is False
+    assert result["scope"] is None
+    assert result["scope_ambiguous"] is True
+    assert result["scope_selection_reason"] == expected_reason
+    assert result["properties"] == {}
+    assert [item["main_pid"] for item in result["scope_candidates"]] == ["101", "202"]
+
+
+def test_service_logs_refuses_ambiguous_transition_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(argv, **kwargs):
+        assert argv[0] == "/usr/bin/systemctl"
+        state = "active" if "--user" in argv else "reloading"
+        return {
+            "returncode": 0,
+            "stdout": _complete_service_show_fixture(main_pid=100, active_state=state),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_logs("competing.service", lines=5)
+    assert result["scope"] is None
+    assert result["scope_ambiguous"] is True
+    assert result["logs"] is None
+    assert result["observation_complete"] is False
 
 
 def test_service_logs_uses_resolved_system_scope(monkeypatch: pytest.MonkeyPatch) -> None:
