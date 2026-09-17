@@ -104,6 +104,9 @@ _SYSTEMD_SERVICE_PROPERTIES = (
     "TasksCurrent",
     "CPUUsageNSec",
 )
+_SYSTEMD_SCOPES: tuple[Literal["user", "system"], ...] = ("user", "system")
+_SYSTEMD_RUNNING_ACTIVE_STATES = frozenset({"active", "reloading"})
+_SYSTEMD_TRANSITIONAL_ACTIVE_STATES = frozenset({"activating", "deactivating"})
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -473,11 +476,25 @@ def list_user_services() -> dict[str, Any]:
     }
 
 
-@mcp.tool(name="service_status", annotations=READ_ANNOTATIONS)
-def service_status(unit: str) -> dict[str, Any]:
-    """Read fixed status, lifecycle, cgroup and resource fields for any user service."""
-    safe_unit = _validate_unit(unit)
-    result = _run(["/usr/bin/systemctl", "--user", "show", safe_unit, "--no-pager", "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=Result", "--property=ExecMainCode", "--property=ExecMainStatus", "--property=MainPID", "--property=FragmentPath", "--property=NRestarts", "--property=ActiveEnterTimestamp", "--property=ExecMainStartTimestamp", "--property=ControlGroup", "--property=MemoryCurrent", "--property=TasksCurrent", "--property=CPUUsageNSec"])
+def _service_show_argv(unit: str, scope: Literal["user", "system"]) -> list[str]:
+    argv = ["/usr/bin/systemctl"]
+    if scope == "user":
+        argv.append("--user")
+    elif scope != "system":
+        raise ValueError("invalid systemd scope")
+    argv.extend([
+        "show", unit, "--no-pager", "--property=LoadState", "--property=ActiveState",
+        "--property=SubState", "--property=Result", "--property=ExecMainCode",
+        "--property=ExecMainStatus", "--property=MainPID", "--property=FragmentPath",
+        "--property=NRestarts", "--property=ActiveEnterTimestamp",
+        "--property=ExecMainStartTimestamp", "--property=ControlGroup",
+        "--property=MemoryCurrent", "--property=TasksCurrent", "--property=CPUUsageNSec",
+    ])
+    return argv
+
+
+def _observe_service_scope(unit: str, scope: Literal["user", "system"]) -> dict[str, Any]:
+    result = _run(_service_show_argv(unit, scope))
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     properties: dict[str, str] = {}
     parse_complete = False
@@ -489,11 +506,94 @@ def service_status(unit: str) -> dict[str, Any]:
     if not observation_complete:
         properties = {}
     return {
-        "unit": safe_unit,
+        "scope": scope,
         "status": result,
         "properties": properties,
+        "source_complete": source_complete,
         "parse_complete": parse_complete,
         "observation_complete": observation_complete,
+    }
+
+
+def _service_scope_candidate(observation: dict[str, Any]) -> dict[str, Any]:
+    properties = observation["properties"]
+    return {
+        "scope": observation["scope"],
+        "source_complete": observation["source_complete"],
+        "parse_complete": observation["parse_complete"],
+        "observation_complete": observation["observation_complete"],
+        "load_state": properties.get("LoadState"),
+        "active_state": properties.get("ActiveState"),
+        "sub_state": properties.get("SubState"),
+        "main_pid": properties.get("MainPID"),
+        "fragment_path": properties.get("FragmentPath"),
+        "status": observation["status"],
+    }
+
+
+def _resolve_service_scope(unit: str) -> dict[str, Any]:
+    observations = [_observe_service_scope(unit, scope) for scope in _SYSTEMD_SCOPES]
+    source_complete = all(item["source_complete"] for item in observations)
+    parse_complete = all(item["parse_complete"] for item in observations)
+    selected: dict[str, Any] | None = None
+    reason = "scope-observation-incomplete"
+    ambiguous = False
+    absent = False
+
+    if source_complete and parse_complete:
+        loaded = [
+            item for item in observations
+            if item["properties"].get("LoadState") != "not-found"
+        ]
+        running = [
+            item for item in loaded
+            if item["properties"].get("ActiveState") in _SYSTEMD_RUNNING_ACTIVE_STATES
+        ]
+        transitional = [
+            item for item in loaded
+            if item["properties"].get("ActiveState") in _SYSTEMD_TRANSITIONAL_ACTIVE_STATES
+        ]
+        if transitional and len(loaded) > 1:
+            ambiguous = True
+            reason = "loaded-transition-scope-conflict"
+        elif len(running) == 1:
+            selected = running[0]
+            reason = "single-running-scope"
+        elif len(running) > 1:
+            ambiguous = True
+            reason = "multiple-running-scopes"
+        elif len(loaded) == 1:
+            selected = loaded[0]
+            reason = "single-loaded-scope"
+        elif len(loaded) > 1:
+            ambiguous = True
+            reason = "multiple-loaded-inactive-scopes"
+        else:
+            absent = True
+            reason = "absent-in-user-and-system-scopes"
+
+    observation_complete = source_complete and parse_complete and not ambiguous
+    return {
+        "scope": selected["scope"] if selected is not None else None,
+        "scope_selection_reason": reason,
+        "scope_ambiguous": ambiguous,
+        "scope_absent": absent,
+        "scope_candidates": [_service_scope_candidate(item) for item in observations],
+        "status": selected["status"] if selected is not None else {},
+        "properties": selected["properties"] if selected is not None else {},
+        "parse_complete": parse_complete,
+        "observation_complete": observation_complete,
+    }
+
+
+@mcp.tool(name="service_status", annotations=READ_ANNOTATIONS)
+def service_status(unit: str) -> dict[str, Any]:
+    """Read one service across user and system systemd scopes without guessing on ambiguity."""
+    safe_unit = _validate_unit(unit)
+    resolution = _resolve_service_scope(safe_unit)
+    return {
+        "unit": safe_unit,
+        **resolution,
         "observed_at": _utc_now(),
     }
 
@@ -535,7 +635,7 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
 
 @mcp.tool(name="service_runtime", annotations=READ_ANNOTATIONS)
 def service_runtime(unit: str) -> dict[str, Any]:
-    """Correlate one user service with its cgroup-bound process tree and listeners."""
+    """Correlate one resolved user/system service with its cgroup-bound process tree and listeners."""
     status = service_status(unit)
     props = status["properties"]
     status_complete = status["observation_complete"]
@@ -546,6 +646,8 @@ def service_runtime(unit: str) -> dict[str, Any]:
     active_state = props.get("ActiveState")
     if status_complete and active_state is None:
         missing.append("active_state")
+    if status.get("scope") not in _SYSTEMD_SCOPES:
+        missing.append("systemd_scope")
 
     try:
         main_pid = int(props.get("MainPID", "0") or "0")
@@ -603,6 +705,8 @@ def service_runtime(unit: str) -> dict[str, Any]:
 
     return {
         "unit": unit,
+        "service_scope": status.get("scope"),
+        "scope_selection_reason": status.get("scope_selection_reason"),
         "service": props,
         "main_pid": main_pid,
         "control_group": _normalize_cgroup(control_group) if control_group else None,
@@ -621,14 +725,45 @@ def service_runtime(unit: str) -> dict[str, Any]:
 
 @mcp.tool(name="service_logs", annotations=READ_ANNOTATIONS)
 def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
-    """Read bounded recent journal lines for any syntactically valid user service."""
+    """Read bounded recent journal lines from the same resolved systemd scope as service_status."""
     safe_unit = _validate_unit(unit)
     if not isinstance(lines, int) or isinstance(lines, bool) or not 1 <= lines <= 500:
         raise ValueError("lines must be between 1 and 500")
-    result = _run([
-        "/usr/bin/journalctl", "--user", "-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso",
-    ], timeout=20)
-    return {"unit": safe_unit, "logs": result, "observed_at": _utc_now()}
+    status = service_status(safe_unit)
+    scope = status.get("scope")
+    if not status["observation_complete"] or scope not in _SYSTEMD_SCOPES:
+        return {
+            "unit": safe_unit,
+            "scope": scope,
+            "scope_selection_reason": status.get("scope_selection_reason"),
+            "scope_ambiguous": status.get("scope_ambiguous", False),
+            "logs": None,
+            "observation_complete": False,
+            "observed_at": _utc_now(),
+        }
+    argv = ["/usr/bin/journalctl"]
+    if scope == "user":
+        argv.append("--user")
+    else:
+        argv.append("--system")
+    argv.extend(["-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso"])
+    result = _run(argv, timeout=20)
+    diagnostics_present = bool(result["stderr"].strip())
+    observation_complete = (
+        result["returncode"] == 0
+        and not result["stdout_truncated"]
+        and not result["stderr_truncated"]
+        and not diagnostics_present
+    )
+    return {
+        "unit": safe_unit,
+        "scope": scope,
+        "scope_selection_reason": status.get("scope_selection_reason"),
+        "journal_diagnostics_present": diagnostics_present,
+        "logs": result,
+        "observation_complete": observation_complete,
+        "observed_at": _utc_now(),
+    }
 
 
 def _validate_lane_id(lane_id: str) -> str:
