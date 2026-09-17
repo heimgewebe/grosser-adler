@@ -258,7 +258,7 @@ def test_inbox_short_write_does_not_replace_valid_view_with_truncated_json(tmp_p
     assert json.loads(path.read_text(encoding="utf-8"))["findings"] == [{"finding_id": "fixture"}]
 
 
-def test_failed_external_atomic_replace_preserves_old_and_cleans_temp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_failed_external_atomic_exchange_preserves_old_and_cleans_temp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     inbox_dir = tmp_path / "inboxes"
     inbox_dir.mkdir(mode=0o700)
     name = "lane.json"
@@ -266,9 +266,9 @@ def test_failed_external_atomic_replace_preserves_old_and_cleans_temp(tmp_path: 
     (inbox_dir / name).write_bytes(old)
     (inbox_dir / name).chmod(0o600)
     dir_fd = os.open(inbox_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    monkeypatch.setattr(server.os, "replace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")))
+    monkeypatch.setattr(server, "_rename_exchange", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("exchange failed")))
     try:
-        with pytest.raises(OSError, match="replace failed"):
+        with pytest.raises(OSError, match="exchange failed"):
             server._atomic_write_inbox(dir_fd, name, b"new\n")
     finally:
         os.close(dir_fd)
