@@ -37,6 +37,7 @@ MAX_EVIDENCE_REFS = 32
 MAX_EVIDENCE_REF_CHARS = 1_000
 MAX_AFFECTED_EFFECTS = 16
 MAX_AFFECTED_EFFECT_CHARS = 120
+LEGACY_CONNECTOR_CONTRACT = "adler-legacy-connector-submit-v1"
 
 READ_ANNOTATIONS = ToolAnnotations(
     title="Independent read-only observation",
@@ -1220,6 +1221,13 @@ def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]
         payload for _, payload in loaded
         if payload.get("finding_contract") == FINDING_CONTRACT and payload.get("subject") == subject
     ]
+    legacy_records = [
+        (path, payload) for path, payload in loaded
+        if payload.get("finding_contract") != FINDING_CONTRACT
+        and payload.get("subject_kind") == "grabowski_lane"
+        and payload.get("subject") == subject
+        and payload.get("checkpoint") == checkpoint
+    ]
     records.sort(key=lambda item: (str(item.get("observed_at", "")), str(item.get("finding_id", ""))))
     roots = {str(item["finding_id"]): item for item in records if not item.get("recheck_of")}
     rechecks: dict[str, list[dict[str, Any]]] = {}
@@ -1248,6 +1256,8 @@ def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]
                 for key in ("finding_id", "finding_sha256", "checkpoint", "conclusion", "summary", "evidence_refs", "observed_at")
             }
         current.append(item)
+    for path, payload in legacy_records:
+        current.append(_finding_record_view(payload, path))
     current.sort(key=lambda item: (str(item.get("severity", "")), str(item.get("finding_id", ""))))
     return current
 
@@ -1570,11 +1580,16 @@ def _clean_optional_text(value: str | None, field: str) -> str | None:
 
 
 def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
-    finding_sha256 = _sha256_json(payload)
     payload = dict(payload)
-    payload["finding_sha256"] = finding_sha256
     target_name = f"{payload['finding_id']}.json"
-    _validate_v1_finding_payload(payload, FINDINGS_ROOT / target_name)
+    target_path = FINDINGS_ROOT / target_name
+    if payload.get("finding_contract") == FINDING_CONTRACT:
+        finding_sha256 = _sha256_json(payload)
+        payload["finding_sha256"] = finding_sha256
+        _validate_v1_finding_payload(payload, target_path)
+    else:
+        _validate_legacy_finding_payload(payload, target_path)
+        finding_sha256 = _sha256_json(payload)
     encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     tmp_name = f".finding-{payload['finding_id']}-{uuid.uuid4().hex}.tmp"
     dir_fd = os.open(FINDINGS_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -1617,7 +1632,7 @@ def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
     return finding_sha256, hashlib.sha256(encoded).hexdigest()
 
 
-@mcp.tool(name="submit_finding", annotations=FINDING_ANNOTATIONS)
+@mcp.tool(name="submit_finding_v1", annotations=FINDING_ANNOTATIONS)
 def submit_finding(
     kind: Literal["observation", "risk", "contradiction", "missing_evidence", "advice"],
     severity: Literal["low", "medium", "high", "critical"],
@@ -1632,7 +1647,7 @@ def submit_finding(
     recheck_of: str | None = None,
     conclusion: Literal["still_current", "no_longer_reproduced"] | None = None,
 ) -> dict[str, Any]:
-    """Append one immutable observation and best-effort project exact lane findings beside the work."""
+    """Append one strict adler-finding-v1 record and best-effort project exact lane findings."""
     _ensure_state()
     subject_clean = _clean_required_identity_text(subject, "subject")
     checkpoint_clean = _clean_required_identity_text(checkpoint, "checkpoint")
@@ -1719,6 +1734,98 @@ def submit_finding(
         "finding_id": finding_id,
         "finding_sha256": finding_sha256,
         "record_sha256": record_sha256,
+        "observed_at": observed_at,
+        "automatic_effect": False,
+        "delivery": delivery,
+        "next_action": "Grabowski or the working agent may read the advisory view and independently decide what to do.",
+    }
+
+
+@mcp.tool(name="submit_finding", annotations=FINDING_ANNOTATIONS)
+def submit_finding_legacy(
+    subject_kind: Literal["repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane"],
+    subject: str,
+    severity: Literal["low", "medium", "high", "critical"],
+    summary: str,
+    evidence_refs: list[str],
+    checkpoint: str | None = None,
+    status: Literal["observation", "finding", "recheck_suggested"] = "finding",
+) -> dict[str, Any]:
+    """Accept the historical connector shape; grabowski_lane subjects are exact lane ids or lane:<id>."""
+    _ensure_state()
+    if subject_kind not in {"repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane"}:
+        raise ValueError("unsupported legacy subject_kind")
+    if severity not in {"low", "medium", "high", "critical"}:
+        raise ValueError("invalid severity")
+    if status not in _LEGACY_BASE_STATUSES:
+        raise ValueError("unsupported legacy status")
+
+    subject_clean = _clean_required_identity_text(subject, "subject")
+    checkpoint_clean = (
+        _clean_required_identity_text(checkpoint, "checkpoint")
+        if checkpoint is not None
+        else None
+    )
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
+        raise ValueError(f"summary must be 1..{MAX_SUMMARY_CHARS} characters")
+    if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
+        raise ValueError(f"evidence_refs must contain 1..{MAX_EVIDENCE_REFS} entries")
+    cleaned_refs: list[str] = []
+    for ref in evidence_refs:
+        if not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_EVIDENCE_REF_CHARS:
+            raise ValueError("invalid evidence reference")
+        cleaned_refs.append(_redact(ref.strip()))
+
+    lane_id: str | None = None
+    if subject_kind == "grabowski_lane":
+        direct_lane = subject_clean if _LANE_ID_RE.fullmatch(subject_clean) is not None else None
+        prefixed_lane = _LANE_SUBJECT_RE.fullmatch(subject_clean)
+        lane_id = direct_lane or (prefixed_lane.group(1) if prefixed_lane is not None else None)
+        if lane_id is None:
+            raise ValueError("legacy grabowski_lane subject must be a lane id or lane:<id>")
+        target = _read_work_target(lane_id)
+        current_checkpoint = _clean_required_identity_text(target["checkpoint"], "checkpoint")
+        if checkpoint_clean is not None and checkpoint_clean != current_checkpoint:
+            raise ValueError("legacy lane checkpoint does not match the current worktree checkpoint")
+        subject_clean = f"lane:{lane_id}"
+        checkpoint_clean = current_checkpoint
+
+    observed_at = _utc_now()
+    finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "finding_id": finding_id,
+        "adler_identity": IDENTITY,
+        "subject_kind": subject_kind,
+        "subject": subject_clean,
+        "checkpoint": checkpoint_clean,
+        "severity": severity,
+        "status": status,
+        "summary": _redact(summary.strip()),
+        "evidence_refs": cleaned_refs,
+        "observed_at": observed_at,
+        "effect_contract": "advisory_only_no_automatic_action",
+    }
+    finding_sha256, record_sha256 = _persist_finding(payload)
+
+    delivery: dict[str, Any] = {"state": "not_applicable"}
+    if lane_id is not None:
+        try:
+            delivery = _publish_worktree_inbox(lane_id)
+        except Exception as exc:
+            delivery = {
+                "state": "delivery_failed",
+                "error_type": type(exc).__name__,
+                "source_complete": False,
+                "finding_remains_durable": True,
+            }
+    return {
+        "accepted": True,
+        "finding_id": finding_id,
+        "finding_sha256": finding_sha256,
+        "record_sha256": record_sha256,
+        "legacy": True,
+        "compatibility_contract": LEGACY_CONNECTOR_CONTRACT,
         "observed_at": observed_at,
         "automatic_effect": False,
         "delivery": delivery,
