@@ -132,6 +132,31 @@ def test_legacy_lane_submission_resolves_current_checkpoint_and_publishes(
     assert finding["binding_strength"] == "legacy-unbound"
 
 
+def test_legacy_lane_submission_persists_noncanonical_subject_without_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    subject = "former-human-readable-lane"
+
+    result = server.submit_finding_legacy(
+        subject_kind="grabowski_lane",
+        subject=subject,
+        severity="low",
+        summary="preserve historical free-form lane subject",
+        evidence_refs=["fixture:noncanonical-lane-subject"],
+    )
+
+    assert result["accepted"] is True
+    assert result["legacy"] is True
+    assert result["delivery"]["state"] == "not_applicable"
+    payload = json.loads(
+        (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
+    )
+    assert payload["subject_kind"] == "grabowski_lane"
+    assert payload["subject"] == subject
+    assert payload["checkpoint"] is None
+    assert payload["compatibility_contract"] == server.LEGACY_CONNECTOR_CONTRACT
+
 def test_legacy_lane_submission_persists_stale_checkpoint_and_fails_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

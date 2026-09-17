@@ -1804,21 +1804,20 @@ def submit_finding_legacy(
         direct_lane = subject_clean if _LANE_ID_RE.fullmatch(subject_clean) is not None else None
         prefixed_lane = _LANE_SUBJECT_RE.fullmatch(subject_clean)
         lane_id = direct_lane or (prefixed_lane.group(1) if prefixed_lane is not None else None)
-        if lane_id is None:
-            raise ValueError("legacy grabowski_lane subject must be a lane id or lane:<id>")
-        subject_clean = f"lane:{lane_id}"
-        try:
-            target = _read_work_target(lane_id)
-        except Exception as exc:
-            lane_resolution_error = exc
-        else:
-            current_checkpoint = _clean_required_identity_text(target["checkpoint"], "checkpoint")
-            if checkpoint_clean is None:
-                checkpoint_clean = current_checkpoint
-            elif checkpoint_clean != current_checkpoint:
-                lane_checkpoint_error = RuntimeError(
-                    "legacy lane checkpoint does not match the current worktree checkpoint"
-                )
+        if lane_id is not None:
+            subject_clean = f"lane:{lane_id}"
+            try:
+                target = _read_work_target(lane_id)
+            except Exception as exc:
+                lane_resolution_error = exc
+            else:
+                current_checkpoint = _clean_required_identity_text(target["checkpoint"], "checkpoint")
+                if checkpoint_clean is None:
+                    checkpoint_clean = current_checkpoint
+                elif checkpoint_clean != current_checkpoint:
+                    lane_checkpoint_error = RuntimeError(
+                        "legacy lane checkpoint does not match the current worktree checkpoint"
+                    )
 
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
