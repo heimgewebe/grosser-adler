@@ -1799,6 +1799,7 @@ def submit_finding_legacy(
 
     lane_id: str | None = None
     lane_resolution_error: Exception | None = None
+    lane_checkpoint_error: Exception | None = None
     if subject_kind == "grabowski_lane":
         direct_lane = subject_clean if _LANE_ID_RE.fullmatch(subject_clean) is not None else None
         prefixed_lane = _LANE_SUBJECT_RE.fullmatch(subject_clean)
@@ -1812,9 +1813,12 @@ def submit_finding_legacy(
             lane_resolution_error = exc
         else:
             current_checkpoint = _clean_required_identity_text(target["checkpoint"], "checkpoint")
-            if checkpoint_clean is not None and checkpoint_clean != current_checkpoint:
-                raise ValueError("legacy lane checkpoint does not match the current worktree checkpoint")
-            checkpoint_clean = current_checkpoint
+            if checkpoint_clean is None:
+                checkpoint_clean = current_checkpoint
+            elif checkpoint_clean != current_checkpoint:
+                lane_checkpoint_error = RuntimeError(
+                    "legacy lane checkpoint does not match the current worktree checkpoint"
+                )
 
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
@@ -1837,10 +1841,11 @@ def submit_finding_legacy(
 
     delivery: dict[str, Any] = {"state": "not_applicable"}
     if lane_id is not None:
-        if lane_resolution_error is not None:
+        delivery_error = lane_resolution_error or lane_checkpoint_error
+        if delivery_error is not None:
             delivery = {
                 "state": "delivery_failed",
-                "error_type": type(lane_resolution_error).__name__,
+                "error_type": type(delivery_error).__name__,
                 "source_complete": False,
                 "finding_remains_durable": True,
             }

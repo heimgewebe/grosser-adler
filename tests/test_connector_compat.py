@@ -132,25 +132,33 @@ def test_legacy_lane_submission_resolves_current_checkpoint_and_publishes(
     assert finding["binding_strength"] == "legacy-unbound"
 
 
-def test_legacy_lane_submission_rejects_stale_checkpoint(
+def test_legacy_lane_submission_persists_stale_checkpoint_and_fails_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
     lane_id = "b" * 32
-    _install_pointer(worktree, state, lane_id)
+    inbox_path = _install_pointer(worktree, state, lane_id)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
 
-    with pytest.raises(ValueError, match="does not match the current worktree checkpoint"):
-        server.submit_finding_legacy(
-            subject_kind="grabowski_lane",
-            subject=f"lane:{lane_id}",
-            checkpoint=OID_B,
-            severity="medium",
-            summary="stale fixture",
-            evidence_refs=["fixture:stale"],
-        )
-    assert not (state / "findings").exists() or list((state / "findings").glob("*.json")) == []
+    result = server.submit_finding_legacy(
+        subject_kind="grabowski_lane",
+        subject=f"lane:{lane_id}",
+        checkpoint=OID_B,
+        severity="medium",
+        summary="stale fixture",
+        evidence_refs=["fixture:stale"],
+    )
+
+    assert result["accepted"] is True
+    assert result["delivery"]["state"] == "delivery_failed"
+    assert result["delivery"]["error_type"] == "RuntimeError"
+    assert result["delivery"]["finding_remains_durable"] is True
+    payload = json.loads(
+        (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
+    )
+    assert payload["checkpoint"] == OID_B
+    assert not inbox_path.exists()
 
 
 @pytest.mark.parametrize(
