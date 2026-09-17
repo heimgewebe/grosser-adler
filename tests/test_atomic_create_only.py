@@ -52,39 +52,24 @@ def test_finding_final_install_never_replaces_racing_existing_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = _configure_state(tmp_path, monkeypatch)
-    real_link = server.os.link
+    real_noreplace = server._rename_noreplace
     sentinel = b"foreign-writer-won-the-race\n"
 
-    def collide_then_link(
-        src: str,
-        dst: str,
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-        follow_symlinks: bool = True,
-    ) -> None:
-        assert src_dir_fd is not None
-        assert dst_dir_fd is not None
+    def collide_then_rename(dir_fd: int, left: str, right: str) -> None:
         fd = os.open(
-            dst,
+            right,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
             0o600,
-            dir_fd=dst_dir_fd,
+            dir_fd=dir_fd,
         )
         try:
             os.write(fd, sentinel)
             os.fsync(fd)
         finally:
             os.close(fd)
-        real_link(
-            src,
-            dst,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-            follow_symlinks=follow_symlinks,
-        )
+        real_noreplace(dir_fd, left, right)
 
-    monkeypatch.setattr(server.os, "link", collide_then_link)
+    monkeypatch.setattr(server, "_rename_noreplace", collide_then_rename)
 
     with pytest.raises(FileExistsError):
         server.submit_finding(**_finding_args())
@@ -102,37 +87,23 @@ def test_absent_inbox_install_never_replaces_racing_foreign_record(
     inbox_dir.mkdir(mode=0o700)
     name = "lane.json"
     sentinel = b"foreign-writer-won-the-inbox-race\n"
-    real_link = server.os.link
+    real_noreplace = server._rename_noreplace
 
-    def collide_then_link(
-        src: str,
-        dst: str,
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-        follow_symlinks: bool = True,
-    ) -> None:
-        assert dst_dir_fd is not None
+    def collide_then_rename(dir_fd: int, left: str, right: str) -> None:
         fd = os.open(
-            dst,
+            right,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
             0o600,
-            dir_fd=dst_dir_fd,
+            dir_fd=dir_fd,
         )
         try:
             os.write(fd, sentinel)
             os.fsync(fd)
         finally:
             os.close(fd)
-        real_link(
-            src,
-            dst,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-            follow_symlinks=follow_symlinks,
-        )
+        real_noreplace(dir_fd, left, right)
 
-    monkeypatch.setattr(server.os, "link", collide_then_link)
+    monkeypatch.setattr(server, "_rename_noreplace", collide_then_rename)
     dir_fd = os.open(inbox_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         with pytest.raises(FileExistsError):
@@ -185,3 +156,60 @@ def test_existing_inbox_swap_is_rolled_back_if_validated_inode_changed(
     assert calls["count"] == 2
     assert path.read_bytes() == foreign
     assert list(inbox_dir.glob(".*.tmp")) == []
+
+
+def test_finding_noreplace_install_has_no_hardlink_crash_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    real_noreplace = server._rename_noreplace
+
+    def install_then_interrupt(dir_fd: int, left: str, right: str) -> None:
+        real_noreplace(dir_fd, left, right)
+        raise SystemExit("simulated process loss after rename")
+
+    monkeypatch.setattr(server, "_rename_noreplace", install_then_interrupt)
+    with pytest.raises(SystemExit, match="simulated process loss"):
+        server.submit_finding(**_finding_args())
+
+    finals = list((state / "findings").glob("*.json"))
+    assert len(finals) == 1
+    assert finals[0].stat().st_nlink == 1
+    assert list((state / "findings").glob(".finding-*.tmp")) == []
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is True
+    assert listing["count"] == 1
+
+
+def test_absent_inbox_noreplace_install_is_restart_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inbox_dir = tmp_path / "inboxes"
+    inbox_dir.mkdir(mode=0o700)
+    name = "lane.json"
+    path = inbox_dir / name
+    real_noreplace = server._rename_noreplace
+
+    def install_then_interrupt(dir_fd: int, left: str, right: str) -> None:
+        real_noreplace(dir_fd, left, right)
+        raise SystemExit("simulated process loss after rename")
+
+    monkeypatch.setattr(server, "_rename_noreplace", install_then_interrupt)
+    dir_fd = os.open(inbox_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        with pytest.raises(SystemExit, match="simulated process loss"):
+            server._atomic_write_inbox(dir_fd, name, _owned_inbox(generation=1))
+    finally:
+        os.close(dir_fd)
+
+    assert path.stat().st_nlink == 1
+    assert path.read_bytes() == _owned_inbox(generation=1)
+    assert list(inbox_dir.glob(".*.tmp")) == []
+
+    monkeypatch.setattr(server, "_rename_noreplace", real_noreplace)
+    dir_fd = os.open(inbox_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        server._atomic_write_inbox(dir_fd, name, _owned_inbox(generation=2))
+    finally:
+        os.close(dir_fd)
+    assert path.read_bytes() == _owned_inbox(generation=2)
