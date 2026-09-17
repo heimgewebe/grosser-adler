@@ -313,11 +313,13 @@ def test_other_checkpoint_is_not_projected_as_current(tmp_path: Path, monkeypatc
     target = _install_pointer(worktree, state, lane_id)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane, checkpoint=OID_B))
     result = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}", checkpoint=OID_A))
-    assert result["delivery"]["state"] == "published"
-    inbox = json.loads(target.read_text(encoding="utf-8"))
-    assert inbox["checkpoint"] == OID_B
-    assert inbox["findings"] == []
-    assert (worktree / ".adler" / "inbox.json").read_text(encoding="utf-8") == target.read_text(encoding="utf-8")
+    assert result["delivery"]["state"] == "delivery_failed"
+    assert result["delivery"]["error_type"] == "RuntimeError"
+    assert result["delivery"]["finding_remains_durable"] is True
+    finding_path = state / "findings" / f"{result['finding_id']}.json"
+    persisted = json.loads(finding_path.read_text(encoding="utf-8"))
+    assert persisted["checkpoint"] == OID_A
+    assert not target.exists()
 
 
 def test_free_text_secrets_are_redacted_before_persistence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
