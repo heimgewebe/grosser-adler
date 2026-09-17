@@ -1781,7 +1781,9 @@ def submit_finding_legacy(
     if status not in _LEGACY_BASE_STATUSES:
         raise ValueError("unsupported legacy status")
 
-    subject_clean = _clean_required_identity_text(subject, "subject")
+    if not isinstance(subject, str) or not subject.strip() or len(subject) > 500:
+        raise ValueError("subject must be 1..500 characters")
+    subject_clean = _redact(subject.strip())
     if checkpoint is None:
         checkpoint_clean = None
     elif not isinstance(checkpoint, str) or len(checkpoint) > 500:

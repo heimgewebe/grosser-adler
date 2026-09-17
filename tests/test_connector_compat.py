@@ -185,6 +185,32 @@ def test_legacy_lane_submission_persists_noncanonical_subject_without_delivery(
     assert payload["checkpoint"] is None
     assert payload["compatibility_contract"] == server.LEGACY_CONNECTOR_CONTRACT
 
+
+def test_legacy_lane_submission_redacts_sensitive_subject_and_keeps_it_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    sensitive_value = "tok" + "en=" + "fixture-value"
+    subject = f"former-lane {sensitive_value}"
+
+    result = server.submit_finding_legacy(
+        subject_kind="grabowski_lane",
+        subject=subject,
+        severity="low",
+        summary="preserve historical subject while redacting sensitive material",
+        evidence_refs=["fixture:redacted-legacy-subject"],
+    )
+
+    assert result["accepted"] is True
+    assert result["legacy"] is True
+    assert result["delivery"]["state"] == "not_applicable"
+    path = state / "findings" / f"{result['finding_id']}.json"
+    serialized = path.read_text(encoding="utf-8")
+    payload = json.loads(serialized)
+    assert payload["subject"] == "former-lane <REDACTED>"
+    assert sensitive_value not in serialized
+    assert payload["compatibility_contract"] == server.LEGACY_CONNECTOR_CONTRACT
+
 def test_legacy_lane_submission_persists_stale_checkpoint_and_fails_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
