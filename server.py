@@ -735,13 +735,22 @@ def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     argv = ["/usr/bin/journalctl"]
     if scope == "user":
         argv.append("--user")
+    else:
+        argv.append("--system")
     argv.extend(["-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso"])
     result = _run(argv, timeout=20)
-    observation_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    diagnostics_present = bool(result["stderr"].strip())
+    observation_complete = (
+        result["returncode"] == 0
+        and not result["stdout_truncated"]
+        and not result["stderr_truncated"]
+        and not diagnostics_present
+    )
     return {
         "unit": safe_unit,
         "scope": scope,
         "scope_selection_reason": status.get("scope_selection_reason"),
+        "journal_diagnostics_present": diagnostics_present,
         "logs": result,
         "observation_complete": observation_complete,
         "observed_at": _utc_now(),

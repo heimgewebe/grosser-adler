@@ -387,6 +387,7 @@ def test_service_logs_uses_resolved_system_scope(monkeypatch: pytest.MonkeyPatch
             }
         if argv[0] == "/usr/bin/journalctl":
             assert "--user" not in argv
+            assert "--system" in argv
             return {
                 "returncode": 0, "stdout": "system-log\n", "stderr": "",
                 "stdout_truncated": False, "stderr_truncated": False,
@@ -397,8 +398,45 @@ def test_service_logs_uses_resolved_system_scope(monkeypatch: pytest.MonkeyPatch
     result = server.service_logs("grabowski-operator.service", lines=5)
     assert result["scope"] == "system"
     assert result["observation_complete"] is True
+    assert result["journal_diagnostics_present"] is False
     assert result["logs"]["stdout"] == "system-log\n"
     assert len([argv for argv in calls if argv[0] == "/usr/bin/systemctl"]) == 2
+
+
+def test_service_logs_fails_closed_on_successful_journal_access_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/systemctl":
+            stdout = (
+                _complete_service_show_fixture(main_pid=0, control_group="", active_state="inactive")
+                if "--user" in argv
+                else _complete_service_show_fixture(
+                    main_pid=653103,
+                    control_group="/system.slice/grabowski-operator.service",
+                    fragment_path="/etc/systemd/system/grabowski-operator.service",
+                )
+            )
+            return {
+                "returncode": 0, "stdout": stdout, "stderr": "",
+                "stdout_truncated": False, "stderr_truncated": False,
+            }
+        if argv[0] == "/usr/bin/journalctl":
+            return {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "Hint: journal access is restricted\n",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_logs("grabowski-operator.service", lines=5)
+    assert result["scope"] == "system"
+    assert result["logs"]["returncode"] == 0
+    assert result["journal_diagnostics_present"] is True
+    assert result["observation_complete"] is False
 
 
 def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
