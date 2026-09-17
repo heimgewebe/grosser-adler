@@ -1533,7 +1533,13 @@ def _publish_worktree_inbox(
         if len(encoded) > MAX_OUTPUT_BYTES:
             raise RuntimeError("worktree inbox exceeds bounded size")
         _atomic_write_inbox(inbox_dir_fd, inbox_path.name, encoded)
-        _validate_worktree_inbox_pointer(worktree, lane_id)
+        published_target = _read_work_target(lane_id)
+        if Path(published_target["worktree"]) != worktree:
+            raise RuntimeError("lane worktree changed after inbox publication")
+        if published_target["checkpoint"] != target["checkpoint"]:
+            raise RuntimeError("lane checkpoint changed after inbox publication")
+        if _validate_worktree_inbox_pointer(worktree, lane_id) != inbox_path:
+            raise RuntimeError("worktree inbox pointer changed after publication")
     finally:
         if locked:
             fcntl.flock(inbox_dir_fd, fcntl.LOCK_UN)
@@ -1780,7 +1786,7 @@ def submit_finding_legacy(
     elif not isinstance(checkpoint, str) or len(checkpoint) > 500:
         raise ValueError("checkpoint must be a string of at most 500 characters")
     else:
-        checkpoint_clean = checkpoint
+        checkpoint_clean = _redact(checkpoint)
     if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
         raise ValueError(f"summary must be 1..{MAX_SUMMARY_CHARS} characters")
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:

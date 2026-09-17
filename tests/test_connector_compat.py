@@ -76,6 +76,28 @@ def test_legacy_connector_record_does_not_invent_v1_confidence(
     assert listed["binding_strength"] == "legacy-unbound"
 
 
+def test_legacy_checkpoint_is_redacted_before_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    secret_checkpoint = "token=compatibility-secret-value"
+
+    result = server.submit_finding_legacy(
+        subject_kind="repo",
+        subject="repo:fixture",
+        checkpoint=secret_checkpoint,
+        severity="medium",
+        summary="legacy checkpoint redaction fixture",
+        evidence_refs=["fixture:checkpoint-redaction"],
+    )
+
+    finding_path = state / "findings" / f"{result['finding_id']}.json"
+    serialized = finding_path.read_text(encoding="utf-8")
+    payload = json.loads(serialized)
+    assert secret_checkpoint not in serialized
+    assert payload["checkpoint"] == "<REDACTED>"
+
+
 @pytest.mark.parametrize("checkpoint", [None, ""])
 def test_legacy_lane_submission_resolves_current_checkpoint_and_publishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint: str | None
@@ -200,6 +222,41 @@ def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_persist(
     )
     assert payload["checkpoint"] == OID_A
     assert not inbox_path.exists()
+
+
+def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_inbox_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "f" * 32
+    inbox_path = _install_pointer(worktree, state, lane_id)
+    targets = iter([
+        _target(worktree, lane_id),
+        _target(worktree, lane_id),
+        _target(worktree, lane_id),
+        {**_target(worktree, lane_id), "checkpoint": OID_B},
+    ])
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: next(targets))
+
+    result = server.submit_finding_legacy(
+        subject_kind="grabowski_lane",
+        subject=lane_id,
+        severity="medium",
+        summary="post-write checkpoint race fixture",
+        evidence_refs=["fixture:post-write-checkpoint-race"],
+    )
+
+    assert result["accepted"] is True
+    assert result["delivery"]["state"] == "delivery_failed"
+    assert result["delivery"]["error_type"] == "RuntimeError"
+    assert result["delivery"]["finding_remains_durable"] is True
+    payload = json.loads(
+        (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
+    )
+    assert payload["checkpoint"] == OID_A
+    inbox = json.loads(inbox_path.read_text(encoding="utf-8"))
+    assert inbox["checkpoint"] == OID_A
 
 
 def test_strict_v1_lane_delivery_fails_closed_if_checkpoint_has_advanced(
