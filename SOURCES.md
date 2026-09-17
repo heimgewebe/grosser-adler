@@ -5,8 +5,8 @@
 | lokaler HEAD / Dirty-State | Git | `git_status` | primär |
 | Commitinhalt | Git | `git_show` | primär |
 | PR-HEAD / Base / CI / Reviews | GitHub | `github_pr` | primär für GitHub |
-| User-Servicezustand | user-systemd | `service_status` | primär für Servicezustand |
-| Service-Prozessbaum | Prozesssicht + systemd MainPID/ControlGroup | `service_runtime` | same-UID, cgroup-gebundene Hostbeobachtung |
+| Servicezustand | user-/system-systemd | `service_status` | beobachtet beide Scopes; wählt genau einen aktiven/geladenen Scope, Doppelbelegung bleibt unbekannt |
+| Service-Prozessbaum | Prozesssicht + aufgelöster systemd MainPID/ControlGroup | `service_runtime` | same-UID, cgroup-gebundene Hostbeobachtung im selben Scope |
 | positive TCP/UDP-Listener-Evidenz | `ss` mit cgroup-Metadaten | `service_runtime` | nur positive cgroup-korrelierte Evidenz; kein Beweis für Abwesenheit |
 | Grabowski-Lane-Ziel | Grabowski Work-Lane-Receipt + registrierter Git-Worktree | `get_work_target(lane_id)` | Autorität nur für `lane_id → repo/worktree/branch/purpose`; keine Aussage über Korrektheit der Arbeit |
 | Bureau Task/Run | Bureau StateStore | kein V1-Adapter | unbekannt, bis ein realer Bedarf einen direkten Adapter rechtfertigt |
@@ -23,3 +23,4 @@
 6. V1 besitzt keinen `supervise_work`-Lifecycle, kein Adler-current_work, keine Delivery Queue, keine ACKs und keine Admission Engine.
 7. Listener-Beobachtung belegt nur positiv zugeordnete TCP/UDP-Listener; ein leeres oder unvollständig attribuiertes Ergebnis ist keine Abwesenheitsbehauptung.
 8. Identity-Felder, die Secret-Redaction benötigen würden, werden fail-closed abgewiesen statt identitätskollabierend gespeichert.
+9. Gleichnamige User- und System-Units werden gemeinsam beobachtet. Genau ein aktiver Scope gewinnt; ohne aktiven Scope darf nur genau eine geladene Unit gewählt werden. Mehrdeutigkeit bleibt fail-closed.

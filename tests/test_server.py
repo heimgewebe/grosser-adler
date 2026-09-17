@@ -174,17 +174,25 @@ def _complete_git_fixture(head: str = OID_A, *, untracked: bool = False) -> dict
 
 
 def _complete_service_show_fixture(
-    *, main_pid: int = 100, control_group: str = "/user.slice/nixer", active_state: str = "active"
+    *, main_pid: int = 100, control_group: str = "/user.slice/nixer",
+    active_state: str = "active", load_state: str = "loaded",
+    fragment_path: str = "/home/alex/.config/systemd/user/nixer-mcp.service",
 ) -> str:
     values = {
-        "LoadState": "loaded", "ActiveState": active_state,
+        "LoadState": load_state, "ActiveState": active_state,
         "SubState": "running" if active_state == "active" else "dead", "Result": "success",
         "ExecMainCode": "0", "ExecMainStatus": "0", "MainPID": str(main_pid),
-        "FragmentPath": "/home/alex/.config/systemd/user/nixer-mcp.service", "NRestarts": "2",
+        "FragmentPath": fragment_path, "NRestarts": "2",
         "ActiveEnterTimestamp": "now", "ExecMainStartTimestamp": "now", "ControlGroup": control_group,
         "MemoryCurrent": "2048", "TasksCurrent": "2", "CPUUsageNSec": "1000",
     }
     return "".join(f"{key}={values[key]}\n" for key in server._SYSTEMD_SERVICE_PROPERTIES)
+
+
+def _missing_system_service_show_fixture() -> str:
+    return _complete_service_show_fixture(
+        main_pid=0, control_group="", active_state="inactive", load_state="not-found", fragment_path=""
+    )
 
 
 def test_process_descendants_are_bounded_to_requested_root() -> None:
@@ -315,13 +323,92 @@ def test_service_status_fails_closed_on_missing_or_malformed_properties(monkeypa
         assert result["properties"] == {}
 
 
+def test_service_status_selects_system_scope_when_user_shadow_is_inactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(argv, **kwargs):
+        if "--user" in argv:
+            stdout = _complete_service_show_fixture(
+                main_pid=0, control_group="", active_state="inactive"
+            )
+        else:
+            stdout = _complete_service_show_fixture(
+                main_pid=653103,
+                control_group="/system.slice/grabowski-operator.service",
+                fragment_path="/etc/systemd/system/grabowski-operator.service",
+            )
+        return {
+            "returncode": 0, "stdout": stdout, "stderr": "",
+            "stdout_truncated": False, "stderr_truncated": False,
+        }
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_status("grabowski-operator.service")
+    assert result["observation_complete"] is True
+    assert result["scope"] == "system"
+    assert result["scope_selection_reason"] == "single-active-scope"
+    assert result["scope_ambiguous"] is False
+    assert result["properties"]["MainPID"] == "653103"
+    assert result["properties"]["ControlGroup"] == "/system.slice/grabowski-operator.service"
+    assert [item["active_state"] for item in result["scope_candidates"]] == ["inactive", "active"]
+
+
+def test_service_status_fails_closed_when_same_name_is_active_in_both_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: {
+        "returncode": 0,
+        "stdout": _complete_service_show_fixture(),
+        "stderr": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+    })
+    result = server.service_status("nixer-mcp.service")
+    assert result["observation_complete"] is False
+    assert result["scope"] is None
+    assert result["scope_ambiguous"] is True
+    assert result["scope_selection_reason"] == "multiple-active-scopes"
+    assert result["properties"] == {}
+
+
+def test_service_logs_uses_resolved_system_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "/usr/bin/systemctl":
+            if "--user" in argv:
+                stdout = _complete_service_show_fixture(main_pid=0, control_group="", active_state="inactive")
+            else:
+                stdout = _complete_service_show_fixture(
+                    main_pid=653103,
+                    control_group="/system.slice/grabowski-operator.service",
+                    fragment_path="/etc/systemd/system/grabowski-operator.service",
+                )
+            return {
+                "returncode": 0, "stdout": stdout, "stderr": "",
+                "stdout_truncated": False, "stderr_truncated": False,
+            }
+        if argv[0] == "/usr/bin/journalctl":
+            assert "--user" not in argv
+            return {
+                "returncode": 0, "stdout": "system-log\n", "stderr": "",
+                "stdout_truncated": False, "stderr_truncated": False,
+            }
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_logs("grabowski-operator.service", lines=5)
+    assert result["scope"] == "system"
+    assert result["observation_complete"] is True
+    assert result["logs"]["stdout"] == "system-log\n"
+    assert len([argv for argv in calls if argv[0] == "/usr/bin/systemctl"]) == 2
+
+
 def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl" and "show" in argv:
+            stdout = _complete_service_show_fixture() if "--user" in argv else _missing_system_service_show_fixture()
             return {
                 "returncode": 0,
-                "stdout": _complete_service_show_fixture(),
+                "stdout": stdout,
                 "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
             }
         if argv[0] == "/usr/bin/ps":
@@ -345,6 +432,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
     runtime = server.service_runtime("nixer-mcp.service")
+    assert runtime["service_scope"] == "user"
     assert runtime["main_pid"] == 100
     assert [row["pid"] for row in runtime["processes"]] == [100, 101]
     assert "127.0.0.1:18187" in runtime["listeners"][0]
@@ -356,7 +444,10 @@ def test_service_runtime_zero_listener_match_does_not_establish_absence(monkeypa
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
-            return {"returncode": 0, "stdout": _complete_service_show_fixture(control_group="/cg"), "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            stdout = (
+                _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
+            )
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ps":
             return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
@@ -378,7 +469,10 @@ def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkey
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
-            return {"returncode": 0, "stdout": _complete_service_show_fixture(control_group="/cg"), "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            stdout = (
+                _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
+            )
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ps":
             return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
@@ -405,7 +499,10 @@ def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(mo
     own_uid = server.os.getuid()
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
-            return {"returncode": 0, "stdout": _complete_service_show_fixture(control_group="/cg"), "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            stdout = (
+                _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
+            )
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ps":
             return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
         if argv[0] == "/usr/bin/ss":
