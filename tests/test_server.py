@@ -701,7 +701,7 @@ def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeyp
     assert not target.exists()
 
 
-def test_worktree_root_is_observation_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worktree_root_limits_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     allowed = tmp_path / "allowed"; allowed.mkdir()
     worktree = tmp_path / "outside"; worktree.mkdir()
@@ -711,7 +711,7 @@ def test_worktree_root_is_observation_only(tmp_path: Path, monkeypatch: pytest.M
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
         "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
     })
-    with pytest.raises(PermissionError, match="outside Adler's observed worktree root"):
+    with pytest.raises(PermissionError, match="outside Adler's delivery worktree root"):
         server.publish_worktree_inbox(lane_id)
     assert not (worktree / ".adler").exists()
     assert not (state / "worktree-inboxes").exists()
@@ -776,18 +776,18 @@ def test_finding_digest_mismatch_cannot_be_published_as_complete_empty_view(tmp_
     assert listing["source_complete"] is False
 
 
-def test_finding_install_is_atomic_when_final_rename_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_finding_install_is_atomic_when_final_noreplace_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
-    real_rename = server.os.rename
-    def fail_final_rename(*args, **kwargs):
-        raise OSError("fixture rename failure")
-    monkeypatch.setattr(server.os, "rename", fail_final_rename)
-    with pytest.raises(OSError, match="fixture rename failure"):
+
+    def fail_final_install(*args, **kwargs):
+        raise OSError("fixture install failure")
+
+    monkeypatch.setattr(server, "_rename_noreplace", fail_final_install)
+    with pytest.raises(OSError, match="fixture install failure"):
         server.submit_finding(**_finding_args())
     findings = state / "findings"
     assert list(findings.glob("*.json")) == []
     assert list(findings.glob(".finding-*.tmp")) == []
-    monkeypatch.setattr(server.os, "rename", real_rename)
 
 
 def test_inbox_snapshot_waits_for_external_inbox_store_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
