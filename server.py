@@ -934,6 +934,7 @@ def _finding_record_view(payload: dict[str, Any], path: Path) -> dict[str, Any]:
     return {
         "finding_id": payload["finding_id"],
         "finding_sha256": _sha256_json(payload),
+        "compatibility_contract": payload.get("compatibility_contract"),
         "kind": legacy_status,
         "status": legacy_status,
         "subject_kind": payload["subject_kind"],
@@ -969,6 +970,9 @@ def _validate_legacy_finding_payload(payload: dict[str, Any], path: Path) -> Non
         raise RuntimeError("legacy finding Adler identity is invalid")
     if payload.get("effect_contract") != "advisory_only_no_automatic_action":
         raise RuntimeError("legacy finding effect contract is invalid")
+    compatibility_contract = payload.get("compatibility_contract")
+    if compatibility_contract is not None and compatibility_contract != LEGACY_CONNECTOR_CONTRACT:
+        raise RuntimeError("legacy finding compatibility contract is invalid")
 
     finding_id = payload.get("finding_id")
     if (
@@ -1224,6 +1228,7 @@ def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]
     legacy_records = [
         (path, payload) for path, payload in loaded
         if payload.get("finding_contract") != FINDING_CONTRACT
+        and payload.get("compatibility_contract") == LEGACY_CONNECTOR_CONTRACT
         and payload.get("subject_kind") == "grabowski_lane"
         and payload.get("subject") == subject
         and payload.get("checkpoint") == checkpoint
@@ -1796,6 +1801,7 @@ def submit_finding_legacy(
         "schema_version": 1,
         "finding_id": finding_id,
         "adler_identity": IDENTITY,
+        "compatibility_contract": LEGACY_CONNECTOR_CONTRACT,
         "subject_kind": subject_kind,
         "subject": subject_clean,
         "checkpoint": checkpoint_clean,

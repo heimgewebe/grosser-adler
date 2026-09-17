@@ -65,6 +65,7 @@ def test_legacy_connector_record_does_not_invent_v1_confidence(
     )
     assert payload["schema_version"] == 1
     assert payload["status"] == "finding"
+    assert payload["compatibility_contract"] == server.LEGACY_CONNECTOR_CONTRACT
     assert "finding_contract" not in payload
     assert "confidence" not in payload
     assert "binding_strength" not in payload
@@ -101,6 +102,7 @@ def test_legacy_lane_submission_resolves_current_checkpoint_and_publishes(
     assert finding["subject"] == f"lane:{lane_id}"
     assert finding["checkpoint"] == OID_A
     assert finding["status"] == "recheck_suggested"
+    assert finding["compatibility_contract"] == server.LEGACY_CONNECTOR_CONTRACT
     assert finding["confidence"] is None
     assert finding["binding_strength"] == "legacy-unbound"
 
