@@ -1,7 +1,10 @@
 # Großer-Adler authority-boundary regression tests.
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -15,14 +18,17 @@ OID_C = "c" * 40
 OID_D = "d" * 40
 
 
-def test_status_declares_read_mostly_boundary() -> None:
+def test_status_declares_minimal_read_mostly_boundary() -> None:
     status = server.adler_status()
     assert status["identity"] == "grosser-adler-observer-v1"
     assert status["mode"] == "read-mostly"
-    assert status["allowed_effects"] == ["append_finding"]
-    assert "file_write" in status["forbidden_effects"]
+    assert status["architecture_contract"] == "observer-evidence-finding-delivery-v1"
+    assert status["allowed_effects"] == ["append_finding", "publish_worktree_inbox"]
+    assert "general_file_write" in status["forbidden_effects"]
+    assert "git_index_mutation" in status["forbidden_effects"]
     assert "bureau_mutation" in status["forbidden_effects"]
     assert "agent_start" in status["forbidden_effects"]
+    assert "admission_policy" in status["forbidden_effects"]
 
 
 def test_repo_path_escape_is_rejected(tmp_path: Path) -> None:
@@ -44,37 +50,6 @@ def test_bad_revision_is_rejected() -> None:
         server._validate_revision("HEAD;touch /tmp/nope")
     with pytest.raises(ValueError):
         server._validate_revision("--textconv")
-
-
-def test_finding_is_create_only_and_advisory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    state = tmp_path / "state"
-    findings = state / "findings"
-    monkeypatch.setattr(server, "STATE_ROOT", state)
-    monkeypatch.setattr(server, "FINDINGS_ROOT", findings)
-
-    result = server.submit_finding(
-        subject_kind="commit",
-        subject="heimgewebe/grabowski",
-        checkpoint="0123456789abcdef",
-        severity="low",
-        status="observation",
-        summary="Controlled observer fixture; no action requested.",
-        evidence_refs=["fixture:test_server.py"],
-    )
-
-    assert result["accepted"] is True
-    assert result["automatic_effect"] is False
-    files = list(findings.glob("*.json"))
-    assert len(files) == 1
-    payload = json.loads(files[0].read_text(encoding="utf-8"))
-    assert payload["finding_id"] == result["finding_id"]
-    assert payload["schema_version"] == 1
-    assert payload["effect_contract"] == "advisory_only_no_automatic_action"
-    assert files[0].stat().st_mode & 0o777 == 0o600
-
-    listing = server.list_findings(limit=10)
-    assert listing["count"] == 1
-    assert listing["findings"][0]["finding_id"] == result["finding_id"]
 
 
 def test_internal_runner_has_no_shell_escape() -> None:
@@ -175,98 +150,6 @@ def test_github_pr_requests_base_oid(monkeypatch: pytest.MonkeyPatch) -> None:
     fields = calls[0][calls[0].index("--json") + 1].split(",")
     assert "headRefOid" in fields
     assert "baseRefOid" in fields
-
-
-def test_relational_checkpoint_binds_every_component(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    state = tmp_path / "state"
-    findings = state / "findings"
-    monkeypatch.setattr(server, "STATE_ROOT", state)
-    monkeypatch.setattr(server, "FINDINGS_ROOT", findings)
-
-    result = server.submit_finding(
-        subject_kind="repo",
-        subject="heimgewebe/grabowski",
-        checkpoint="local-head-a",
-        checkpoint_mode="relational",
-        checkpoint_components=[
-            {"name": "upstream_head", "value": "upstream-b"},
-            {"name": "local_head", "value": "local-head-a"},
-        ],
-        severity="medium",
-        summary="Relational fixture.",
-        evidence_refs=["fixture:relational-checkpoint"],
-    )
-
-    payload = json.loads(next(findings.glob("*.json")).read_text(encoding="utf-8"))
-    assert result["automatic_effect"] is False
-    assert payload["schema_version"] == 2
-    assert payload["checkpoint_mode"] == "relational"
-    assert payload["checkpoint_components"] == [
-        {"name": "local_head", "value": "local-head-a"},
-        {"name": "upstream_head", "value": "upstream-b"},
-    ]
-    assert payload["checkpoint_contract"] == "all_components_must_match_or_recheck"
-
-    changed = server._normalize_checkpoint_components([
-        {"name": "local_head", "value": "local-head-a"},
-        {"name": "upstream_head", "value": "upstream-c"},
-    ])
-    assert changed is not None
-    assert server._checkpoint_set_sha256(changed) != payload["checkpoint_set_sha256"]
-
-
-def test_relational_checkpoint_rejects_components_requiring_redaction_before_persisting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    state = tmp_path / "state"
-    findings = state / "findings"
-    monkeypatch.setattr(server, "STATE_ROOT", state)
-    monkeypatch.setattr(server, "FINDINGS_ROOT", findings)
-
-    for sensitive_value in ("sk-proj-" + "A" * 24, "sk-proj-" + "B" * 24):
-        with pytest.raises(ValueError, match="requiring redaction"):
-            server.submit_finding(
-                subject_kind="work", subject="fixture", severity="medium", summary="fixture",
-                evidence_refs=["fixture:redaction"], checkpoint_mode="relational",
-                checkpoint_components=[
-                    {"name": "local_head", "value": "a" * 40},
-                    {"name": "runtime_token", "value": sensitive_value},
-                ],
-            )
-
-    assert list(findings.glob("*.json")) == []
-
-
-def test_relational_checkpoint_rejects_incomplete_component_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
-    monkeypatch.setattr(server, "FINDINGS_ROOT", tmp_path / "state" / "findings")
-
-    with pytest.raises(ValueError, match="at least two checkpoint_components"):
-        server.submit_finding(
-            subject_kind="pr",
-            subject="heimgewebe/grosser-adler#2",
-            checkpoint_mode="relational",
-            checkpoint_components=[{"name": "pr_head", "value": "head-a"}],
-            severity="medium",
-            summary="Incomplete relational fixture.",
-            evidence_refs=["fixture:incomplete-relational"],
-        )
-
-
-def test_single_checkpoint_rejects_relational_components(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
-    monkeypatch.setattr(server, "FINDINGS_ROOT", tmp_path / "state" / "findings")
-
-    with pytest.raises(ValueError, match="checkpoint_mode='relational'"):
-        server.submit_finding(
-            subject_kind="repo",
-            subject="heimgewebe/grosser-adler",
-            checkpoint_components=[
-                {"name": "local_head", "value": "a"},
-                {"name": "upstream_head", "value": "b"},
-            ],
-            severity="medium",
-            summary="Ambiguous mode fixture.",
-            evidence_refs=["fixture:ambiguous-mode"],
-        )
 
 
 def test_deploy_templates_keep_credentials_separate() -> None:
@@ -535,194 +418,6 @@ def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(mo
     assert "listeners" in runtime["missing_evidence"]
 
 
-def test_supervise_work_rejects_symbolic_or_abbreviated_claimed_head() -> None:
-    for claimed in ("HEAD", "abc123", "a" * 12):
-        with pytest.raises(ValueError, match="full commit OID"):
-            server.supervise_work(
-                binding_kind="manual", binding_id="manual:fixture",
-                repo="/home/alex/repos/nixer", claimed_head=claimed,
-            )
-
-
-def test_supervise_work_keeps_unverified_lane_top_level_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture())
-    result = server.supervise_work(
-        binding_kind="grabowski_lane", binding_id="lane:fixture",
-        repo="/home/alex/repos/nixer", claimed_head=OID_A, expect_clean=True,
-    )
-    assert result["evidence_conclusion"] == "confirmed"
-    assert result["conclusion"] == "incomplete"
-    assert result["binding"]["verification"] == "unverified"
-    assert "binding_identity" in result["missing_evidence"]
-    assert result["persisted"] is False
-
-
-def test_supervise_work_manual_claim_can_confirm_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture())
-    result = server.supervise_work(
-        binding_kind="manual", binding_id="manual:fixture",
-        repo="/home/alex/repos/nixer", claimed_head=OID_A, expect_clean=True,
-    )
-    assert result["conclusion"] == "confirmed"
-    assert result["binding"]["verification"] == "not_applicable"
-    assert "stale_evidence" not in result
-
-
-def test_supervise_work_truncated_git_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
-    fixture = _complete_git_fixture()
-    fixture["observation_complete"] = False
-    fixture["status"]["stdout_truncated"] = True
-    monkeypatch.setattr(server, "git_status", lambda repo: fixture)
-    result = server.supervise_work(
-        binding_kind="manual", binding_id="manual:fixture",
-        repo="/home/alex/repos/nixer", claimed_head=OID_A, expect_clean=True,
-    )
-    assert result["conclusion"] == "incomplete"
-    assert result["dimensions"]["cleanliness"]["status"] == "incomplete"
-
-
-def test_supervise_work_service_expectation_requires_unit() -> None:
-    with pytest.raises(ValueError, match="unit is required"):
-        server.supervise_work(
-            binding_kind="manual", binding_id="manual:fixture",
-            repo="/home/alex/repos/nixer", expect_service_active=True,
-        )
-
-
-def test_supervise_work_missing_active_state_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture())
-    monkeypatch.setattr(server, "service_runtime", lambda unit: {
-        "service": {}, "main_pid": 0, "control_group": None, "processes": [],
-        "listeners": [], "missing_evidence": ["systemd_status"], "complete": False,
-    })
-    result = server.supervise_work(
-        binding_kind="manual", binding_id="manual:fixture", repo="/home/alex/repos/nixer",
-        claimed_head=OID_A, unit="nixer-mcp.service", expect_service_active=True,
-    )
-    assert result["conclusion"] == "incomplete"
-    assert result["dimensions"]["runtime_active"]["status"] == "incomplete"
-    assert not result["contradictions"]
-    assert not any(item["name"].startswith("runtime_") for item in result["checkpoint_components"])
-
-
-def test_supervise_work_checkpoint_components_bind_cleanliness_and_complete_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture(OID_A))
-    monkeypatch.setattr(server, "service_runtime", lambda unit: {
-        "service": {
-            "ActiveState": "active", "ExecMainStartTimestamp": "now", "NRestarts": "2",
-        },
-        "main_pid": 100, "control_group": "/cg", "processes": [{"pid": 100}],
-        "listeners": ["tcp LISTEN ... cgroup:/cg"], "missing_evidence": [], "complete": True,
-    })
-    result = server.supervise_work(
-        binding_kind="manual", binding_id="manual:fixture", repo="/home/alex/repos/nixer",
-        claimed_head=OID_A, expect_clean=True, unit="nixer-mcp.service", expect_service_active=True,
-    )
-    components = {item["name"]: item["value"] for item in result["checkpoint_components"]}
-    assert components["local_head"] == OID_A
-    assert components["local_clean"] == "true"
-    assert components["runtime_main_pid"] == "100"
-    assert components["runtime_active_state"] == "active"
-    assert components["runtime_start"] == "now"
-    assert components["runtime_restarts"] == "2"
-    assert components["runtime_cgroup"] == "/cg"
-
-
-def test_supervise_work_pr_head_mismatch_is_contradicted(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture(OID_B))
-    monkeypatch.setattr(server, "github_pr", lambda repo, pr: {
-        "metadata": {"returncode": 0, "stdout": json.dumps({"number": 1, "headRefOid": OID_C, "baseRefOid": OID_D}), "stdout_truncated": False},
-        "reviews": {"returncode": 0, "stdout": "[]"},
-    })
-    result = server.supervise_work(
-        binding_kind="pr", binding_id="heimgewebe/nixer#1", repo="/home/alex/repos/nixer",
-        claimed_head=OID_B, github_repo="heimgewebe/nixer", pr=1,
-    )
-    assert result["conclusion"] == "contradicted"
-    assert result["dimensions"]["github_pr_head"]["status"] == "contradicted"
-
-
-def test_supervise_work_missing_pr_head_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "git_status", lambda repo: _complete_git_fixture(OID_B))
-    monkeypatch.setattr(server, "github_pr", lambda repo, pr: {
-        "metadata": {"returncode": 0, "stdout": json.dumps({"number": 1, "baseRefOid": OID_D}), "stdout_truncated": False},
-        "reviews": {"returncode": 0, "stdout": "[]"},
-    })
-    result = server.supervise_work(
-        binding_kind="pr", binding_id="heimgewebe/nixer#1", repo="/home/alex/repos/nixer",
-        claimed_head=OID_B, github_repo="heimgewebe/nixer", pr=1,
-    )
-    assert result["conclusion"] == "incomplete"
-    assert "github_pr_head" in result["missing_evidence"]
-
-
-def test_enriched_advice_rejects_huge_integer_confidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = tmp_path / "state"
-    monkeypatch.setattr(server, "STATE_ROOT", state)
-    monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
-    with pytest.raises(ValueError, match="finite number between 0 and 1"):
-        server.submit_finding(
-            subject_kind="work", subject="lane:fixture", severity="medium", status="advice",
-            summary="Huge confidence fixture.", evidence_refs=["fixture:confidence"], confidence=10**10000,
-        )
-    assert list((state / "findings").glob("*.json")) == []
-
-
-@pytest.mark.parametrize("confidence", [float("nan"), float("inf"), float("-inf")])
-def test_enriched_advice_rejects_non_finite_confidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confidence: float
-) -> None:
-    state = tmp_path / "state"
-    monkeypatch.setattr(server, "STATE_ROOT", state)
-    monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
-    with pytest.raises(ValueError, match="finite number between 0 and 1"):
-        server.submit_finding(
-            subject_kind="work", subject="lane:fixture", severity="medium", status="advice",
-            summary="Non-finite confidence fixture.", evidence_refs=["fixture:confidence"], confidence=confidence,
-        )
-    assert list((state / "findings").glob("*.json")) == []
-
-
-def test_enriched_advice_stays_append_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    state = tmp_path / "state"
-    findings = state / "findings"
-    monkeypatch.setattr(server, "STATE_ROOT", state)
-    monkeypatch.setattr(server, "FINDINGS_ROOT", findings)
-    result = server.submit_finding(
-        subject_kind="work", subject="lane:fixture", severity="medium", status="advice",
-        summary="Exact-head evidence is stale.", evidence_refs=["fixture:head"],
-        target_actor="grabowski", binding="lane:fixture",
-        recommendation="Recheck the current head before closeout.",
-        rationale="The reviewed head differs from the current head.", confidence=0.95,
-    )
-    payload = json.loads(next(findings.glob("*.json")).read_text(encoding="utf-8"))
-    assert result["automatic_effect"] is False
-    assert payload["schema_version"] == 3
-    assert payload["status"] == "advice"
-    assert payload["target_actor"] == "grabowski"
-    assert payload["confidence"] == 0.95
-
-
-def test_relational_enriched_advice_uses_schema_v3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    state = tmp_path / "state"
-    monkeypatch.setattr(server, "STATE_ROOT", state)
-    monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
-    server.submit_finding(
-        subject_kind="work", subject="lane:fixture", severity="medium", status="advice",
-        summary="Relational advice.", evidence_refs=["fixture:head"],
-        checkpoint_mode="relational", checkpoint_components=[
-            {"name": "local_head", "value": "head-a"},
-            {"name": "runtime_main_pid", "value": "100"},
-        ], recommendation="Recheck both components.",
-    )
-    payload = json.loads(next((state / "findings").glob("*.json")).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
-    assert payload["checkpoint_mode"] == "relational"
-    assert payload["recommendation"] == "Recheck both components."
-
-
 def test_git_status_hides_untracked_filenames_and_tracks_completeness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(server, "_resolve_repo", lambda repo: tmp_path)
     def fake_run(argv, **kwargs):
@@ -742,21 +437,399 @@ def test_git_status_hides_untracked_filenames_and_tracks_completeness(monkeypatc
 
 def test_status_cleanliness_requires_observed_branch_line() -> None:
     assert server._status_is_clean("## feature\n") is True
-    assert server._status_is_clean("") is False
     assert server._status_is_clean("## feature\n M server.py\n") is False
 
-
-def test_finding_v3_redacts_new_advisory_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _configure_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     state = tmp_path / "state"
+    state.mkdir(mode=0o700)
     monkeypatch.setattr(server, "STATE_ROOT", state)
     monkeypatch.setattr(server, "FINDINGS_ROOT", state / "findings")
-    secret = "token=opaque-sensitive-value"
-    server.submit_finding(
-        subject_kind="work", subject=f"work {secret}", severity="low", status="advice",
-        summary=f"summary {secret}", evidence_refs=[f"evidence:{secret}"],
-        recommendation=f"recommend {secret}",
-    )
-    payload = json.loads(next((state / "findings").glob("*.json")).read_text(encoding="utf-8"))
-    encoded = json.dumps(payload)
-    assert "opaque-sensitive-value" not in encoded
-    assert "<REDACTED>" in encoded
+    monkeypatch.setattr(server, "INBOX_ROOT", state / "worktree-inboxes")
+    monkeypatch.setattr(server, "WORKTREE_ROOT", tmp_path.resolve())
+    return state
+
+
+def _install_pointer(worktree: Path, state: Path, lane_id: str) -> Path:
+    worktree.mkdir(parents=True, exist_ok=True)
+    sidecar = worktree / ".adler"
+    sidecar.mkdir(mode=0o700)
+    gitignore = sidecar / ".gitignore"
+    gitignore.write_bytes(b"*\n")
+    gitignore.chmod(0o600)
+    target = state / "worktree-inboxes" / f"{lane_id}.json"
+    (sidecar / "inbox.json").symlink_to(target)
+    return target
+
+
+def _seal_lane(lane: dict) -> dict:
+    lane = json.loads(json.dumps(lane))
+    lane.setdefault("kind", "grabowski.work_lane")
+    lane.setdefault("schema_version", 1)
+    lane["inputs"].setdefault("lease_owner_id", f"lane:{lane['lane_id']}")
+    lane["inputs_sha256"] = server._sha256_json(lane["inputs"])
+    lane["receipt_sha256"] = server._sha256_json(lane)
+    return lane
+
+
+def _finding_args(**overrides):
+    data = {
+        "kind": "risk",
+        "severity": "high",
+        "confidence": 0.9,
+        "subject": "repo:heimgewebe/grosser-adler",
+        "checkpoint": OID_A,
+        "binding_strength": "exact",
+        "summary": "Evidence-bound fixture.",
+        "evidence_refs": ["fixture:test_server.py"],
+    }
+    data.update(overrides)
+    return data
+
+
+def test_finding_v1_is_create_only_hashed_and_advisory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    result = server.submit_finding(**_finding_args())
+    assert result["accepted"] is True
+    assert result["automatic_effect"] is False
+    assert result["delivery"]["state"] == "not_applicable"
+    files = list((state / "findings").glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    assert payload["finding_contract"] == "adler-finding-v1"
+    assert payload["kind"] == "risk"
+    assert payload["binding_strength"] == "exact"
+    assert payload["finding_sha256"] == result["finding_sha256"]
+    core = dict(payload)
+    core.pop("finding_sha256")
+    import hashlib
+    expected = hashlib.sha256(json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    assert expected == result["finding_sha256"]
+    assert files[0].stat().st_mode & 0o777 == 0o600
+
+
+def test_finding_identity_fields_requiring_redaction_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    secret = "sk-proj-" + "A" * 24
+    for field in ("subject", "checkpoint"):
+        args = _finding_args(**{field: secret})
+        with pytest.raises(ValueError, match="requiring redaction"):
+            server.submit_finding(**args)
+    assert list((state / "findings").glob("*.json")) == []
+
+
+@pytest.mark.parametrize("confidence", [float("nan"), float("inf"), float("-inf"), -0.1, 1.1])
+def test_finding_rejects_invalid_confidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confidence: float) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="finite number between 0 and 1"):
+        server.submit_finding(**_finding_args(confidence=confidence))
+
+
+def test_legacy_finding_remains_readable_without_driving_v1_semantics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    findings = state / "findings"
+    findings.mkdir(mode=0o700)
+    legacy = {
+        "schema_version": 3,
+        "finding_id": "ga-20260916T000000Z-aaaaaaaaaaaa",
+        "adler_identity": server.IDENTITY,
+        "subject_kind": "work",
+        "status": "advice",
+        "severity": "medium",
+        "subject": "legacy-subject",
+        "checkpoint": "legacy-checkpoint",
+        "summary": "legacy",
+        "evidence_refs": ["fixture:legacy"],
+        "observed_at": "2026-09-16T00:00:00Z",
+        "effect_contract": "advisory_only_no_automatic_action",
+        "target_actor": None,
+        "binding": None,
+        "recommendation": None,
+        "rationale": None,
+        "confidence": None,
+    }
+    (findings / f"{legacy['finding_id']}.json").write_text(json.dumps(legacy), encoding="utf-8")
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is True
+    assert listing["count"] == 1
+    assert listing["findings"][0]["legacy"] is True
+    assert listing["findings"][0]["kind"] == "advice"
+    assert listing["findings"][0]["status"] == "advice"
+    assert listing["findings"][0]["binding_strength"] == "legacy-unbound"
+
+
+def test_work_target_reads_exact_active_grabowski_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    lanes = tmp_path / "lanes"
+    repo.mkdir(); worktree.mkdir(); lanes.mkdir()
+    (repo / ".git").mkdir(); (worktree / ".git").write_text("gitdir: fixture", encoding="utf-8")
+    lane_id = "1" * 32
+    lane = _seal_lane({
+        "lane_id": lane_id,
+        "state": "ready",
+        "terminal_closeout": None,
+        "inputs": {
+            "lane_id": lane_id,
+            "repo": str(repo),
+            "target_path": str(worktree),
+            "branch": "feature/minimal",
+            "purpose": "fixture",
+            "base_head": OID_B,
+        },
+    })
+    (lanes / f"{lane_id}.json").write_text(json.dumps(lane), encoding="utf-8")
+    monkeypatch.setattr(server, "REPO_ROOT", tmp_path.resolve())
+    monkeypatch.setattr(server, "GRABOWSKI_WORK_LANES_ROOT", lanes.resolve())
+    def fake_run(argv, **kwargs):
+        if "worktree" in argv and "list" in argv:
+            out = f"worktree {worktree.resolve()}\nHEAD {OID_A}\nbranch refs/heads/feature/minimal\n\n"
+        elif argv[-2:] == ["rev-parse", "HEAD"]:
+            out = OID_A + "\n"
+        elif argv[-2:] == ["branch", "--show-current"]:
+            out = "feature/minimal\n"
+        elif argv[-2:] == ["rev-parse", "--show-toplevel"]:
+            out = str(worktree.resolve()) + "\n"
+        else:
+            raise AssertionError(argv)
+        return {"returncode": 0, "stdout": out, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+    monkeypatch.setattr(server, "_run", fake_run)
+    target = server.get_work_target(lane_id)
+    assert target["worktree"] == str(worktree.resolve())
+    assert target["branch"] == "feature/minimal"
+    assert target["checkpoint"] == OID_A
+    assert target["purpose"] == "fixture"
+
+
+def test_work_target_rejects_terminal_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lanes = tmp_path / "lanes"; lanes.mkdir()
+    lane_id = "2" * 32
+    lane = _seal_lane({"lane_id": lane_id, "state": "ready", "terminal_closeout": {"closeout_state": "no_change_proven"}, "inputs": {"lane_id": lane_id, "repo": str(tmp_path), "target_path": str(tmp_path), "branch": "fixture", "purpose": "fixture", "base_head": OID_A}})
+    (lanes / f"{lane_id}.json").write_text(json.dumps(lane), encoding="utf-8")
+    monkeypatch.setattr(server, "GRABOWSKI_WORK_LANES_ROOT", lanes.resolve())
+    with pytest.raises(RuntimeError, match="not active"):
+        server.get_work_target(lane_id)
+
+
+def test_work_target_rejects_tampered_lane_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lanes = tmp_path / "lanes"; lanes.mkdir()
+    lane_id = "8" * 32
+    lane = _seal_lane({"lane_id": lane_id, "state": "ready", "terminal_closeout": None, "inputs": {"lane_id": lane_id, "repo": str(tmp_path), "target_path": str(tmp_path), "branch": "fixture", "purpose": "before", "base_head": OID_A}})
+    lane["inputs"]["purpose"] = "tampered-after-seal"
+    path = lanes / f"{lane_id}.json"
+    path.write_text(json.dumps(lane), encoding="utf-8"); path.chmod(0o600)
+    monkeypatch.setattr(server, "GRABOWSKI_WORK_LANES_ROOT", lanes.resolve())
+    with pytest.raises(RuntimeError, match="receipt digest is invalid"):
+        server.get_work_target(lane_id)
+
+
+def test_lane_finding_automatically_publishes_external_current_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "3" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": str(tmp_path / "repo"), "worktree": str(worktree),
+        "branch": "feature/minimal", "purpose": "fixture", "base_head": OID_B,
+        "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    result = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}"))
+    assert result["delivery"]["state"] == "published"
+    assert result["delivery"]["inbox_store"] == str(target)
+    inbox = json.loads(target.read_text(encoding="utf-8"))
+    assert inbox["contract"] == "adler-worktree-inbox-v1"
+    assert inbox["writer_identity"] == server.IDENTITY
+    assert inbox["delivery_mode"] == "grabowski_owned_symlink_to_adler_state"
+    assert inbox["checkpoint"] == OID_A
+    assert [item["finding_id"] for item in inbox["findings"]] == [result["finding_id"]]
+    assert os.readlink(worktree / ".adler" / "inbox.json") == str(target)
+
+
+def test_sidecar_rejects_symlink_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"; worktree.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    (worktree / ".adler").symlink_to(outside, target_is_directory=True)
+    lane_id = "4" * 32
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    with pytest.raises(RuntimeError, match="unsafe .adler"):
+        server.publish_worktree_inbox(lane_id)
+    assert list(outside.iterdir()) == []
+
+
+def test_recheck_preserves_history_and_removes_no_longer_current_finding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "6" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    checkpoint = {"value": OID_A}
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": checkpoint["value"], "source": "fixture", "observed_at": "fixture",
+    })
+    first = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}", checkpoint=OID_A))
+    original_path = state / "findings" / f"{first['finding_id']}.json"
+    before = original_path.read_bytes()
+    checkpoint["value"] = OID_B
+    second = server.submit_finding(**_finding_args(
+        kind="observation", severity="low", subject=f"lane:{lane_id}", checkpoint=OID_B,
+        summary="Rechecked and no longer reproduced.", recheck_of=first["finding_id"], conclusion="no_longer_reproduced",
+    ))
+    assert second["delivery"]["state"] == "published"
+    assert original_path.read_bytes() == before
+    assert len(list((state / "findings").glob("*.json"))) == 2
+    inbox = json.loads(target.read_text(encoding="utf-8"))
+    assert inbox["checkpoint"] == OID_B
+    assert inbox["findings"] == []
+
+
+def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "9" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    findings = state / "findings"; findings.mkdir(mode=0o700)
+    bad = findings / "broken.json"; bad.write_text("{broken", encoding="utf-8"); bad.chmod(0o600)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    with pytest.raises(RuntimeError, match="finding store observation is incomplete"):
+        server.publish_worktree_inbox(lane_id)
+    assert not target.exists()
+
+
+def test_worktree_root_limits_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    allowed = tmp_path / "allowed"; allowed.mkdir()
+    worktree = tmp_path / "outside"; worktree.mkdir()
+    monkeypatch.setattr(server, "WORKTREE_ROOT", allowed.resolve())
+    lane_id = "a" * 32
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    with pytest.raises(PermissionError, match="outside Adler's delivery worktree root"):
+        server.publish_worktree_inbox(lane_id)
+    assert not (worktree / ".adler").exists()
+    assert not (state / "worktree-inboxes").exists()
+
+
+def test_delivery_failure_keeps_finding_durable_and_does_not_create_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"; worktree.mkdir()
+    lane_id = "7" * 32
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    result = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}"))
+    assert result["accepted"] is True
+    assert result["delivery"]["state"] == "delivery_failed"
+    assert result["delivery"]["source_complete"] is False
+    assert result["delivery"]["finding_remains_durable"] is True
+    assert (state / "findings" / f"{result['finding_id']}.json").exists()
+    assert not (worktree / ".adler").exists()
+
+
+def test_finding_short_write_does_not_install_truncated_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    real_write = server.os.write
+
+    def short_write(fd: int, data) -> int:
+        raw = bytes(data)
+        if len(raw) > 1:
+            raw = raw[: max(1, len(raw) // 2)]
+        return real_write(fd, raw)
+
+    monkeypatch.setattr(server.os, "write", short_write)
+    result = server.submit_finding(**_finding_args())
+    path = state / "findings" / f"{result['finding_id']}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["finding_sha256"] == result["finding_sha256"]
+    server._validate_v1_finding_payload(payload, path)
+
+
+def test_finding_digest_mismatch_cannot_be_published_as_complete_empty_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "c" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    submitted = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}", checkpoint=OID_A))
+    before_inbox = target.read_bytes()
+    finding = state / "findings" / f"{submitted['finding_id']}.json"
+    payload = json.loads(finding.read_text(encoding="utf-8"))
+    payload["checkpoint"] = OID_B
+    finding.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    finding.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="finding store observation is incomplete"):
+        server.publish_worktree_inbox(lane_id)
+    assert target.read_bytes() == before_inbox
+    listing = server.list_findings(limit=10)
+    assert listing["source_complete"] is False
+
+
+def test_finding_install_is_atomic_when_final_noreplace_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+
+    def fail_final_install(*args, **kwargs):
+        raise OSError("fixture install failure")
+
+    monkeypatch.setattr(server, "_rename_noreplace", fail_final_install)
+    with pytest.raises(OSError, match="fixture install failure"):
+        server.submit_finding(**_finding_args())
+    findings = state / "findings"
+    assert list(findings.glob("*.json")) == []
+    assert list(findings.glob(".finding-*.tmp")) == []
+
+
+def test_inbox_snapshot_waits_for_external_inbox_store_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "b" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    target.parent.mkdir(mode=0o700)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: {
+        "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
+        "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
+    })
+    entered_projection = threading.Event()
+    real_projection = server._current_lane_findings
+    def observed_projection(lane: str, checkpoint: str):
+        entered_projection.set()
+        return real_projection(lane, checkpoint)
+    monkeypatch.setattr(server, "_current_lane_findings", observed_projection)
+    lock_fd = server.os.open(target.parent, server.os.O_RDONLY | server.os.O_DIRECTORY | server.os.O_CLOEXEC)
+    server.fcntl.flock(lock_fd, server.fcntl.LOCK_EX)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(server.publish_worktree_inbox, lane_id)
+            assert entered_projection.wait(0.1) is False
+            assert not target.exists()
+            server.fcntl.flock(lock_fd, server.fcntl.LOCK_UN)
+            result = future.result(timeout=2)
+    finally:
+        server.os.close(lock_fd)
+    assert entered_projection.is_set()
+    assert result["state"] == "published"
+
+
+def test_recheck_chain_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    root = server.submit_finding(**_finding_args(subject="repo:fixture"))
+    recheck = server.submit_finding(**_finding_args(
+        kind="observation", severity="low", subject="repo:fixture", checkpoint=OID_B,
+        recheck_of=root["finding_id"], conclusion="still_current",
+    ))
+    with pytest.raises(ValueError, match="root finding"):
+        server.submit_finding(**_finding_args(
+            kind="observation", severity="low", subject="repo:fixture", checkpoint=OID_C,
+            recheck_of=recheck["finding_id"], conclusion="still_current",
+        ))

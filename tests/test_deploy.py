@@ -1,17 +1,28 @@
 from pathlib import Path
 
 
+def _unit() -> str:
+    root = Path(__file__).parents[1]
+    return (root / "deploy" / "grosser-adler-mcp.service").read_text(encoding="utf-8")
+
+
 def test_mcp_service_allows_netlink_for_read_only_socket_observation() -> None:
     root = Path(__file__).parents[1]
-    mcp = (root / "deploy" / "grosser-adler-mcp.service").read_text(encoding="utf-8")
+    mcp = _unit()
     tunnel = (root / "deploy" / "tunnel-client-grosser-adler.service").read_text(encoding="utf-8")
-
-    mcp_line = next(
-        line for line in mcp.splitlines() if line.startswith("RestrictAddressFamilies=")
-    )
-    tunnel_line = next(
-        line for line in tunnel.splitlines() if line.startswith("RestrictAddressFamilies=")
-    )
-
+    mcp_line = next(line for line in mcp.splitlines() if line.startswith("RestrictAddressFamilies="))
+    tunnel_line = next(line for line in tunnel.splitlines() if line.startswith("RestrictAddressFamilies="))
     assert mcp_line == "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
     assert "AF_NETLINK" not in tunnel_line
+
+
+def test_mcp_service_keeps_repositories_read_only_and_writes_only_adler_state() -> None:
+    mcp = _unit()
+    assert "Environment=GROSSER_ADLER_WORK_LANES_ROOT=%h/.local/state/grabowski/work-lanes" in mcp
+    assert "Environment=GROSSER_ADLER_WORKTREE_ROOT=%h/repos/.grabowski-worktrees" in mcp
+    assert "ProtectHome=read-only" in mcp
+    assert "ReadOnlyPaths=%h/repos %h/.local/state/grabowski/work-lanes" in mcp
+    assert "ReadWritePaths=%h/.local/state/grosser-adler" in mcp
+    read_write_lines = [line for line in mcp.splitlines() if line.startswith("ReadWritePaths=")]
+    assert read_write_lines == ["ReadWritePaths=%h/.local/state/grosser-adler"]
+    assert all(".grabowski-worktrees" not in line for line in read_write_lines)

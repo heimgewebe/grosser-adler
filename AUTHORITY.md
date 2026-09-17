@@ -1,48 +1,16 @@
-# Großer Adler — Authority & Operating Contract v2
+# Großer Adler — Authority Boundary
 
-## Zweck
-Großer Adler ist die unabhängige Supervisory Plane des Heimgewebe-Operator-Ökosystems: Observer, Auditor und Berater. Er prüft konkrete Arbeitsbehauptungen und Ergebnisse gegen Primärquellen. Er ist weder zweite Control Plane noch zweite Work-State-Autorität.
+Großer Adler is an independent observer, auditor and advisor. The authoritative V1 architecture is `ARCHITECTURE.md`.
 
-## Begriffe
-- **controller**: steuert oder verantwortet eine Arbeit;
-- **executor**: führt den konkreten Effekt aus;
-- **subject**: Gegenstand der Arbeit;
-- **artifact**: erzeugtes oder geprüftes Ergebnis;
-- **runtime**: tatsächlich laufender Dienst, Prozess oder Deploymentzustand.
-Diese Rollen dürfen nicht gleichgesetzt werden.
+Adler may read typed, bounded, secret-safe primary evidence; append immutable findings under its own state root; read one exact active Grabowski lane target; and publish the computed current finding view only to its own state root after validating a Grabowski-owned `.adler/inbox.json` pointer.
 
-## Wahrheitsmodell
-Grabowski-, Bureau-, Agenten- oder andere Operatorprojektionen sind Claims und Discovery-Hinweise, nicht automatisch die Wahrheit ihres eigenen Audits. Adler bevorzugt unabhängige Primärquellen: konkrete Runtime, zuständige Primärstores, Git/GitHub und gebundene Receipts. Partiell oder trunciert beobachtet bedeutet `unknown`/`incomplete`, niemals Abwesenheit. `supervise_work` verifiziert eine explizite Binding-/Claim-Beschreibung und persistiert keinen Work-State. Bestätigung gilt pro Evidenzdimension. Grabowski-Lane-, Bureau-Task- und Agent-Run-Identitäten bleiben in v1 ohne direkten Primäradapter `unverified`; selbst bei bestätigtem Git-/Runtime-Zustand bleibt der Gesamtstatus dann `incomplete`. PR-Bindungen können dagegen über die exakte GitHub-PR-Identität direkt bestätigt oder widersprochen werden.
+Adler has no work-state authority and no decision or execution authority. It must not acquire claims or leases, create Bureau/operator tasks, start coding agents, edit product/configuration files, mutate the Git index, commit, push, mutate pull requests, merge, deploy, control services, signal processes, mutate/reveal credentials, or create an admission/blocking policy.
 
-## Trust Boundary
-Eigener MCP-Prozess, eigener OpenAI-Tunnel, eigener Toolkatalog; keine Verwendung des Grabowski-MCP als Beobachtungsbackend; direkte Git-/GitHub-/systemd-/Prozessbeobachtung; keine eigene kanonische Arbeitsdatenbank.
+`Finding != Task != Claim != Fix != Blockade != Work Lane`. Severity is descriptive; binding strength and checkpoint freshness remain separate evidence dimensions.
 
-Credentials bleiben getrennte Secret-Domänen. Der Tunnel lädt ausschließlich `%h/.config/tunnel-client/grosser-adler-runtime.env`. Der MCP-Dienst kann `%h/.config/grosser-adler/github.env` laden; dessen `GROSSER_ADLER_GITHUB_TOKEN` wird vom Server ausschließlich für `/usr/bin/gh` als `GH_TOKEN` weitergereicht. Git, systemd, `ps`, `ss` und andere Subprozesse erhalten dieses Credential nicht. Fehlt das dedizierte GitHub-Credential, schlagen GitHub-Reads fail-closed fehl. Ausgaben aller erlaubten Subprozesse durchlaufen die zentrale Secret-Redaction.
+The central finding store is append-only history. The external inbox target is a replaceable current view bound to an exact active lane and current worktree checkpoint; `.adler/inbox.json` is only Grabowski-owned pointer metadata to that target.
 
-Der MCP-Dienst bindet ausschließlich Loopback. Ein eigener tunnel-client-Prozess verbindet ihn mit dem dedizierten OpenAI-Tunnel `großer-adler`.
+## Operating Trust Boundary
+Adler runs its own MCP process, its own tool catalogue and its own tunnel path. The Grabowski MCP is not an observation backend for Adler; Git, GitHub, user-systemd and bounded process/socket observations are read from their responsible primary interfaces instead of trusting another operator's summary of itself.
 
-## Read Capabilities
-- Git status/log/show unter `/home/alex/repos`;
-- GitHub PR-Metadaten, Reviews und Checks;
-- Discovery und Status aller syntaktisch gültigen **user-systemd** Services ohne Namens-Allowlist;
-- bounded Journal-Reads;
-- Service-Runtime-Korrelation auf MainPID, **same-UID und service-cgroup-gebundene** Prozessnachkommen, Prozessname, Ressourcen und sichtbare Listener;
-- explizite Claim-Verifikation über `supervise_work`;
-- eigener Finding-Store.
-Es gibt keinen generischen Terminal-, Shell-, ptrace-, Signal- oder Service-Control-Endpunkt und keinen öffentlichen generischen Prozess-PID-Reader. Prozess-argv und Prozessumgebungen werden in v1 nicht ausgegeben; Prozesssicht entsteht nur im Kontext eines ausgewählten Services und dessen cgroup. Systemweite Root-/Docker-/Nix-Sicht ist nicht Bestandteil von v1.
-
-## Einziger Write-Pfad
-`submit_finding` schreibt genau einen create-only Datensatz in den Adler-Finding-Store. Er kann Beobachtungen, Widersprüche, fehlende Evidenz, Risiken, Advice und Recheck-Bedarf ausdrücken. Advice ist Datenmaterial, keine Ausführungsautorität. Relationale Aussagen binden alle zustandsrelevanten Komponenten über `checkpoint_components`. Der kanonische Komponenten-Hash bindet die gesamte Menge; ändert sich eine Komponente, gilt `all_components_must_match_or_recheck`. Legacy-Single-Checkpoint-Findings bleiben kompatibel. Findings starten niemals automatisch Tasks, Leases, Merges oder Deployments.
-
-## Verbotene Effekte
-Kein File-Writer außerhalb des Finding-Stores, kein Commit/Push/Merge, keine GitHub-Mutation, kein Deployment, kein Service start/stop/restart, kein Prozesssignal, kein Root, keine Bureau-Mutation, keine Work-Lane oder Lease, kein Agentenstart, kein Secret-Reveal.
-
-## Supervisor-Ablauf
-1. Eine bestehende Authority oder der Aufrufer liefert eine starke Binding-Identität und eine konkrete Behauptung.
-2. Adler liest unabhängige Primärquellen.
-3. Adler antwortet in `supervise_work` `confirmed`, `contradicted`, `incomplete` oder `unknown`; Staleness wird nur dort behauptet, wo eine Quelle sie eigenständig belegt.
-4. Nur eine entscheidungsrelevante Abweichung rechtfertigt ein Finding/Advice.
-5. Der zuständige Controller entscheidet über jede Aktion.
-
-## Anti-Doppelbau
-Adler erzeugt keinen eigenen Lifecycle und kein globales Work-Register. Vor jeder neuen Read-Oberfläche gilt reuse-before-build. Cross-Work- und Portfolio-Aussagen bleiben hinter einem Nutzengate.
+The HTTP MCP transport binds only to `127.0.0.1`; external reachability is delegated to the dedicated tunnel client. Tunnel credentials and GitHub credentials are separate secret domains. `GROSSER_ADLER_GITHUB_TOKEN` is forwarded only to `/usr/bin/gh` as `GH_TOKEN`; Git, systemd, process and socket subprocesses do not receive it. Missing dedicated GitHub credentials make GitHub reads fail closed, and allowed subprocess output passes through central secret redaction.

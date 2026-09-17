@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import fcntl
 import hashlib
 import json
 import math
@@ -19,17 +21,22 @@ from mcp.types import ToolAnnotations
 
 APP_NAME = "Großer Adler"
 IDENTITY = "grosser-adler-observer-v1"
-SUPERVISION_CONTRACT = "claim-to-independent-evidence-v1"
+FINDING_CONTRACT = "adler-finding-v1"
+SIDECAR_CONTRACT = "adler-worktree-inbox-v1"
+ARCHITECTURE_CONTRACT = "observer-evidence-finding-delivery-v1"
 REPO_ROOT = Path("/home/alex/repos").resolve()
 STATE_ROOT = Path(os.environ.get("GROSSER_ADLER_STATE_ROOT", "/home/alex/.local/state/grosser-adler")).resolve()
 FINDINGS_ROOT = STATE_ROOT / "findings"
+INBOX_ROOT = STATE_ROOT / "worktree-inboxes"
+GRABOWSKI_WORK_LANES_ROOT = Path(os.environ.get("GROSSER_ADLER_WORK_LANES_ROOT", "/home/alex/.local/state/grabowski/work-lanes")).resolve()
+WORKTREE_ROOT = Path(os.environ.get("GROSSER_ADLER_WORKTREE_ROOT", "/home/alex/repos/.grabowski-worktrees")).resolve()
 MAX_OUTPUT_BYTES = 160_000
+MAX_JSON_SOURCE_BYTES = 1_000_000
 MAX_SUMMARY_CHARS = 4_000
 MAX_EVIDENCE_REFS = 32
 MAX_EVIDENCE_REF_CHARS = 1_000
-MAX_CHECKPOINT_COMPONENTS = 16
-MAX_CHECKPOINT_NAME_CHARS = 100
-MAX_CHECKPOINT_VALUE_CHARS = 500
+MAX_AFFECTED_EFFECTS = 16
+MAX_AFFECTED_EFFECT_CHARS = 120
 
 READ_ANNOTATIONS = ToolAnnotations(
     title="Independent read-only observation",
@@ -45,15 +52,41 @@ FINDING_ANNOTATIONS = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=False,
 )
+SIDECAR_ANNOTATIONS = ToolAnnotations(
+    title="Publish advisory worktree inbox",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
-INSTRUCTIONS = """You are Großer Adler, an independent supervisor, auditor and advisor. Treat operator projections and caller-supplied work claims as claims to verify, never as a second work-state authority. Reconstruct current state from independent primary sources whenever possible. Keep controller, executor, subject, artifact and runtime distinct. A confirmed evidence dimension does not confirm an unverified lane, task or agent binding. Partial or truncated evidence is incomplete, never absent. Do not repair, merge, deploy, restart services, acquire work, or create Bureau tasks. Use submit_finding only for evidence-bound advisory observations or advice. A finding is data, never a command. Prefer exact commit/PR/runtime checkpoints and explicitly call out stale evidence. If no decision-relevant deviation exists, report that plainly instead of manufacturing findings."""
+INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and advisor. Reconstruct relevant state from primary evidence whenever possible. You do not own work state, decisions, execution, admission or lifecycle. Your only writes are immutable advisory findings and computed inbox files inside your own state root. Grabowski owns the worktree-local .adler/inbox.json symlink that points at the exact external inbox file. Findings are facts or advice, never commands. Never create work, acquire leases, edit worktree or product files, commit, push, merge, deploy, control services, signal processes or mutate credentials. Partial evidence is incomplete, never absence. Prefer exact checkpoints and explicit uncertainty; do not manufacture findings."""
 
 mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
-_COMMIT_OID_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
+_LANE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_LANE_SUBJECT_RE = re.compile(r"^lane:([0-9a-f]{32})$")
+_FINDING_ID_RE = re.compile(r"^ga-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+_LEGACY_SUBJECT_KINDS = {
+    "repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane",
+    "agent_run", "service", "work",
+}
+_LEGACY_STATUSES = {
+    "observation", "finding", "recheck_suggested", "contradiction",
+    "missing_evidence", "risk", "advice", "recheck_required",
+}
+_LEGACY_BASE_STATUSES = {"observation", "finding", "recheck_suggested"}
+_LEGACY_ENRICHED_FIELDS = ("target_actor", "binding", "recommendation", "rationale", "confidence")
+_LEGACY_RELATIONAL_FIELDS = (
+    "checkpoint_mode", "checkpoint_components", "checkpoint_set_sha256", "checkpoint_contract",
+)
+_V1_ONLY_MARKERS = {
+    "finding_contract", "finding_sha256", "kind", "binding_strength",
+    "recheck_of", "conclusion", "affected_effects",
+}
 _SYSTEMD_SERVICE_PROPERTIES = (
     "LoadState",
     "ActiveState",
@@ -293,69 +326,11 @@ def _validate_revision(revision: str) -> str:
     return revision
 
 
-def _validate_commit_oid(value: str) -> str:
-    if not isinstance(value, str) or _COMMIT_OID_RE.fullmatch(value) is None:
-        raise ValueError("claimed_head must be a full commit OID")
-    return value.lower()
-
-
-def _normalize_checkpoint_components(
-    value: list[dict[str, str]] | None,
-) -> list[dict[str, str]] | None:
-    if value is None:
-        return None
-    if not isinstance(value, list) or not 1 <= len(value) <= MAX_CHECKPOINT_COMPONENTS:
-        raise ValueError(
-            f"checkpoint_components must contain 1..{MAX_CHECKPOINT_COMPONENTS} entries"
-        )
-    normalized: list[dict[str, str]] = []
-    names: set[str] = set()
-    for component in value:
-        if not isinstance(component, dict) or set(component) != {"name", "value"}:
-            raise ValueError("each checkpoint component must contain exactly name and value")
-        name = component["name"]
-        component_value = component["value"]
-        if (
-            not isinstance(name, str)
-            or not name.strip()
-            or len(name) > MAX_CHECKPOINT_NAME_CHARS
-        ):
-            raise ValueError("invalid checkpoint component name")
-        if (
-            not isinstance(component_value, str)
-            or not component_value.strip()
-            or len(component_value) > MAX_CHECKPOINT_VALUE_CHARS
-        ):
-            raise ValueError("invalid checkpoint component value")
-        name = name.strip()
-        component_value = component_value.strip()
-        if (
-            _redact(name) != name
-            or _redact(component_value) != component_value
-            or "<REDACTED>" in name
-            or "<REDACTED>" in component_value
-        ):
-            raise ValueError(
-                "checkpoint components requiring redaction cannot be persisted"
-            )
-        if name in names:
-            raise ValueError("checkpoint component names must be unique")
-        names.add(name)
-        normalized.append({"name": name, "value": component_value})
-    return sorted(normalized, key=lambda item: item["name"])
-
-
-def _checkpoint_set_sha256(components: list[dict[str, str]]) -> str:
-    encoded = json.dumps(
-        components, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _ensure_state() -> None:
     STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     FINDINGS_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for path in (STATE_ROOT, FINDINGS_ROOT):
+    INBOX_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for path in (STATE_ROOT, FINDINGS_ROOT, INBOX_ROOT):
         mode = stat.S_IMODE(path.stat().st_mode)
         if mode & 0o077:
             raise RuntimeError(f"unsafe state directory permissions: {path}")
@@ -363,21 +338,27 @@ def _ensure_state() -> None:
 
 @mcp.tool(name="adler_status", annotations=READ_ANNOTATIONS)
 def adler_status() -> dict[str, Any]:
-    """Return the observer identity and enforced capability boundary."""
+    """Return observer identity and the enforced minimal authority boundary."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "identity": IDENTITY,
         "service": APP_NAME,
         "healthy": True,
         "mode": "read-mostly",
+        "architecture_contract": ARCHITECTURE_CONTRACT,
+        "finding_contract": FINDING_CONTRACT,
+        "worktree_sidecar_contract": SIDECAR_CONTRACT,
         "repository_root": str(REPO_ROOT),
         "finding_store": str(FINDINGS_ROOT),
-        "supervision_contract": SUPERVISION_CONTRACT,
+        "inbox_store": str(INBOX_ROOT),
+        "work_lane_store": str(GRABOWSKI_WORK_LANES_ROOT),
+        "worktree_delivery_root": str(WORKTREE_ROOT),
         "work_state_authority": False,
-        "allowed_effects": ["append_finding"],
+        "allowed_effects": ["append_finding", "publish_worktree_inbox"],
         "forbidden_effects": [
             "shell",
-            "file_write",
+            "general_file_write",
+            "git_index_mutation",
             "git_commit",
             "git_push",
             "github_mutation",
@@ -389,6 +370,7 @@ def adler_status() -> dict[str, Any]:
             "work_or_lease_acquisition",
             "agent_start",
             "secret_reveal",
+            "admission_policy",
         ],
         "observed_at": _utc_now(),
     }
@@ -637,217 +619,6 @@ def service_runtime(unit: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool(name="supervise_work", annotations=READ_ANNOTATIONS)
-def supervise_work(
-    binding_kind: Literal["grabowski_lane", "agent_run", "bureau_task", "pr", "manual"],
-    binding_id: str,
-    repo: str,
-    claimed_head: str | None = None,
-    expect_clean: bool | None = None,
-    unit: str | None = None,
-    expect_service_active: bool | None = None,
-    github_repo: str | None = None,
-    pr: int | None = None,
-) -> dict[str, Any]:
-    """Verify explicit claim dimensions without claiming ownership of work identity."""
-    if not isinstance(binding_id, str) or not binding_id.strip() or len(binding_id) > 500:
-        raise ValueError("binding_id must be 1..500 characters")
-    if (github_repo is None) != (pr is None):
-        raise ValueError("github_repo and pr must be supplied together")
-    if expect_service_active is not None and unit is None:
-        raise ValueError("unit is required when expect_service_active is supplied")
-    if claimed_head is not None:
-        claimed_head = _validate_commit_oid(claimed_head)
-
-    dimensions: dict[str, dict[str, Any]] = {}
-    contradictions: list[str] = []
-    missing: list[str] = []
-
-    local = git_status(repo)
-    evidence: dict[str, Any] = {"local_git": local}
-    actual_head = (
-        local["head"]["stdout"].strip()
-        if local.get("observation_complete") and local["head"]["returncode"] == 0
-        else None
-    )
-    clean: bool | None = None
-    if local.get("observation_complete"):
-        tracked_clean = _status_is_clean(local["status"]["stdout"])
-        clean = tracked_clean and local.get("untracked_present") is False
-
-    if claimed_head is not None:
-        if actual_head is None:
-            dimensions["local_git_head"] = {"status": "incomplete"}
-            missing.append("local_git_head")
-        elif actual_head == claimed_head:
-            dimensions["local_git_head"] = {"status": "confirmed", "observed": actual_head}
-        else:
-            dimensions["local_git_head"] = {"status": "contradicted", "observed": actual_head}
-            contradictions.append(f"local_head:{actual_head}!=claimed_head:{claimed_head}")
-    else:
-        dimensions["local_git_head"] = {"status": "not_requested", "observed": actual_head}
-
-    if expect_clean is not None:
-        if clean is None:
-            dimensions["cleanliness"] = {"status": "incomplete"}
-            missing.append("cleanliness")
-        elif clean == expect_clean:
-            dimensions["cleanliness"] = {"status": "confirmed", "observed": clean}
-        else:
-            dimensions["cleanliness"] = {"status": "contradicted", "observed": clean}
-            contradictions.append(f"clean:{clean}!=expected:{expect_clean}")
-    else:
-        dimensions["cleanliness"] = {"status": "not_requested", "observed": clean}
-
-    runtime = None
-    if unit is not None:
-        runtime = service_runtime(unit)
-        evidence["runtime"] = runtime
-        missing.extend(f"runtime:{item}" for item in runtime["missing_evidence"])
-        if expect_service_active is not None:
-            active_state = runtime["service"].get("ActiveState")
-            if "systemd_status" in runtime["missing_evidence"] or active_state is None:
-                dimensions["runtime_active"] = {"status": "incomplete"}
-                missing.append("runtime:active_state")
-            else:
-                active = active_state == "active"
-                if active == expect_service_active:
-                    dimensions["runtime_active"] = {"status": "confirmed", "observed": active}
-                else:
-                    dimensions["runtime_active"] = {"status": "contradicted", "observed": active}
-                    contradictions.append(f"service_active:{active}!=expected:{expect_service_active}")
-        else:
-            dimensions["runtime_active"] = {"status": "not_requested"}
-    else:
-        dimensions["runtime_active"] = {"status": "not_requested"}
-
-    remote = None
-    metadata: dict[str, Any] | None = None
-    if github_repo is not None and pr is not None:
-        remote = github_pr(github_repo, pr)
-        evidence["github_pr"] = remote
-        if remote["metadata"]["returncode"] == 0 and not remote["metadata"].get("stdout_truncated", False):
-            try:
-                parsed = json.loads(remote["metadata"]["stdout"])
-                metadata = parsed if isinstance(parsed, dict) else None
-            except json.JSONDecodeError:
-                metadata = None
-        observed_pr_number = metadata.get("number") if metadata is not None else None
-        if metadata is None or observed_pr_number is None:
-            dimensions["github_pr"] = {"status": "incomplete"}
-            missing.append("github_pr_metadata")
-        elif observed_pr_number != pr:
-            dimensions["github_pr"] = {"status": "contradicted", "number": observed_pr_number}
-            contradictions.append(f"pr_number:{observed_pr_number}!=requested:{pr}")
-        else:
-            dimensions["github_pr"] = {"status": "confirmed", "number": observed_pr_number}
-            if claimed_head is not None:
-                pr_head = metadata.get("headRefOid")
-                if not pr_head:
-                    dimensions["github_pr_head"] = {"status": "incomplete"}
-                    missing.append("github_pr_head")
-                elif pr_head == claimed_head:
-                    dimensions["github_pr_head"] = {"status": "confirmed", "observed": pr_head}
-                else:
-                    dimensions["github_pr_head"] = {"status": "contradicted", "observed": pr_head}
-                    contradictions.append(f"pr_head:{pr_head}!=claimed_head:{claimed_head}")
-            else:
-                dimensions["github_pr_head"] = {"status": "not_requested"}
-    else:
-        dimensions["github_pr"] = {"status": "not_requested"}
-        dimensions["github_pr_head"] = {"status": "not_requested"}
-
-    if binding_kind == "manual":
-        binding_status = "not_applicable"
-    elif binding_kind == "pr":
-        expected_binding = f"{github_repo}#{pr}" if github_repo is not None and pr is not None else None
-        if (
-            metadata is None
-            or metadata.get("number") != pr
-            or expected_binding is None
-        ):
-            binding_status = "incomplete"
-            missing.append("binding_identity")
-        elif binding_id.strip() != expected_binding:
-            binding_status = "contradicted"
-            contradictions.append(f"binding:{binding_id.strip()}!=observed:{expected_binding}")
-        else:
-            binding_status = "confirmed"
-    else:
-        binding_status = "unverified"
-        missing.append("binding_identity")
-    dimensions["binding_identity"] = {"status": binding_status}
-
-    requested = [
-        value["status"] for name, value in dimensions.items()
-        if name != "binding_identity" and value["status"] != "not_requested"
-    ]
-    if any(status == "contradicted" for status in requested):
-        evidence_conclusion = "contradicted"
-    elif any(status == "incomplete" for status in requested):
-        evidence_conclusion = "incomplete"
-    elif requested and all(status == "confirmed" for status in requested):
-        evidence_conclusion = "confirmed"
-    else:
-        evidence_conclusion = "unknown"
-
-    if contradictions:
-        conclusion = "contradicted"
-    elif binding_status in {"unverified", "incomplete"} or missing:
-        conclusion = "incomplete"
-    elif evidence_conclusion == "confirmed" and binding_status in {"confirmed", "not_applicable"}:
-        conclusion = "confirmed"
-    else:
-        conclusion = evidence_conclusion
-
-    components: list[dict[str, str]] = []
-    if actual_head:
-        components.append({"name": "local_head", "value": actual_head})
-    if expect_clean is not None and clean is not None:
-        components.append({"name": "local_clean", "value": str(clean).lower()})
-    if runtime is not None and runtime.get("complete") is True:
-        components.append({"name": "runtime_main_pid", "value": str(runtime["main_pid"])})
-        active_state = runtime["service"].get("ActiveState")
-        if active_state:
-            components.append({"name": "runtime_active_state", "value": active_state})
-        if runtime["service"].get("ExecMainStartTimestamp"):
-            components.append({"name": "runtime_start", "value": runtime["service"]["ExecMainStartTimestamp"]})
-        if runtime["service"].get("NRestarts") is not None:
-            components.append({"name": "runtime_restarts", "value": runtime["service"].get("NRestarts", "")})
-        if runtime.get("control_group"):
-            components.append({"name": "runtime_cgroup", "value": runtime["control_group"]})
-    if metadata:
-        if metadata.get("headRefOid"):
-            components.append({"name": "pr_head", "value": metadata["headRefOid"]})
-        if metadata.get("baseRefOid"):
-            components.append({"name": "pr_base", "value": metadata["baseRefOid"]})
-
-    return {
-        "schema_version": 2,
-        "supervision_contract": SUPERVISION_CONTRACT,
-        "work_state_authority": False,
-        "binding": {"kind": binding_kind, "id": binding_id.strip(), "verification": binding_status},
-        "claim": {
-            "claimed_head": claimed_head,
-            "expect_clean": expect_clean,
-            "unit": unit,
-            "expect_service_active": expect_service_active,
-            "github_repo": github_repo,
-            "pr": pr,
-        },
-        "conclusion": conclusion,
-        "evidence_conclusion": evidence_conclusion,
-        "dimensions": dimensions,
-        "contradictions": contradictions,
-        "missing_evidence": sorted(set(missing)),
-        "evidence": evidence,
-        "checkpoint_components": sorted(components, key=lambda item: item["name"]),
-        "persisted": False,
-        "automatic_effect": False,
-        "observed_at": _utc_now(),
-    }
-
-
 @mcp.tool(name="service_logs", annotations=READ_ANNOTATIONS)
 def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     """Read bounded recent journal lines for any syntactically valid user service."""
@@ -860,72 +631,880 @@ def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     return {"unit": safe_unit, "logs": result, "observed_at": _utc_now()}
 
 
+def _validate_lane_id(lane_id: str) -> str:
+    if not isinstance(lane_id, str) or _LANE_ID_RE.fullmatch(lane_id) is None:
+        raise ValueError("lane_id must be a 32-character lowercase hex id")
+    return lane_id
+
+
+def _sha256_json(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_json_file_no_symlink(path: Path) -> dict[str, Any]:
+    before = path.lstat()
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) & 0o022
+    ):
+        raise RuntimeError(f"unsafe JSON source: {path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError(f"JSON source changed during open: {path}")
+        chunks: list[bytes] = []
+        remaining = MAX_JSON_SOURCE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    raw = b"".join(chunks)
+    if len(raw) > MAX_JSON_SOURCE_BYTES:
+        raise RuntimeError(f"JSON source exceeds bounded size: {path}")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid JSON source: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"JSON source is not an object: {path}")
+    return payload
+
+
+def _parse_worktree_porcelain(text: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            if current:
+                items.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    if current:
+        items.append(current)
+    return items
+
+
+def _read_work_target(lane_id: str) -> dict[str, Any]:
+    safe_lane_id = _validate_lane_id(lane_id)
+    lane_path = GRABOWSKI_WORK_LANES_ROOT / f"{safe_lane_id}.json"
+    payload = _read_json_file_no_symlink(lane_path)
+    if payload.get("kind") != "grabowski.work_lane" or payload.get("schema_version") != 1:
+        raise RuntimeError("lane receipt contract is invalid")
+    supplied_receipt = payload.get("receipt_sha256")
+    receipt_material = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    if not isinstance(supplied_receipt, str) or supplied_receipt != _sha256_json(receipt_material):
+        raise RuntimeError("lane receipt digest is invalid")
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, dict):
+        raise RuntimeError("lane has no authoritative inputs")
+    if payload.get("inputs_sha256") != _sha256_json(inputs):
+        raise RuntimeError("lane input digest is invalid")
+    if payload.get("lane_id") != safe_lane_id or inputs.get("lane_id") != safe_lane_id:
+        raise RuntimeError("lane identity mismatch")
+    if inputs.get("lease_owner_id") != f"lane:{safe_lane_id}":
+        raise RuntimeError("lane lease-owner identity is invalid")
+    if payload.get("state") != "ready" or payload.get("terminal_closeout") is not None:
+        raise RuntimeError("lane is not active")
+
+    repo_raw = inputs.get("repo")
+    target_raw = inputs.get("target_path")
+    branch = inputs.get("branch")
+    if not all(isinstance(value, str) and value for value in (repo_raw, target_raw, branch)):
+        raise RuntimeError("lane work target is incomplete")
+    repo = Path(repo_raw).resolve(strict=True)
+    target_input = Path(target_raw)
+    if target_input.is_symlink():
+        raise RuntimeError("worktree path may not be a symlink")
+    target = target_input.resolve(strict=True)
+    try:
+        repo.relative_to(REPO_ROOT)
+        target.relative_to(REPO_ROOT)
+    except ValueError as exc:
+        raise PermissionError("lane work target is outside repository root") from exc
+    if not (repo / ".git").exists() or not (target / ".git").exists():
+        raise RuntimeError("lane repository or worktree is not a Git checkout")
+
+    inventory = _run(["/usr/bin/git", "-C", str(repo), "worktree", "list", "--porcelain"])
+    if inventory["returncode"] != 0 or inventory["stdout_truncated"]:
+        raise RuntimeError("Git worktree inventory is incomplete")
+    matches = [
+        item for item in _parse_worktree_porcelain(inventory["stdout"])
+        if item.get("worktree") == str(target)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("lane target is not one registered Git worktree")
+    entry = matches[0]
+    expected_ref = f"refs/heads/{branch}"
+    if entry.get("branch") != expected_ref or not entry.get("HEAD"):
+        raise RuntimeError("registered worktree branch does not match lane")
+
+    head = _run(["/usr/bin/git", "-C", str(target), "rev-parse", "HEAD"])
+    current_branch = _run(["/usr/bin/git", "-C", str(target), "branch", "--show-current"])
+    top = _run(["/usr/bin/git", "-C", str(target), "rev-parse", "--show-toplevel"])
+    reads = (head, current_branch, top)
+    if any(item["returncode"] != 0 or item["stdout_truncated"] for item in reads):
+        raise RuntimeError("worktree identity read is incomplete")
+    checkpoint = head["stdout"].strip()
+    if checkpoint != entry["HEAD"] or current_branch["stdout"].strip() != branch:
+        raise RuntimeError("worktree identity drifted from registered lane")
+    if Path(top["stdout"].strip()).resolve() != target:
+        raise RuntimeError("worktree top-level does not match lane target")
+
+    return {
+        "lane_id": safe_lane_id,
+        "repository": str(repo),
+        "worktree": str(target),
+        "branch": branch,
+        "purpose": inputs.get("purpose"),
+        "base_head": inputs.get("base_head"),
+        "checkpoint": checkpoint,
+        "source": str(lane_path),
+        "observed_at": _utc_now(),
+    }
+
+
+@mcp.tool(name="get_work_target", annotations=READ_ANNOTATIONS)
+def get_work_target(lane_id: str) -> dict[str, Any]:
+    """Read one exact Grabowski lane target without building independent work state."""
+    return _read_work_target(lane_id)
+
+
+def _finding_record_view(payload: dict[str, Any], path: Path) -> dict[str, Any]:
+    if payload.get("finding_contract") == FINDING_CONTRACT:
+        fields = (
+            "finding_id", "finding_sha256", "kind", "severity", "confidence",
+            "subject", "checkpoint", "binding_strength", "summary", "evidence_refs",
+            "recommendation", "affected_effects", "recheck_of", "conclusion", "observed_at",
+        )
+        view = {key: payload.get(key) for key in fields if key in payload}
+        view["legacy"] = False
+        return view
+
+    legacy_status = payload["status"]
+    return {
+        "finding_id": payload["finding_id"],
+        "finding_sha256": _sha256_json(payload),
+        "kind": legacy_status,
+        "status": legacy_status,
+        "subject_kind": payload["subject_kind"],
+        "severity": payload["severity"],
+        "confidence": payload.get("confidence"),
+        "subject": payload["subject"],
+        "checkpoint": payload.get("checkpoint"),
+        "checkpoint_mode": payload.get("checkpoint_mode", "single"),
+        "checkpoint_components": payload.get("checkpoint_components"),
+        "checkpoint_set_sha256": payload.get("checkpoint_set_sha256"),
+        "checkpoint_contract": payload.get("checkpoint_contract"),
+        "binding_strength": "legacy-unbound",
+        "summary": payload["summary"],
+        "evidence_refs": payload["evidence_refs"],
+        "target_actor": payload.get("target_actor"),
+        "binding": payload.get("binding"),
+        "recommendation": payload.get("recommendation"),
+        "rationale": payload.get("rationale"),
+        "observed_at": payload["observed_at"],
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "legacy": True,
+    }
+
+
+def _validate_legacy_finding_payload(payload: dict[str, Any], path: Path) -> None:
+    if any(key in payload for key in _V1_ONLY_MARKERS):
+        raise RuntimeError("finding contract is invalid or ambiguous")
+
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+        raise RuntimeError("legacy finding schema version is invalid")
+    if payload.get("adler_identity") != IDENTITY:
+        raise RuntimeError("legacy finding Adler identity is invalid")
+    if payload.get("effect_contract") != "advisory_only_no_automatic_action":
+        raise RuntimeError("legacy finding effect contract is invalid")
+
+    finding_id = payload.get("finding_id")
+    if (
+        not isinstance(finding_id, str)
+        or _FINDING_ID_RE.fullmatch(finding_id) is None
+        or path.name != f"{finding_id}.json"
+    ):
+        raise RuntimeError("legacy finding file identity mismatch")
+    if payload.get("subject_kind") not in _LEGACY_SUBJECT_KINDS:
+        raise RuntimeError("legacy finding subject kind is invalid")
+
+    subject = payload.get("subject")
+    if not isinstance(subject, str) or not subject.strip() or len(subject) > 500:
+        raise RuntimeError("legacy finding subject is invalid")
+    checkpoint = payload.get("checkpoint")
+    if checkpoint is not None and (not isinstance(checkpoint, str) or len(checkpoint) > 500):
+        raise RuntimeError("legacy finding checkpoint is invalid")
+    if payload.get("severity") not in {"low", "medium", "high", "critical"}:
+        raise RuntimeError("legacy finding severity is invalid")
+    if payload.get("status") not in _LEGACY_STATUSES:
+        raise RuntimeError("legacy finding status is invalid")
+
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
+        raise RuntimeError("legacy finding summary is invalid")
+    evidence_refs = payload.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
+        raise RuntimeError("legacy finding evidence refs are invalid")
+    if any(
+        not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_EVIDENCE_REF_CHARS
+        for ref in evidence_refs
+    ):
+        raise RuntimeError("legacy finding evidence refs are invalid")
+    observed_at = payload.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at.strip() or len(observed_at) > 100:
+        raise RuntimeError("legacy finding observed_at is invalid")
+
+    relational_present = [field in payload for field in _LEGACY_RELATIONAL_FIELDS]
+    relational = any(relational_present)
+    if relational and not all(relational_present):
+        raise RuntimeError("legacy relational checkpoint fields are incomplete")
+    if relational:
+        if payload.get("checkpoint_mode") != "relational":
+            raise RuntimeError("legacy checkpoint mode is invalid")
+        components = payload.get("checkpoint_components")
+        if not isinstance(components, list) or not 2 <= len(components) <= 16:
+            raise RuntimeError("legacy checkpoint components are invalid")
+        names: set[str] = set()
+        for component in components:
+            if not isinstance(component, dict) or set(component) != {"name", "value"}:
+                raise RuntimeError("legacy checkpoint component is invalid")
+            name = component["name"]
+            value = component["value"]
+            if not isinstance(name, str) or not name.strip() or len(name) > 100:
+                raise RuntimeError("legacy checkpoint component name is invalid")
+            if not isinstance(value, str) or not value.strip() or len(value) > 500:
+                raise RuntimeError("legacy checkpoint component value is invalid")
+            if name in names:
+                raise RuntimeError("legacy checkpoint component names are not unique")
+            names.add(name)
+        if components != sorted(components, key=lambda item: item["name"]):
+            raise RuntimeError("legacy checkpoint components are not canonical")
+        supplied_checkpoint_digest = payload.get("checkpoint_set_sha256")
+        if (
+            not isinstance(supplied_checkpoint_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", supplied_checkpoint_digest) is None
+            or supplied_checkpoint_digest != _sha256_json(components)
+        ):
+            raise RuntimeError("legacy checkpoint set digest is invalid")
+        if payload.get("checkpoint_contract") != "all_components_must_match_or_recheck":
+            raise RuntimeError("legacy checkpoint contract is invalid")
+
+    enriched_present = [field in payload for field in _LEGACY_ENRICHED_FIELDS]
+    if schema_version == 3:
+        if not all(enriched_present):
+            raise RuntimeError("legacy enriched fields are incomplete")
+        for field in ("target_actor", "binding", "recommendation", "rationale"):
+            value = payload.get(field)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip() or len(value) > MAX_SUMMARY_CHARS
+            ):
+                raise RuntimeError(f"legacy finding {field} is invalid")
+        confidence = payload.get("confidence")
+        if confidence is not None and (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not math.isfinite(float(confidence))
+            or not 0 <= float(confidence) <= 1
+        ):
+            raise RuntimeError("legacy finding confidence is invalid")
+        enriched = (
+            payload["status"] not in _LEGACY_BASE_STATUSES
+            or any(payload.get(field) is not None for field in ("target_actor", "binding", "recommendation", "rationale"))
+            or confidence is not None
+        )
+        if not enriched:
+            raise RuntimeError("legacy schema 3 finding is not enriched")
+    else:
+        if any(enriched_present):
+            raise RuntimeError("legacy enriched fields are invalid for schema 1/2")
+        if payload["status"] not in _LEGACY_BASE_STATUSES:
+            raise RuntimeError("legacy status requires schema 3")
+
+    if schema_version == 1 and relational:
+        raise RuntimeError("legacy schema 1 cannot be relational")
+    if schema_version == 2 and not relational:
+        raise RuntimeError("legacy schema 2 must be relational")
+
+
+def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
+    if payload.get("finding_contract") != FINDING_CONTRACT:
+        _validate_legacy_finding_payload(payload, path)
+        return
+
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
+        raise RuntimeError("V1 finding schema version is invalid")
+    if payload.get("adler_identity") != IDENTITY:
+        raise RuntimeError("V1 finding Adler identity is invalid")
+    if payload.get("effect_contract") != "advisory_only_no_automatic_action":
+        raise RuntimeError("V1 finding effect contract is invalid")
+
+    finding_id = payload.get("finding_id")
+    if (
+        not isinstance(finding_id, str)
+        or _FINDING_ID_RE.fullmatch(finding_id) is None
+        or path.name != f"{finding_id}.json"
+    ):
+        raise RuntimeError("V1 finding file identity mismatch")
+
+    if payload.get("kind") not in {"observation", "risk", "contradiction", "missing_evidence", "advice"}:
+        raise RuntimeError("V1 finding kind is invalid")
+    if payload.get("severity") not in {"low", "medium", "high", "critical"}:
+        raise RuntimeError("V1 finding severity is invalid")
+    if payload.get("binding_strength") not in {"exact", "strong", "heuristic", "unbound"}:
+        raise RuntimeError("V1 finding binding strength is invalid")
+
+    confidence = payload.get("confidence")
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not math.isfinite(float(confidence))
+        or not 0 <= float(confidence) <= 1
+    ):
+        raise RuntimeError("V1 finding confidence is invalid")
+
+    for field in ("subject", "checkpoint"):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > 500:
+            raise RuntimeError(f"V1 finding {field} is invalid")
+        clean = value.strip()
+        if clean != value or _redact(clean) != clean or "<REDACTED>" in clean:
+            raise RuntimeError(f"V1 finding {field} is invalid")
+
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
+        raise RuntimeError("V1 finding summary is invalid")
+
+    evidence_refs = payload.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
+        raise RuntimeError("V1 finding evidence refs are invalid")
+    if any(
+        not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_EVIDENCE_REF_CHARS
+        for ref in evidence_refs
+    ):
+        raise RuntimeError("V1 finding evidence refs are invalid")
+
+    recommendation = payload.get("recommendation")
+    if recommendation is not None and (
+        not isinstance(recommendation, str)
+        or not recommendation.strip()
+        or len(recommendation) > MAX_SUMMARY_CHARS
+    ):
+        raise RuntimeError("V1 finding recommendation is invalid")
+
+    affected_effects = payload.get("affected_effects")
+    if affected_effects is not None:
+        if not isinstance(affected_effects, list) or len(affected_effects) > MAX_AFFECTED_EFFECTS:
+            raise RuntimeError("V1 finding affected effects are invalid")
+        for effect in affected_effects:
+            if not isinstance(effect, str) or not effect.strip() or len(effect) > MAX_AFFECTED_EFFECT_CHARS:
+                raise RuntimeError("V1 finding affected effects are invalid")
+            clean = effect.strip()
+            if clean != effect or _redact(clean) != clean or "<REDACTED>" in clean:
+                raise RuntimeError("V1 finding affected effects are invalid")
+
+    observed_at = payload.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at.strip() or len(observed_at) > 100:
+        raise RuntimeError("V1 finding observed_at is invalid")
+
+    recheck_of = payload.get("recheck_of")
+    conclusion = payload.get("conclusion")
+    if (recheck_of is None) != (conclusion is None):
+        raise RuntimeError("V1 finding recheck fields are incomplete")
+    if recheck_of is not None:
+        if not isinstance(recheck_of, str) or _FINDING_ID_RE.fullmatch(recheck_of) is None:
+            raise RuntimeError("V1 finding recheck target is invalid")
+        if conclusion not in {"still_current", "no_longer_reproduced"}:
+            raise RuntimeError("V1 finding recheck conclusion is invalid")
+
+    supplied = payload.get("finding_sha256")
+    if not isinstance(supplied, str) or not re.fullmatch(r"[0-9a-f]{64}", supplied):
+        raise RuntimeError("V1 finding digest is missing or invalid")
+    core = dict(payload)
+    core.pop("finding_sha256", None)
+    if supplied != _sha256_json(core):
+        raise RuntimeError("V1 finding digest mismatch")
+
+
+def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[str]]:
+    _ensure_state()
+    records: list[tuple[Path, dict[str, Any]]] = []
+    errors: list[str] = []
+    for path in sorted(FINDINGS_ROOT.glob("*.json")):
+        try:
+            payload = _read_json_file_no_symlink(path)
+            _validate_v1_finding_payload(payload, path)
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+            continue
+        records.append((path, payload))
+
+    v1_by_id = {
+        str(payload["finding_id"]): payload
+        for _, payload in records
+        if payload.get("finding_contract") == FINDING_CONTRACT
+    }
+    for _, payload in records:
+        if payload.get("finding_contract") != FINDING_CONTRACT:
+            continue
+        parent_id = payload.get("recheck_of")
+        if parent_id is None:
+            continue
+        parent = v1_by_id.get(str(parent_id))
+        if (
+            parent is None
+            or parent.get("recheck_of") is not None
+            or parent.get("subject") != payload.get("subject")
+        ):
+            errors.append("RuntimeError")
+    return records, errors
+
+
+def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]]:
+    subject = f"lane:{lane_id}"
+    loaded, errors = _load_finding_payloads()
+    if errors:
+        raise RuntimeError("finding store observation is incomplete")
+    records = [
+        payload for _, payload in loaded
+        if payload.get("finding_contract") == FINDING_CONTRACT and payload.get("subject") == subject
+    ]
+    records.sort(key=lambda item: (str(item.get("observed_at", "")), str(item.get("finding_id", ""))))
+    roots = {str(item["finding_id"]): item for item in records if not item.get("recheck_of")}
+    rechecks: dict[str, list[dict[str, Any]]] = {}
+    for item in records:
+        parent = item.get("recheck_of")
+        if isinstance(parent, str):
+            rechecks.setdefault(parent, []).append(item)
+
+    current: list[dict[str, Any]] = []
+    for finding_id, root in roots.items():
+        matching_rechecks = [
+            item for item in rechecks.get(finding_id, []) if item.get("checkpoint") == checkpoint
+        ]
+        latest_recheck = matching_rechecks[-1] if matching_rechecks else None
+        if latest_recheck is not None:
+            if latest_recheck.get("conclusion") == "no_longer_reproduced":
+                continue
+            if latest_recheck.get("conclusion") != "still_current":
+                continue
+        elif root.get("checkpoint") != checkpoint:
+            continue
+        item = _finding_record_view(root, FINDINGS_ROOT / f"{finding_id}.json")
+        if latest_recheck is not None:
+            item["current_recheck"] = {
+                key: latest_recheck.get(key)
+                for key in ("finding_id", "finding_sha256", "checkpoint", "conclusion", "summary", "evidence_refs", "observed_at")
+            }
+        current.append(item)
+    current.sort(key=lambda item: (str(item.get("severity", "")), str(item.get("finding_id", ""))))
+    return current
+
+
+def _worktree_inbox_path(lane_id: str) -> Path:
+    return INBOX_ROOT / f"{lane_id}.json"
+
+
+def _validate_worktree_inbox_pointer(worktree: Path, lane_id: str) -> Path:
+    try:
+        worktree.relative_to(WORKTREE_ROOT)
+    except ValueError as exc:
+        raise PermissionError("lane worktree is outside Adler's delivery worktree root") from exc
+
+    expected = _worktree_inbox_path(lane_id)
+    worktree_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        worktree_flags |= os.O_NOFOLLOW
+    root_fd = os.open(worktree, worktree_flags)
+    try:
+        try:
+            sidecar_st = os.stat(".adler", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError("Grabowski-owned .adler sidecar directory is missing") from exc
+        if not stat.S_ISDIR(sidecar_st.st_mode) or sidecar_st.st_uid != os.getuid():
+            raise RuntimeError("unsafe .adler sidecar directory")
+        if stat.S_IMODE(sidecar_st.st_mode) & 0o077:
+            raise RuntimeError("unsafe .adler directory permissions")
+        sidecar_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            sidecar_flags |= os.O_NOFOLLOW
+        dir_fd = os.open(".adler", sidecar_flags, dir_fd=root_fd)
+        try:
+            unexpected = set(os.listdir(dir_fd)) - {"inbox.json", ".gitignore"}
+            if unexpected:
+                raise RuntimeError(".adler contains files outside the inbox pointer contract")
+            try:
+                inbox_st = os.stat("inbox.json", dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise RuntimeError("Grabowski-owned .adler/inbox.json pointer is missing") from exc
+            if (
+                not stat.S_ISLNK(inbox_st.st_mode)
+                or inbox_st.st_uid != os.getuid()
+                or inbox_st.st_nlink != 1
+            ):
+                raise RuntimeError("unsafe .adler/inbox.json pointer")
+            target = os.readlink("inbox.json", dir_fd=dir_fd)
+            if target != str(expected):
+                raise RuntimeError(".adler/inbox.json pointer targets the wrong Adler inbox")
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+    return expected
+
+
+def _open_secure_state_inbox(dir_fd: int, name: str) -> tuple[int, bytes] | None:
+    try:
+        before = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1:
+        raise RuntimeError("unsafe existing external inbox file")
+    if stat.S_IMODE(before.st_mode) & 0o077:
+        raise RuntimeError("unsafe external inbox file permissions")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(name, flags, dir_fd=dir_fd)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError("external inbox changed during open")
+        raw = os.read(fd, MAX_OUTPUT_BYTES + 1)
+        if len(raw) > MAX_OUTPUT_BYTES:
+            raise RuntimeError("external inbox is unexpectedly large")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("existing external inbox is not Adler-owned JSON") from exc
+        if payload.get("writer_identity") != IDENTITY or payload.get("contract") != SIDECAR_CONTRACT:
+            raise RuntimeError("existing external inbox is not Adler-owned")
+        return fd, raw
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _revalidate_open_state_inbox(fd: int, expected_raw: bytes) -> os.stat_result:
+    opened = os.fstat(fd)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) & 0o077
+    ):
+        raise RuntimeError("external inbox changed before atomic publication")
+    os.lseek(fd, 0, os.SEEK_SET)
+    raw = os.read(fd, MAX_OUTPUT_BYTES + 1)
+    if len(raw) > MAX_OUTPUT_BYTES or raw != expected_raw:
+        raise RuntimeError("external inbox changed before atomic publication")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("external inbox changed before atomic publication") from exc
+    if payload.get("writer_identity") != IDENTITY or payload.get("contract") != SIDECAR_CONTRACT:
+        raise RuntimeError("external inbox changed before atomic publication")
+    return opened
+
+
+def _renameat2(dir_fd: int, left: str, right: str, flags: int) -> None:
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic renameat2 is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        dir_fd,
+        os.fsencode(left),
+        dir_fd,
+        os.fsencode(right),
+        flags,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), right)
+
+
+def _rename_exchange(dir_fd: int, left: str, right: str) -> None:
+    _renameat2(dir_fd, left, right, 2)  # RENAME_EXCHANGE
+
+
+def _rename_noreplace(dir_fd: int, left: str, right: str) -> None:
+    _renameat2(dir_fd, left, right, 1)  # RENAME_NOREPLACE
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write made no progress")
+        view = view[written:]
+
+
+def _atomic_write_inbox(dir_fd: int, name: str, encoded: bytes) -> None:
+    existing = _open_secure_state_inbox(dir_fd, name)
+    existing_fd: int | None = None
+    existing_raw: bytes | None = None
+    if existing is not None:
+        existing_fd, existing_raw = existing
+
+    tmp_name = f".{name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+    our_temp_at_tmp = True
+    try:
+        _write_all(fd, encoded)
+        os.fsync(fd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+            raise RuntimeError("unsafe external inbox temporary file")
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+            our_temp_at_tmp = False
+        finally:
+            os.close(fd)
+            if existing_fd is not None:
+                os.close(existing_fd)
+        raise
+    else:
+        os.close(fd)
+
+    try:
+        if existing_fd is None:
+            _rename_noreplace(dir_fd, tmp_name, name)
+            our_temp_at_tmp = False
+            os.fsync(dir_fd)
+            return
+
+        assert existing_raw is not None
+        _rename_exchange(dir_fd, tmp_name, name)
+        our_temp_at_tmp = False
+        try:
+            displaced = os.stat(tmp_name, dir_fd=dir_fd, follow_symlinks=False)
+            validated = _revalidate_open_state_inbox(existing_fd, existing_raw)
+            if (displaced.st_dev, displaced.st_ino) != (validated.st_dev, validated.st_ino):
+                raise RuntimeError("external inbox changed before atomic publication")
+        except BaseException:
+            try:
+                _rename_exchange(dir_fd, tmp_name, name)
+                our_temp_at_tmp = True
+            except BaseException as rollback_exc:
+                raise RuntimeError("external inbox changed and atomic rollback failed") from rollback_exc
+            raise
+
+        os.fsync(dir_fd)
+        os.unlink(tmp_name, dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    finally:
+        if our_temp_at_tmp:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        if existing_fd is not None:
+            os.close(existing_fd)
+
+
+def _publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
+    initial_target = _read_work_target(lane_id)
+    worktree = Path(initial_target["worktree"])
+    inbox_path = _validate_worktree_inbox_pointer(worktree, lane_id)
+    _ensure_state()
+    inbox_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        inbox_flags |= os.O_NOFOLLOW
+    inbox_dir_fd = os.open(INBOX_ROOT, inbox_flags)
+    locked = False
+    try:
+        fcntl.flock(inbox_dir_fd, fcntl.LOCK_EX)
+        locked = True
+        target = _read_work_target(lane_id)
+        if Path(target["worktree"]) != worktree:
+            raise RuntimeError("lane worktree changed during inbox publication")
+        if _validate_worktree_inbox_pointer(worktree, lane_id) != inbox_path:
+            raise RuntimeError("worktree inbox pointer changed during publication")
+        findings = _current_lane_findings(lane_id, target["checkpoint"])
+        payload = {
+            "schema_version": 1,
+            "contract": SIDECAR_CONTRACT,
+            "writer_identity": IDENTITY,
+            "delivery_mode": "grabowski_owned_symlink_to_adler_state",
+            "lane_id": lane_id,
+            "repository": target["repository"],
+            "worktree": target["worktree"],
+            "branch": target["branch"],
+            "checkpoint": target["checkpoint"],
+            "source_complete": True,
+            "source_store": str(FINDINGS_ROOT),
+            "inbox_store": str(inbox_path),
+            "findings": findings,
+            "generated_at": _utc_now(),
+            "effect_contract": "advisory_only_no_automatic_action",
+            "does_not_establish": [
+                "absence_of_findings_after_generated_at",
+                "work_state_authority",
+                "decision_authority",
+                "effect_permission",
+            ],
+        }
+        encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        if len(encoded) > MAX_OUTPUT_BYTES:
+            raise RuntimeError("worktree inbox exceeds bounded size")
+        _atomic_write_inbox(inbox_dir_fd, inbox_path.name, encoded)
+        _validate_worktree_inbox_pointer(worktree, lane_id)
+    finally:
+        if locked:
+            fcntl.flock(inbox_dir_fd, fcntl.LOCK_UN)
+        os.close(inbox_dir_fd)
+    return {
+        "state": "published",
+        "lane_id": lane_id,
+        "checkpoint": target["checkpoint"],
+        "finding_count": len(findings),
+        "sidecar": str(worktree / ".adler" / "inbox.json"),
+        "inbox_store": str(inbox_path),
+        "source_complete": True,
+        "observed_at": _utc_now(),
+    }
+
+
+@mcp.tool(name="publish_worktree_inbox", annotations=SIDECAR_ANNOTATIONS)
+def publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
+    """Rebuild one current advisory inbox for an exact active Grabowski lane."""
+    return _publish_worktree_inbox(_validate_lane_id(lane_id))
+
+
 @mcp.tool(name="list_findings", annotations=READ_ANNOTATIONS)
 def list_findings(limit: int = 20) -> dict[str, Any]:
-    """List recent immutable advisory findings from the Adler finding store."""
-    _ensure_state()
+    """List recent immutable findings while keeping legacy records readable."""
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
-    items: list[dict[str, Any]] = []
-    for path in sorted(FINDINGS_ROOT.glob("*.json"), reverse=True)[:limit]:
-        if path.is_symlink() or not path.is_file():
-            continue
+    records, errors = _load_finding_payloads()
+    selected = records[-limit:]
+    items = [_finding_record_view(payload, path) for path, payload in reversed(selected)]
+    return {
+        "count": len(items),
+        "findings": items,
+        "source_complete": not errors,
+        "source_error_count": len(errors),
+        "observed_at": _utc_now(),
+    }
+
+
+def _clean_required_identity_text(value: str, field: str, *, max_chars: int = 500) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > max_chars:
+        raise ValueError(f"{field} must be 1..{max_chars} characters")
+    clean = value.strip()
+    if _redact(clean) != clean or "<REDACTED>" in clean:
+        raise ValueError(f"{field} requiring redaction cannot be persisted")
+    return clean
+
+
+def _clean_optional_text(value: str | None, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > MAX_SUMMARY_CHARS:
+        raise ValueError(f"{field} must be 1..{MAX_SUMMARY_CHARS} characters when supplied")
+    return _redact(value.strip())
+
+
+def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
+    finding_sha256 = _sha256_json(payload)
+    payload = dict(payload)
+    payload["finding_sha256"] = finding_sha256
+    target_name = f"{payload['finding_id']}.json"
+    _validate_v1_finding_payload(payload, FINDINGS_ROOT / target_name)
+    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    tmp_name = f".finding-{payload['finding_id']}-{uuid.uuid4().hex}.tmp"
+    dir_fd = os.open(FINDINGS_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    locked = False
+    tmp_created = False
+    try:
+        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        locked = True
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        items.append({
-            "finding_id": payload.get("finding_id"),
-            "subject_kind": payload.get("subject_kind"),
-            "subject": payload.get("subject"),
-            "checkpoint": payload.get("checkpoint"),
-            "checkpoint_mode": payload.get("checkpoint_mode", "single"),
-            "checkpoint_components": payload.get("checkpoint_components"),
-            "checkpoint_set_sha256": payload.get("checkpoint_set_sha256"),
-            "checkpoint_contract": payload.get("checkpoint_contract"),
-            "severity": payload.get("severity"),
-            "status": payload.get("status"),
-            "summary": payload.get("summary"),
-            "target_actor": payload.get("target_actor"),
-            "binding": payload.get("binding"),
-            "recommendation": payload.get("recommendation"),
-            "rationale": payload.get("rationale"),
-            "confidence": payload.get("confidence"),
-            "observed_at": payload.get("observed_at"),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        })
-    return {"count": len(items), "findings": items, "observed_at": _utc_now()}
+            os.stat(target_name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"finding already exists: {target_name}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+        tmp_created = True
+        try:
+            _write_all(fd, encoded)
+            os.fsync(fd)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+                raise RuntimeError("unsafe finding temporary file")
+        finally:
+            os.close(fd)
+        _rename_noreplace(dir_fd, tmp_name, target_name)
+        tmp_created = False
+        os.fsync(dir_fd)
+    finally:
+        if tmp_created:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        if locked:
+            fcntl.flock(dir_fd, fcntl.LOCK_UN)
+        os.close(dir_fd)
+    return finding_sha256, hashlib.sha256(encoded).hexdigest()
 
 
 @mcp.tool(name="submit_finding", annotations=FINDING_ANNOTATIONS)
 def submit_finding(
-    subject_kind: Literal["repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane", "agent_run", "service", "work"],
-    subject: str, severity: Literal["low", "medium", "high", "critical"], summary: str, evidence_refs: list[str], checkpoint: str | None = None, checkpoint_mode: Literal["single", "relational"] = "single", checkpoint_components: list[dict[str, str]] | None = None,
-    status: Literal["observation", "finding", "recheck_suggested", "contradiction", "missing_evidence", "risk", "advice", "recheck_required"] = "finding",
-    target_actor: str | None = None, binding: str | None = None, recommendation: str | None = None, rationale: str | None = None, confidence: float | None = None,
+    kind: Literal["observation", "risk", "contradiction", "missing_evidence", "advice"],
+    severity: Literal["low", "medium", "high", "critical"],
+    confidence: float,
+    subject: str,
+    checkpoint: str,
+    binding_strength: Literal["exact", "strong", "heuristic", "unbound"],
+    summary: str,
+    evidence_refs: list[str],
+    recommendation: str | None = None,
+    affected_effects: list[str] | None = None,
+    recheck_of: str | None = None,
+    conclusion: Literal["still_current", "no_longer_reproduced"] | None = None,
 ) -> dict[str, Any]:
-    """Append one evidence-bound advisory record; never create work or trigger action."""
+    """Append one immutable observation and best-effort project exact lane findings beside the work."""
     _ensure_state()
-    if not isinstance(subject, str) or not subject.strip() or len(subject) > 500:
-        raise ValueError("subject must be 1..500 characters")
+    subject_clean = _clean_required_identity_text(subject, "subject")
+    checkpoint_clean = _clean_required_identity_text(checkpoint, "checkpoint")
     if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
         raise ValueError(f"summary must be 1..{MAX_SUMMARY_CHARS} characters")
-    if checkpoint is not None and (not isinstance(checkpoint, str) or len(checkpoint) > 500):
-        raise ValueError("checkpoint must be at most 500 characters")
-    if checkpoint_mode not in {"single", "relational"}:
-        raise ValueError("checkpoint_mode must be single or relational")
-    normalized_checkpoints = _normalize_checkpoint_components(checkpoint_components)
-    if checkpoint_mode == "relational":
-        if normalized_checkpoints is None or len(normalized_checkpoints) < 2:
-            raise ValueError(
-                "relational findings require at least two checkpoint_components covering every relevant state"
-            )
-    elif normalized_checkpoints is not None:
-        raise ValueError("checkpoint_components require checkpoint_mode='relational'")
-    optional_text = {"target_actor": target_actor, "binding": binding, "recommendation": recommendation, "rationale": rationale}
-    for field, value in optional_text.items():
-        if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > MAX_SUMMARY_CHARS): raise ValueError(f"{field} must be 1..{MAX_SUMMARY_CHARS} characters when supplied")
-    if confidence is not None and (not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or (isinstance(confidence, float) and not math.isfinite(confidence)) or confidence < 0 or confidence > 1): raise ValueError("confidence must be a finite number between 0 and 1")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1:
+        raise ValueError("confidence must be a finite number between 0 and 1")
     if not isinstance(evidence_refs, list) or not 1 <= len(evidence_refs) <= MAX_EVIDENCE_REFS:
         raise ValueError(f"evidence_refs must contain 1..{MAX_EVIDENCE_REFS} entries")
     cleaned_refs: list[str] = []
@@ -933,79 +1512,82 @@ def submit_finding(
         if not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_EVIDENCE_REF_CHARS:
             raise ValueError("invalid evidence reference")
         cleaned_refs.append(_redact(ref.strip()))
-    subject_clean = _redact(subject.strip())
-    summary_clean = _redact(summary.strip())
-    optional_clean = {
-        field: _redact(value.strip()) if value is not None else None
-        for field, value in optional_text.items()
-    }
+    recommendation_clean = _clean_optional_text(recommendation, "recommendation")
+
+    effects: list[str] = []
+    if affected_effects is not None:
+        if not isinstance(affected_effects, list) or len(affected_effects) > MAX_AFFECTED_EFFECTS:
+            raise ValueError(f"affected_effects must contain at most {MAX_AFFECTED_EFFECTS} entries")
+        for effect in affected_effects:
+            effects.append(_clean_required_identity_text(effect, "affected_effect", max_chars=MAX_AFFECTED_EFFECT_CHARS))
+    if (recheck_of is None) != (conclusion is None):
+        raise ValueError("recheck_of and conclusion must be supplied together")
+    if recheck_of is not None:
+        if not isinstance(recheck_of, str) or _FINDING_ID_RE.fullmatch(recheck_of) is None:
+            raise ValueError("invalid recheck_of finding id")
+        parent_path = FINDINGS_ROOT / f"{recheck_of}.json"
+        if not parent_path.exists():
+            raise ValueError("recheck_of finding does not exist")
+        parent = _read_json_file_no_symlink(parent_path)
+        try:
+            _validate_v1_finding_payload(parent, parent_path)
+        except (RuntimeError, ValueError) as exc:
+            raise ValueError("recheck_of must reference a valid V1 finding") from exc
+        if parent.get("finding_contract") != FINDING_CONTRACT:
+            raise ValueError("recheck_of must reference a V1 finding")
+        if parent.get("recheck_of") is not None:
+            raise ValueError("recheck_of must reference a root finding")
+        if parent.get("subject") != subject_clean:
+            raise ValueError("recheck subject must match original finding")
 
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
-    enriched = (
-        status not in {"observation", "finding", "recheck_suggested"}
-        or any(value is not None for value in optional_text.values())
-        or confidence is not None
-    )
-    payload = {
-        "schema_version": 3 if enriched else (2 if checkpoint_mode == "relational" else 1),
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "finding_contract": FINDING_CONTRACT,
         "finding_id": finding_id,
         "adler_identity": IDENTITY,
-        "subject_kind": subject_kind,
-        "subject": subject_clean,
-        "checkpoint": _redact(checkpoint) if checkpoint is not None else None,
+        "kind": kind,
         "severity": severity,
-        "status": status,
-        "summary": summary_clean,
+        "confidence": float(confidence),
+        "subject": subject_clean,
+        "checkpoint": checkpoint_clean,
+        "binding_strength": binding_strength,
+        "summary": _redact(summary.strip()),
         "evidence_refs": cleaned_refs,
         "observed_at": observed_at,
         "effect_contract": "advisory_only_no_automatic_action",
     }
-    if enriched:
-        payload.update({
-            "target_actor": optional_clean["target_actor"],
-            "binding": optional_clean["binding"],
-            "recommendation": optional_clean["recommendation"],
-            "rationale": optional_clean["rationale"],
-            "confidence": float(confidence) if confidence is not None else None,
-        })
-    if checkpoint_mode == "relational":
-        assert normalized_checkpoints is not None
-        payload.update({
-            "checkpoint_mode": "relational",
-            "checkpoint_components": normalized_checkpoints,
-            "checkpoint_set_sha256": _checkpoint_set_sha256(normalized_checkpoints),
-            "checkpoint_contract": "all_components_must_match_or_recheck",
-        })
-    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
-    target = FINDINGS_ROOT / f"{finding_id}.json"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(target, flags, 0o600)
-    try:
-        with os.fdopen(fd, "wb", closefd=True) as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
+    if recommendation_clean is not None:
+        payload["recommendation"] = recommendation_clean
+    if effects:
+        payload["affected_effects"] = effects
+    if recheck_of is not None:
+        payload["recheck_of"] = recheck_of
+        payload["conclusion"] = conclusion
+
+    finding_sha256, record_sha256 = _persist_finding(payload)
+    delivery: dict[str, Any] = {"state": "not_applicable"}
+    lane_match = _LANE_SUBJECT_RE.fullmatch(subject_clean)
+    if lane_match is not None:
         try:
-            target.unlink(missing_ok=True)
-        finally:
-            raise
-    dir_fd = os.open(FINDINGS_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-    digest = hashlib.sha256(encoded).hexdigest()
+            delivery = _publish_worktree_inbox(lane_match.group(1))
+        except Exception as exc:
+            delivery = {
+                "state": "delivery_failed",
+                "error_type": type(exc).__name__,
+                "source_complete": False,
+                "finding_remains_durable": True,
+            }
     return {
         "accepted": True,
         "finding_id": finding_id,
-        "sha256": digest,
+        "finding_sha256": finding_sha256,
+        "record_sha256": record_sha256,
         "observed_at": observed_at,
         "automatic_effect": False,
-        "next_action": "Grabowski may read and independently decide whether any action is warranted.",
+        "delivery": delivery,
+        "next_action": "Grabowski or the working agent may read the advisory view and independently decide what to do.",
     }
 
 
