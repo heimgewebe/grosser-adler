@@ -1791,18 +1791,23 @@ def submit_finding_legacy(
         cleaned_refs.append(_redact(ref.strip()))
 
     lane_id: str | None = None
+    lane_resolution_error: Exception | None = None
     if subject_kind == "grabowski_lane":
         direct_lane = subject_clean if _LANE_ID_RE.fullmatch(subject_clean) is not None else None
         prefixed_lane = _LANE_SUBJECT_RE.fullmatch(subject_clean)
         lane_id = direct_lane or (prefixed_lane.group(1) if prefixed_lane is not None else None)
         if lane_id is None:
             raise ValueError("legacy grabowski_lane subject must be a lane id or lane:<id>")
-        target = _read_work_target(lane_id)
-        current_checkpoint = _clean_required_identity_text(target["checkpoint"], "checkpoint")
-        if checkpoint_clean is not None and checkpoint_clean != current_checkpoint:
-            raise ValueError("legacy lane checkpoint does not match the current worktree checkpoint")
         subject_clean = f"lane:{lane_id}"
-        checkpoint_clean = current_checkpoint
+        try:
+            target = _read_work_target(lane_id)
+        except Exception as exc:
+            lane_resolution_error = exc
+        else:
+            current_checkpoint = _clean_required_identity_text(target["checkpoint"], "checkpoint")
+            if checkpoint_clean is not None and checkpoint_clean != current_checkpoint:
+                raise ValueError("legacy lane checkpoint does not match the current worktree checkpoint")
+            checkpoint_clean = current_checkpoint
 
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
@@ -1825,17 +1830,25 @@ def submit_finding_legacy(
 
     delivery: dict[str, Any] = {"state": "not_applicable"}
     if lane_id is not None:
-        try:
-            delivery = _publish_worktree_inbox(
-                lane_id, expected_checkpoint=checkpoint_clean
-            )
-        except Exception as exc:
+        if lane_resolution_error is not None:
             delivery = {
                 "state": "delivery_failed",
-                "error_type": type(exc).__name__,
+                "error_type": type(lane_resolution_error).__name__,
                 "source_complete": False,
                 "finding_remains_durable": True,
             }
+        else:
+            try:
+                delivery = _publish_worktree_inbox(
+                    lane_id, expected_checkpoint=checkpoint_clean
+                )
+            except Exception as exc:
+                delivery = {
+                    "state": "delivery_failed",
+                    "error_type": type(exc).__name__,
+                    "source_complete": False,
+                    "finding_remains_durable": True,
+                }
     return {
         "accepted": True,
         "finding_id": finding_id,

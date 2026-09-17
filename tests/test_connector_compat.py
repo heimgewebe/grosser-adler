@@ -128,6 +128,41 @@ def test_legacy_lane_submission_rejects_stale_checkpoint(
     assert not (state / "findings").exists() or list((state / "findings").glob("*.json")) == []
 
 
+@pytest.mark.parametrize("checkpoint", [None, OID_A])
+def test_legacy_lane_submission_persists_when_lane_cannot_be_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint: str | None
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = "e" * 32
+
+    def unavailable(_lane: str) -> dict:
+        raise RuntimeError("lane unavailable")
+
+    monkeypatch.setattr(server, "_read_work_target", unavailable)
+
+    result = server.submit_finding_legacy(
+        subject_kind="grabowski_lane",
+        subject=lane_id,
+        checkpoint=checkpoint,
+        severity="medium",
+        summary="preserve finding even when delivery target is unavailable",
+        evidence_refs=["fixture:unresolved-lane"],
+    )
+    assert result["accepted"] is True
+    assert result["legacy"] is True
+    assert result["delivery"]["state"] == "delivery_failed"
+    assert result["delivery"]["error_type"] == "RuntimeError"
+    assert result["delivery"]["finding_remains_durable"] is True
+    payload = json.loads(
+        (state / "findings" / f"{result['finding_id']}.json").read_text(encoding="utf-8")
+    )
+    assert payload["subject"] == f"lane:{lane_id}"
+    assert payload["checkpoint"] == checkpoint
+    assert payload["compatibility_contract"] == server.LEGACY_CONNECTOR_CONTRACT
+    assert "confidence" not in payload
+    assert "binding_strength" not in payload
+
+
 def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_persist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
