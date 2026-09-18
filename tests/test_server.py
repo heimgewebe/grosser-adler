@@ -155,6 +155,7 @@ def test_github_pr_requests_base_oid(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls[2][2] == "repos/heimgewebe/grosser-adler/pulls/2/comments"
     assert calls[2][-1] == "--paginate"
     assert result["review_comments"]["returncode"] == 0
+    assert "inline review comments" in (server.github_pr.__doc__ or "")
 
 
 def test_deploy_templates_keep_credentials_separate() -> None:

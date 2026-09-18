@@ -433,7 +433,7 @@ def git_show(repo: str, revision: str = "HEAD") -> dict[str, Any]:
 
 @mcp.tool(name="github_pr", annotations=READ_ANNOTATIONS)
 def github_pr(repo: str, pr: int) -> dict[str, Any]:
-    """Read live GitHub pull-request metadata, reviews and checks without mutation authority."""
+    """Read live GitHub PR metadata, review submissions, inline review comments and checks read-only."""
     gh_repo = _validate_github_repo(repo)
     if not isinstance(pr, int) or isinstance(pr, bool) or not 1 <= pr <= 2_147_483_647:
         raise ValueError("invalid pull request number")
