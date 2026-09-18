@@ -42,7 +42,8 @@ def test_repo_path_escape_is_rejected(tmp_path: Path) -> None:
 def test_service_validation_is_syntax_bound_not_name_allowlisted() -> None:
     assert server._validate_unit("nixer-mcp.service") == "nixer-mcp.service"
     assert server._validate_unit("future-observer-target.service") == "future-observer-target.service"
-    with pytest.raises(ValueError): server._validate_unit("ssh.timer")
+    with pytest.raises(ValueError):
+        server._validate_unit("ssh.timer")
 
 
 def test_bad_revision_is_rejected() -> None:
@@ -134,6 +135,82 @@ def test_github_read_fails_closed_without_dedicated_credential(monkeypatch: pyte
     with pytest.raises(RuntimeError, match="GitHub credential is not configured"):
         server._run(["/usr/bin/gh", "--version"])
     assert called is False
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "heimgewebe/grosser-adler",
+        "heimgewebe/.github",
+        "a/b",
+        "Owner-1/repo_name.v2",
+    ],
+)
+def test_github_repo_accepts_canonical_owner_and_name(repo: str) -> None:
+    assert server._validate_github_repo(repo) == repo
+    owner, name = server._split_github_repo(repo)
+    assert f"{owner}/{name}" == repo
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "../..",
+        "foo/..",
+        "../bar",
+        "./x",
+        "foo/.",
+        "-owner/repo",
+        "owner/-repo",
+        "owner/repo/extra",
+        "owner//repo",
+        "/owner/repo",
+        "owner/repo/",
+        "owner",
+        "",
+        "owner/re%2Fpo",
+        "owner%2Frepo",
+        "owner/repo%00",
+        "own er/repo",
+        "owner/repo\n",
+        "owner/re\npo",
+        "owner-/repo",
+        "own/er/repo",
+        "..%2F..",
+    ],
+)
+def test_github_repo_rejects_traversal_and_boundary_tricks(repo: str) -> None:
+    with pytest.raises(ValueError):
+        server._validate_github_repo(repo)
+    with pytest.raises(ValueError):
+        server._split_github_repo(repo)
+
+
+def test_github_repo_rejects_non_string() -> None:
+    for value in (None, 7, ["heimgewebe", "grosser-adler"]):
+        with pytest.raises(ValueError):
+            server._validate_github_repo(value)
+
+
+def test_accepted_github_repo_cannot_escape_the_repos_api_prefix() -> None:
+    # Every accepted identifier must expand to exactly repos/<owner>/<name>/...
+    for repo in ("heimgewebe/grosser-adler", "heimgewebe/.github", "a/b"):
+        owner, name = server._split_github_repo(repo)
+        path = f"repos/{owner}/{name}/pulls/1/reviews"
+        assert path.count("/") == 5
+        assert ".." not in path.split("/")
+        assert "." not in path.split("/")
+        assert "%" not in path
+
+
+def test_github_pr_rejects_traversal_before_any_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: calls.append(argv))
+    with pytest.raises(ValueError):
+        server.github_pr("../..", 1)
+    assert calls == []
 
 
 def test_github_pr_requests_base_oid(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -278,49 +355,137 @@ def test_process_reader_marks_unparseable_rows_incomplete(monkeypatch: pytest.Mo
     assert result["processes"] == []
 
 
-def test_redact_can_preserve_canonical_grabowski_task_unit_without_weakening_default_redaction() -> None:
-    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
-    token = "sk-" + ("b" * 24)
-    assert server._redact(unit) != unit
-    for prefix in ("", "  ", "● "):
-        assert server._redact(
-            f"{prefix}{unit} {token}",
-            protected_patterns=server._SAFE_REDACTION_LITERAL_PATTERNS,
-        ) == f"{prefix}{unit} <REDACTED>"
-    assert server._redact(
-        unit,
-        exact_secrets=(unit,),
-        protected_patterns=server._SAFE_REDACTION_LITERAL_PATTERNS,
-    ) == "<REDACTED>"
-
-
-def test_list_user_services_protects_only_unit_column_from_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
-    unit = "grabowski-task-" + ("c" * 24) + "-a2.service"
-    description_unit = "grabowski-task-" + ("e" * 24) + "-a3.service"
-    token = "sk-" + ("d" * 24)
-    raw_stdout = f"  {unit} loaded active running decoy {description_unit} token {token}\n"
-    raw_stderr = f"warning {description_unit}\n"
-
+def _systemctl_stdout(monkeypatch: pytest.MonkeyPatch, stdout: str, stderr: str = "") -> None:
     def fake_run(*args, **kwargs):
-        return server.subprocess.CompletedProcess(
-            args[0], 0, stdout=raw_stdout, stderr=raw_stderr
-        )
+        return server.subprocess.CompletedProcess(args[0], 0, stdout=stdout, stderr=stderr)
 
     monkeypatch.setattr(server.subprocess, "run", fake_run)
-    result = server.list_user_services()
 
+
+def test_redact_still_rewrites_secret_shaped_text_without_any_literal_exception() -> None:
+    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
+    token = "sk-" + ("b" * 24)
+    # The unit name is only protected by structural parsing, never by _redact.
+    assert server._redact(unit) != unit
+    assert server._redact(f"api_key: {token}") == "<REDACTED>"
+    assert server._redact(unit, exact_secrets=(unit,)) == "<REDACTED>"
+    assert not hasattr(server, "_SAFE_REDACTION_LITERAL_PATTERNS")
+
+
+def test_list_user_services_keeps_canonical_grabowski_unit_identity_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "grabowski-task-" + ("c" * 24) + "-a1.service"
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Grabowski task\n")
+    result = server.list_user_services()
     assert result["observation_complete"] is True
+    assert [item["unit"] for item in result["services"]] == [unit]
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        # Not covered by the removed whitelist: different suffix, different id
+        # length, and a name whose "sk-" run alone matches the OpenAI pattern.
+        "grabowski-task-" + ("d" * 24) + "-b2.service",
+        "grabowski-task-" + ("e" * 32) + "-a1.service",
+        "my-desk-" + ("f" * 24) + ".service",
+    ],
+)
+def test_list_user_services_preserves_secret_shaped_but_legitimate_unit_names(
+    monkeypatch: pytest.MonkeyPatch, unit: str
+) -> None:
+    # Each of these is rewritten by raw secret redaction; structural parsing
+    # must still report the whole listing with byte-exact unit identity.
+    assert server._redact(unit) != unit
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Example unit\n")
+    result = server.list_user_services()
+    assert result["observation_complete"] is True
+    assert result["parse_complete"] is True
     assert result["services"] == [{
         "unit": unit,
         "load": "loaded",
         "active": "active",
         "sub": "running",
-        "description": "decoy grabowski-ta<REDACTED>.service token <REDACTED>",
+        "description": "Example unit",
     }]
-    assert result["source"]["stdout"].startswith("  " + unit + " ")
-    assert description_unit not in result["source"]["stdout"]
-    assert description_unit not in result["source"]["stderr"]
+
+
+def test_list_user_services_redacts_secrets_in_the_description_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "nixer-mcp.service"
+    token = "ghp_" + ("g" * 24)
+    _systemctl_stdout(
+        monkeypatch,
+        f"{unit} loaded active running Nixer token: {token}\n",
+        stderr=f"warning {token}\n",
+    )
+    result = server.list_user_services()
+    assert result["services"] == [{
+        "unit": unit,
+        "load": "loaded",
+        "active": "active",
+        "sub": "running",
+        "description": "Nixer <REDACTED>",
+    }]
     assert token not in result["source"]["stdout"]
+    assert token not in result["source"]["stderr"]
+    assert token not in json.dumps(result)
+
+
+def test_list_user_services_redacts_the_gh_token_in_a_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exact-secret redaction must still reach parser-emitted free text.
+    secret = "plain-credential-value"
+    monkeypatch.setattr(
+        server.os, "environ", {**os.environ, "GROSSER_ADLER_GITHUB_TOKEN": secret}
+    )
+    units, complete = server._parse_service_units(
+        f"nixer-mcp.service loaded active running desc {secret}\n", (secret,)
+    )
+    assert complete is True
+    assert units[0]["description"] == "desc <REDACTED>"
+
+
+def test_list_user_services_marks_bullet_and_malformed_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "nixer-mcp.service"
+    _systemctl_stdout(monkeypatch, f"\u25cf {unit} loaded failed failed Nixer\n")
+    result = server.list_user_services()
+    assert result["observation_complete"] is True
+    assert result["services"][0]["unit"] == unit
+    assert result["services"][0]["active"] == "failed"
+
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Nixer\nmalformed-row\n")
+    result = server.list_user_services()
+    assert result["parse_complete"] is False
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+
+
+def test_list_user_services_fails_closed_on_non_structural_state_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A state column that is not systemd state vocabulary is never emitted.
+    _systemctl_stdout(
+        monkeypatch, "nixer-mcp.service loaded active token:leak Nixer\n"
+    )
+    result = server.list_user_services()
+    assert result["parse_complete"] is False
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+
+
+def test_run_reports_parser_failure_without_returning_raw_output() -> None:
+    def explode(raw_stdout: str, exact_secrets: tuple[str, ...]):
+        raise RuntimeError("parser is broken")
+
+    result = server._run(["/usr/bin/true"], stdout_parser=explode)
+    assert result["parse_failed"] is True
+    assert result["parsed"] is None
 
 
 def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -816,8 +981,11 @@ def test_work_target_reads_exact_active_grabowski_lane(tmp_path: Path, monkeypat
     repo = tmp_path / "repo"
     worktree = tmp_path / "worktree"
     lanes = tmp_path / "lanes"
-    repo.mkdir(); worktree.mkdir(); lanes.mkdir()
-    (repo / ".git").mkdir(); (worktree / ".git").write_text("gitdir: fixture", encoding="utf-8")
+    repo.mkdir()
+    worktree.mkdir()
+    lanes.mkdir()
+    (repo / ".git").mkdir()
+    (worktree / ".git").write_text("gitdir: fixture", encoding="utf-8")
     lane_id = "1" * 32
     lane = _seal_lane({
         "lane_id": lane_id,
@@ -856,7 +1024,8 @@ def test_work_target_reads_exact_active_grabowski_lane(tmp_path: Path, monkeypat
 
 
 def test_work_target_rejects_terminal_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    lanes = tmp_path / "lanes"; lanes.mkdir()
+    lanes = tmp_path / "lanes"
+    lanes.mkdir()
     lane_id = "2" * 32
     lane = _seal_lane({"lane_id": lane_id, "state": "ready", "terminal_closeout": {"closeout_state": "no_change_proven"}, "inputs": {"lane_id": lane_id, "repo": str(tmp_path), "target_path": str(tmp_path), "branch": "fixture", "purpose": "fixture", "base_head": OID_A}})
     (lanes / f"{lane_id}.json").write_text(json.dumps(lane), encoding="utf-8")
@@ -866,12 +1035,14 @@ def test_work_target_rejects_terminal_lane(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_work_target_rejects_tampered_lane_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    lanes = tmp_path / "lanes"; lanes.mkdir()
+    lanes = tmp_path / "lanes"
+    lanes.mkdir()
     lane_id = "8" * 32
     lane = _seal_lane({"lane_id": lane_id, "state": "ready", "terminal_closeout": None, "inputs": {"lane_id": lane_id, "repo": str(tmp_path), "target_path": str(tmp_path), "branch": "fixture", "purpose": "before", "base_head": OID_A}})
     lane["inputs"]["purpose"] = "tampered-after-seal"
     path = lanes / f"{lane_id}.json"
-    path.write_text(json.dumps(lane), encoding="utf-8"); path.chmod(0o600)
+    path.write_text(json.dumps(lane), encoding="utf-8")
+    path.chmod(0o600)
     monkeypatch.setattr(server, "GRABOWSKI_WORK_LANES_ROOT", lanes.resolve())
     with pytest.raises(RuntimeError, match="receipt digest is invalid"):
         server.get_work_target(lane_id)
@@ -901,8 +1072,10 @@ def test_lane_finding_automatically_publishes_external_current_view(tmp_path: Pa
 
 def test_sidecar_rejects_symlink_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; worktree.mkdir()
-    outside = tmp_path / "outside"; outside.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
     (worktree / ".adler").symlink_to(outside, target_is_directory=True)
     lane_id = "4" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
@@ -945,8 +1118,11 @@ def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeyp
     worktree = tmp_path / "worktree"
     lane_id = "9" * 32
     target = _install_pointer(worktree, state, lane_id)
-    findings = state / "findings"; findings.mkdir(mode=0o700)
-    bad = findings / "broken.json"; bad.write_text("{broken", encoding="utf-8"); bad.chmod(0o600)
+    findings = state / "findings"
+    findings.mkdir(mode=0o700)
+    bad = findings / "broken.json"
+    bad.write_text("{broken", encoding="utf-8")
+    bad.chmod(0o600)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
         "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
@@ -958,8 +1134,10 @@ def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeyp
 
 def test_worktree_root_limits_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
-    allowed = tmp_path / "allowed"; allowed.mkdir()
-    worktree = tmp_path / "outside"; worktree.mkdir()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    worktree = tmp_path / "outside"
+    worktree.mkdir()
     monkeypatch.setattr(server, "WORKTREE_ROOT", allowed.resolve())
     lane_id = "a" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
@@ -974,7 +1152,8 @@ def test_worktree_root_limits_delivery(tmp_path: Path, monkeypatch: pytest.Monke
 
 def test_delivery_failure_keeps_finding_durable_and_does_not_create_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; worktree.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
     lane_id = "7" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",

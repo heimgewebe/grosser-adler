@@ -12,6 +12,7 @@ import re
 import stat
 import subprocess
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -65,7 +66,8 @@ INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and ad
 
 mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
-_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+_GITHUB_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
 _LANE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -80,6 +82,9 @@ _LEGACY_STATUSES = {
     "missing_evidence", "risk", "advice", "recheck_required",
 }
 _LEGACY_BASE_STATUSES = {"observation", "finding", "recheck_suggested"}
+_SEVERITIES = ("critical", "high", "medium", "low")
+_SEVERITY_ORDER = {value: index for index, value in enumerate(_SEVERITIES)}
+_UNKNOWN_SEVERITY_RANK = len(_SEVERITIES)
 _LEGACY_ENRICHED_FIELDS = ("target_actor", "binding", "recommendation", "rationale", "confidence")
 _LEGACY_RELATIONAL_FIELDS = (
     "checkpoint_mode", "checkpoint_components", "checkpoint_set_sha256", "checkpoint_contract",
@@ -108,11 +113,7 @@ _SYSTEMD_SERVICE_PROPERTIES = (
 _SYSTEMD_SCOPES: tuple[Literal["user", "system"], ...] = ("user", "system")
 _SYSTEMD_RUNNING_ACTIVE_STATES = frozenset({"active", "reloading"})
 _SYSTEMD_TRANSITIONAL_ACTIVE_STATES = frozenset({"activating", "deactivating"})
-_SAFE_REDACTION_LITERAL_PATTERNS = (
-    re.compile(
-        r"(?m)^(?:●[ \t]+|[ \t]+)?grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service(?=[ \t])"
-    ),
-)
+_SYSTEMD_STATE_RE = re.compile(r"^[a-z][a-z-]{0,31}$")
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -126,30 +127,13 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _redact(
-    text: str,
-    *,
-    exact_secrets: tuple[str, ...] = (),
-    protected_patterns: tuple[re.Pattern[str], ...] = (),
-) -> str:
+def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     result = text
     for secret in exact_secrets:
         if secret:
             result = result.replace(secret, "<REDACTED>")
-
-    protected_literals: list[str] = []
-
-    def protect_literal(match: re.Match[str]) -> str:
-        marker = f"\x00GROSSER_ADLER_SAFE_{len(protected_literals)}\x00"
-        protected_literals.append(match.group(0))
-        return marker
-
-    for pattern in protected_patterns:
-        result = pattern.sub(protect_literal, result)
     for pattern in _SECRET_PATTERNS:
         result = pattern.sub("<REDACTED>", result)
-    for index, literal in enumerate(protected_literals):
-        result = result.replace(f"\x00GROSSER_ADLER_SAFE_{index}\x00", literal)
     return result
 
 
@@ -166,7 +150,7 @@ def _run(
     *,
     cwd: Path | None = None,
     timeout: int = 15,
-    protected_stdout_redaction_patterns: tuple[re.Pattern[str], ...] = (),
+    stdout_parser: Callable[[str, tuple[str, ...]], Any] | None = None,
 ) -> dict[str, Any]:
     if not argv or not argv[0].startswith("/usr/bin/"):
         raise ValueError("only fixed absolute /usr/bin executables are allowed")
@@ -204,24 +188,35 @@ def _run(
         check=False,
     )
     exact_secrets = (gh_token,) if gh_token else ()
+    parsed: Any = None
+    parse_failed = False
+    if stdout_parser is not None:
+        # Structural fields are read from raw stdout so that identity columns
+        # survive verbatim; the parser itself redacts every free-text field it
+        # emits, so nothing unredacted leaves this function.
+        try:
+            parsed = stdout_parser(completed.stdout, exact_secrets)
+        except Exception:
+            parsed = None
+            parse_failed = True
     stdout, stdout_truncated = _bounded(
-        _redact(
-            completed.stdout,
-            exact_secrets=exact_secrets,
-            protected_patterns=protected_stdout_redaction_patterns,
-        )
+        _redact(completed.stdout, exact_secrets=exact_secrets)
     )
     stderr, stderr_truncated = _bounded(
         _redact(completed.stderr, exact_secrets=exact_secrets),
         32_000,
     )
-    return {
+    result: dict[str, Any] = {
         "returncode": completed.returncode,
         "stdout": stdout,
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
     }
+    if stdout_parser is not None:
+        result["parsed"] = parsed
+        result["parse_failed"] = parse_failed
+    return result
 
 
 def _resolve_repo(repo: str) -> Path:
@@ -349,10 +344,32 @@ def _status_is_clean(status_stdout: str) -> bool:
     return bool(lines) and all(line.startswith("##") for line in lines)
 
 
-def _validate_github_repo(repo: str) -> str:
-    if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
+def _split_github_repo(repo: str) -> tuple[str, str]:
+    """Validate owner and name as separate path segments, never as one string.
+
+    Every accepted value must expand to exactly `repos/<owner>/<name>/...`:
+    the input carries exactly one separator, neither segment may traverse
+    (`.`, `..`), start an option (`-`), or contain an escape (`%`) that could
+    re-cross a segment boundary after URL handling.
+    """
+    if not isinstance(repo, str):
         raise ValueError("GitHub repo must be owner/name")
-    return repo
+    segments = repo.split("/")
+    if len(segments) != 2:
+        raise ValueError("GitHub repo must be owner/name")
+    owner, name = segments
+    if _GITHUB_OWNER_RE.fullmatch(owner) is None:
+        raise ValueError("GitHub owner segment is invalid")
+    if _GITHUB_REPO_NAME_RE.fullmatch(name) is None:
+        raise ValueError("GitHub repository segment is invalid")
+    if name.startswith("-") or set(name) <= {"."}:
+        raise ValueError("GitHub repository segment is invalid")
+    return owner, name
+
+
+def _validate_github_repo(repo: str) -> str:
+    owner, name = _split_github_repo(repo)
+    return f"{owner}/{name}"
 
 
 def _validate_revision(revision: str) -> str:
@@ -469,7 +486,8 @@ def git_show(repo: str, revision: str = "HEAD") -> dict[str, Any]:
 @mcp.tool(name="github_pr", annotations=READ_ANNOTATIONS)
 def github_pr(repo: str, pr: int) -> dict[str, Any]:
     """Read live GitHub PR metadata, review submissions, inline review comments and checks read-only."""
-    gh_repo = _validate_github_repo(repo)
+    owner, name = _split_github_repo(repo)
+    gh_repo = f"{owner}/{name}"
     if not isinstance(pr, int) or isinstance(pr, bool) or not 1 <= pr <= 2_147_483_647:
         raise ValueError("invalid pull request number")
     metadata = _run([
@@ -477,10 +495,10 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
         "--json", "number,title,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,url,reviewDecision,statusCheckRollup",
     ], timeout=20)
     reviews = _run([
-        "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/reviews", "--paginate",
+        "/usr/bin/gh", "api", f"repos/{owner}/{name}/pulls/{pr}/reviews", "--paginate",
     ], timeout=20)
     review_comments = _run([
-        "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/comments", "--paginate",
+        "/usr/bin/gh", "api", f"repos/{owner}/{name}/pulls/{pr}/comments", "--paginate",
     ], timeout=20)
     return {
         "repo": gh_repo,
@@ -492,28 +510,57 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     }
 
 
+def _parse_service_units(
+    raw_stdout: str, exact_secrets: tuple[str, ...]
+) -> tuple[list[dict[str, str]], bool]:
+    """Parse `systemctl list-units` rows from raw output, redacting only free text.
+
+    The unit, load, active and sub columns are structural systemd identity read
+    from a local trusted interface and constrained by `_UNIT_RE` / the systemd
+    state vocabulary; they are never rewritten by secret redaction, because a
+    legitimate unit name may incidentally resemble a secret pattern. Only the
+    free-text description is redacted.
+    """
+    units: list[dict[str, str]] = []
+    complete = True
+    for raw in raw_stdout.splitlines():
+        if not raw.strip():
+            continue
+        row = raw.strip()
+        if row.startswith("●"):
+            row = row[1:].lstrip()
+        parts = row.split(None, 4)
+        if len(parts) < 4 or not _UNIT_RE.fullmatch(parts[0]):
+            complete = False
+            continue
+        if any(_SYSTEMD_STATE_RE.fullmatch(part) is None for part in parts[1:4]):
+            complete = False
+            continue
+        description = parts[4] if len(parts) > 4 else ""
+        units.append({
+            "unit": parts[0],
+            "load": parts[1],
+            "active": parts[2],
+            "sub": parts[3],
+            "description": _redact(description, exact_secrets=exact_secrets),
+        })
+    return units, complete
+
+
 @mcp.tool(name="list_user_services", annotations=READ_ANNOTATIONS)
 def list_user_services() -> dict[str, Any]:
     """Discover user-systemd services without a name allowlist or mutation authority."""
     result = _run(
         ["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"],
         timeout=20,
-        protected_stdout_redaction_patterns=_SAFE_REDACTION_LITERAL_PATTERNS,
+        stdout_parser=_parse_service_units,
     )
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
-    parse_complete = source_complete
     units: list[dict[str, str]] = []
-    if source_complete:
-        for raw in result["stdout"].splitlines():
-            if not raw.strip():
-                continue
-            parts = raw.strip().split(None, 4)
-            if parts and parts[0] == "●":
-                parts = parts[1:]
-            if len(parts) < 4 or not _UNIT_RE.fullmatch(parts[0]):
-                parse_complete = False
-                continue
-            units.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
+    parse_complete = False
+    parsed = result.get("parsed")
+    if source_complete and not result.get("parse_failed") and parsed is not None:
+        units, parse_complete = parsed
     observation_complete = source_complete and parse_complete
     if not observation_complete:
         units = []
@@ -1039,7 +1086,7 @@ def _validate_legacy_finding_payload(payload: dict[str, Any], path: Path) -> Non
     checkpoint = payload.get("checkpoint")
     if checkpoint is not None and (not isinstance(checkpoint, str) or len(checkpoint) > 500):
         raise RuntimeError("legacy finding checkpoint is invalid")
-    if payload.get("severity") not in {"low", "medium", "high", "critical"}:
+    if payload.get("severity") not in _SEVERITY_ORDER:
         raise RuntimeError("legacy finding severity is invalid")
     if payload.get("status") not in _LEGACY_STATUSES:
         raise RuntimeError("legacy finding status is invalid")
@@ -1154,7 +1201,7 @@ def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
 
     if payload.get("kind") not in {"observation", "risk", "contradiction", "missing_evidence", "advice"}:
         raise RuntimeError("V1 finding kind is invalid")
-    if payload.get("severity") not in {"low", "medium", "high", "critical"}:
+    if payload.get("severity") not in _SEVERITY_ORDER:
         raise RuntimeError("V1 finding severity is invalid")
     if payload.get("binding_strength") not in {"exact", "strong", "heuristic", "unbound"}:
         raise RuntimeError("V1 finding binding strength is invalid")
@@ -1265,6 +1312,19 @@ def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[st
     return records, errors
 
 
+def _severity_rank(value: Any) -> int:
+    """Order severities by meaning, never by string comparison.
+
+    Alphabetical ordering would place `medium` below `low`. Stored findings are
+    contract-validated against `_SEVERITIES`, so an unknown value cannot reach
+    this function through a valid record; should one appear, it sorts last and
+    stays visible rather than being silently dropped.
+    """
+    if not isinstance(value, str):
+        return _UNKNOWN_SEVERITY_RANK
+    return _SEVERITY_ORDER.get(value, _UNKNOWN_SEVERITY_RANK)
+
+
 def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]]:
     subject = f"lane:{lane_id}"
     loaded, errors = _load_finding_payloads()
@@ -1313,7 +1373,7 @@ def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]
         current.append(item)
     for path, payload in legacy_records:
         current.append(_finding_record_view(payload, path))
-    current.sort(key=lambda item: (str(item.get("severity", "")), str(item.get("finding_id", ""))))
+    current.sort(key=lambda item: (_severity_rank(item.get("severity")), str(item.get("finding_id", ""))))
     return current
 
 
@@ -1825,7 +1885,7 @@ def submit_finding_legacy(
     _ensure_state()
     if subject_kind not in {"repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane"}:
         raise ValueError("unsupported legacy subject_kind")
-    if severity not in {"low", "medium", "high", "critical"}:
+    if severity not in _SEVERITY_ORDER:
         raise ValueError("invalid severity")
     if status not in _LEGACY_BASE_STATUSES:
         raise ValueError("unsupported legacy status")
