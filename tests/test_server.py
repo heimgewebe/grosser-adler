@@ -287,13 +287,17 @@ def test_redact_can_preserve_canonical_grabowski_task_unit_without_weakening_def
     ) == "<REDACTED>"
 
 
-def test_list_user_services_preserves_canonical_grabowski_task_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_list_user_services_protects_only_unit_column_from_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
     unit = "grabowski-task-" + ("c" * 24) + "-a2.service"
+    description_unit = "grabowski-task-" + ("e" * 24) + "-a3.service"
     token = "sk-" + ("d" * 24)
-    raw_stdout = f"{unit} loaded active running token {token}\n"
+    raw_stdout = f"{unit} loaded active running decoy {description_unit} token {token}\n"
+    raw_stderr = f"warning {description_unit}\n"
 
     def fake_run(*args, **kwargs):
-        return server.subprocess.CompletedProcess(args[0], 0, stdout=raw_stdout, stderr="")
+        return server.subprocess.CompletedProcess(
+            args[0], 0, stdout=raw_stdout, stderr=raw_stderr
+        )
 
     monkeypatch.setattr(server.subprocess, "run", fake_run)
     result = server.list_user_services()
@@ -304,8 +308,11 @@ def test_list_user_services_preserves_canonical_grabowski_task_unit(monkeypatch:
         "load": "loaded",
         "active": "active",
         "sub": "running",
-        "description": "token <REDACTED>",
+        "description": "decoy grabowski-ta<REDACTED>.service token <REDACTED>",
     }]
+    assert result["source"]["stdout"].startswith(unit + " ")
+    assert description_unit not in result["source"]["stdout"]
+    assert description_unit not in result["source"]["stderr"]
     assert token not in result["source"]["stdout"]
 
 

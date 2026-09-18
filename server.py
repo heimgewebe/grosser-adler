@@ -109,7 +109,9 @@ _SYSTEMD_SCOPES: tuple[Literal["user", "system"], ...] = ("user", "system")
 _SYSTEMD_RUNNING_ACTIVE_STATES = frozenset({"active", "reloading"})
 _SYSTEMD_TRANSITIONAL_ACTIVE_STATES = frozenset({"activating", "deactivating"})
 _SAFE_REDACTION_LITERAL_PATTERNS = (
-    re.compile(r"\bgrabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\b"),
+    re.compile(
+        r"(?m)^(?:●\s+)?grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service(?=\s)"
+    ),
 )
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
@@ -164,7 +166,7 @@ def _run(
     *,
     cwd: Path | None = None,
     timeout: int = 15,
-    protected_redaction_patterns: tuple[re.Pattern[str], ...] = (),
+    protected_stdout_redaction_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> dict[str, Any]:
     if not argv or not argv[0].startswith("/usr/bin/"):
         raise ValueError("only fixed absolute /usr/bin executables are allowed")
@@ -206,15 +208,11 @@ def _run(
         _redact(
             completed.stdout,
             exact_secrets=exact_secrets,
-            protected_patterns=protected_redaction_patterns,
+            protected_patterns=protected_stdout_redaction_patterns,
         )
     )
     stderr, stderr_truncated = _bounded(
-        _redact(
-            completed.stderr,
-            exact_secrets=exact_secrets,
-            protected_patterns=protected_redaction_patterns,
-        ),
+        _redact(completed.stderr, exact_secrets=exact_secrets),
         32_000,
     )
     return {
@@ -490,7 +488,7 @@ def list_user_services() -> dict[str, Any]:
     result = _run(
         ["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"],
         timeout=20,
-        protected_redaction_patterns=_SAFE_REDACTION_LITERAL_PATTERNS,
+        protected_stdout_redaction_patterns=_SAFE_REDACTION_LITERAL_PATTERNS,
     )
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     parse_complete = source_complete
