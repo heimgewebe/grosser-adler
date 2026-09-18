@@ -444,7 +444,17 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     reviews = _run([
         "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/reviews", "--paginate",
     ], timeout=20)
-    return {"repo": gh_repo, "pr": pr, "metadata": metadata, "reviews": reviews, "observed_at": _utc_now()}
+    review_comments = _run([
+        "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/comments", "--paginate",
+    ], timeout=20)
+    return {
+        "repo": gh_repo,
+        "pr": pr,
+        "metadata": metadata,
+        "reviews": reviews,
+        "review_comments": review_comments,
+        "observed_at": _utc_now(),
+    }
 
 
 @mcp.tool(name="list_user_services", annotations=READ_ANNOTATIONS)
