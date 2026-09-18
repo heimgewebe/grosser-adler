@@ -110,7 +110,7 @@ _SYSTEMD_RUNNING_ACTIVE_STATES = frozenset({"active", "reloading"})
 _SYSTEMD_TRANSITIONAL_ACTIVE_STATES = frozenset({"activating", "deactivating"})
 _SAFE_REDACTION_LITERAL_PATTERNS = (
     re.compile(
-        r"(?m)^(?:●\s+)?grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service(?=\s)"
+        r"(?m)^(?:●[ \t]+|[ \t]+)?grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service(?=[ \t])"
     ),
 )
 _SECRET_PATTERNS = (

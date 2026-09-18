@@ -276,10 +276,11 @@ def test_redact_can_preserve_canonical_grabowski_task_unit_without_weakening_def
     unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
     token = "sk-" + ("b" * 24)
     assert server._redact(unit) != unit
-    assert server._redact(
-        f"{unit} {token}",
-        protected_patterns=server._SAFE_REDACTION_LITERAL_PATTERNS,
-    ) == f"{unit} <REDACTED>"
+    for prefix in ("", "  ", "● "):
+        assert server._redact(
+            f"{prefix}{unit} {token}",
+            protected_patterns=server._SAFE_REDACTION_LITERAL_PATTERNS,
+        ) == f"{prefix}{unit} <REDACTED>"
     assert server._redact(
         unit,
         exact_secrets=(unit,),
@@ -291,7 +292,7 @@ def test_list_user_services_protects_only_unit_column_from_redaction(monkeypatch
     unit = "grabowski-task-" + ("c" * 24) + "-a2.service"
     description_unit = "grabowski-task-" + ("e" * 24) + "-a3.service"
     token = "sk-" + ("d" * 24)
-    raw_stdout = f"{unit} loaded active running decoy {description_unit} token {token}\n"
+    raw_stdout = f"  {unit} loaded active running decoy {description_unit} token {token}\n"
     raw_stderr = f"warning {description_unit}\n"
 
     def fake_run(*args, **kwargs):
@@ -310,7 +311,7 @@ def test_list_user_services_protects_only_unit_column_from_redaction(monkeypatch
         "sub": "running",
         "description": "decoy grabowski-ta<REDACTED>.service token <REDACTED>",
     }]
-    assert result["source"]["stdout"].startswith(unit + " ")
+    assert result["source"]["stdout"].startswith("  " + unit + " ")
     assert description_unit not in result["source"]["stdout"]
     assert description_unit not in result["source"]["stderr"]
     assert token not in result["source"]["stdout"]
