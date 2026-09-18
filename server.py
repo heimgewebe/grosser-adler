@@ -108,6 +108,9 @@ _SYSTEMD_SERVICE_PROPERTIES = (
 _SYSTEMD_SCOPES: tuple[Literal["user", "system"], ...] = ("user", "system")
 _SYSTEMD_RUNNING_ACTIVE_STATES = frozenset({"active", "reloading"})
 _SYSTEMD_TRANSITIONAL_ACTIVE_STATES = frozenset({"activating", "deactivating"})
+_SAFE_REDACTION_LITERAL_PATTERNS = (
+    re.compile(r"\bgrabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\b"),
+)
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -121,13 +124,30 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
+def _redact(
+    text: str,
+    *,
+    exact_secrets: tuple[str, ...] = (),
+    protected_patterns: tuple[re.Pattern[str], ...] = (),
+) -> str:
     result = text
     for secret in exact_secrets:
         if secret:
             result = result.replace(secret, "<REDACTED>")
+
+    protected_literals: list[str] = []
+
+    def protect_literal(match: re.Match[str]) -> str:
+        marker = f"\x00GROSSER_ADLER_SAFE_{len(protected_literals)}\x00"
+        protected_literals.append(match.group(0))
+        return marker
+
+    for pattern in protected_patterns:
+        result = pattern.sub(protect_literal, result)
     for pattern in _SECRET_PATTERNS:
         result = pattern.sub("<REDACTED>", result)
+    for index, literal in enumerate(protected_literals):
+        result = result.replace(f"\x00GROSSER_ADLER_SAFE_{index}\x00", literal)
     return result
 
 
@@ -139,7 +159,13 @@ def _bounded(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]:
     return clipped + "\n<OUTPUT_TRUNCATED>", True
 
 
-def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 15) -> dict[str, Any]:
+def _run(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 15,
+    protected_redaction_patterns: tuple[re.Pattern[str], ...] = (),
+) -> dict[str, Any]:
     if not argv or not argv[0].startswith("/usr/bin/"):
         raise ValueError("only fixed absolute /usr/bin executables are allowed")
     env = {
@@ -176,9 +202,20 @@ def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 15) -> dict
         check=False,
     )
     exact_secrets = (gh_token,) if gh_token else ()
-    stdout, stdout_truncated = _bounded(_redact(completed.stdout, exact_secrets=exact_secrets))
+    stdout, stdout_truncated = _bounded(
+        _redact(
+            completed.stdout,
+            exact_secrets=exact_secrets,
+            protected_patterns=protected_redaction_patterns,
+        )
+    )
     stderr, stderr_truncated = _bounded(
-        _redact(completed.stderr, exact_secrets=exact_secrets), 32_000
+        _redact(
+            completed.stderr,
+            exact_secrets=exact_secrets,
+            protected_patterns=protected_redaction_patterns,
+        ),
+        32_000,
     )
     return {
         "returncode": completed.returncode,
@@ -450,7 +487,11 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
 @mcp.tool(name="list_user_services", annotations=READ_ANNOTATIONS)
 def list_user_services() -> dict[str, Any]:
     """Discover user-systemd services without a name allowlist or mutation authority."""
-    result = _run(["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"], timeout=20)
+    result = _run(
+        ["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"],
+        timeout=20,
+        protected_redaction_patterns=_SAFE_REDACTION_LITERAL_PATTERNS,
+    )
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     parse_complete = source_complete
     units: list[dict[str, str]] = []
