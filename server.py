@@ -12,7 +12,6 @@ import re
 import stat
 import subprocess
 import uuid
-from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -70,6 +69,13 @@ _GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
 _GITHUB_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
+# Anchors on the `.service` suffix and takes the whole preceding unit-charset
+# run. `:` is a legal unit-name character, so a trailing separator (as in a
+# journal line `... host some.service: started`) must not suppress the match;
+# \b ends the token at the suffix without consuming the separator.
+_UNIT_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@:-])[A-Za-z0-9_.@:-]{1,180}?\.service\b"
+)
 _LANE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _LANE_SUBJECT_RE = re.compile(r"^lane:([0-9a-f]{32})$")
 _FINDING_ID_RE = re.compile(r"^ga-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
@@ -137,6 +143,38 @@ def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     return result
 
 
+def _redact_preserving_unit_names(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
+    """Redact free text while leaving syntactically valid systemd unit names intact.
+
+    Secret patterns match inside legitimate unit names (`sk-` matches inside
+    `grabowski-task-...`), and rewriting a unit name destroys the identity the
+    observer exists to report: the name would no longer match `_UNIT_RE`, no
+    longer agree between a structured claim and its raw receipt, and no longer
+    cross-check against `FragmentPath` or `ControlGroup`.
+
+    A token is exempt only if it fully matches `_UNIT_RE`, i.e. the strict unit
+    charset plus a `.service` suffix, and does not contain a configured exact
+    secret. This is structural identity from a local trusted interface, not a
+    naming-convention allowlist. Residual risk, accepted deliberately: a unit
+    deliberately named with a credential-shaped substring is reported verbatim.
+    Creating such a unit already requires code execution as this user, and
+    exact configured secrets are still redacted everywhere.
+    """
+    parts: list[str] = []
+    last = 0
+    for match in _UNIT_TOKEN_RE.finditer(text):
+        token = match.group(0)
+        if _UNIT_RE.fullmatch(token) is None:
+            continue
+        if any(secret and secret in token for secret in exact_secrets):
+            continue
+        parts.append(_redact(text[last:match.start()], exact_secrets=exact_secrets))
+        parts.append(token)
+        last = match.end()
+    parts.append(_redact(text[last:], exact_secrets=exact_secrets))
+    return "".join(parts)
+
+
 def _bounded(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]:
     encoded = text.encode("utf-8", errors="replace")
     if len(encoded) <= max_bytes:
@@ -150,7 +188,7 @@ def _run(
     *,
     cwd: Path | None = None,
     timeout: int = 15,
-    stdout_parser: Callable[[str, tuple[str, ...]], Any] | None = None,
+    preserve_unit_identity: bool = False,
 ) -> dict[str, Any]:
     if not argv or not argv[0].startswith("/usr/bin/"):
         raise ValueError("only fixed absolute /usr/bin executables are allowed")
@@ -188,35 +226,24 @@ def _run(
         check=False,
     )
     exact_secrets = (gh_token,) if gh_token else ()
-    parsed: Any = None
-    parse_failed = False
-    if stdout_parser is not None:
-        # Structural fields are read from raw stdout so that identity columns
-        # survive verbatim; the parser itself redacts every free-text field it
-        # emits, so nothing unredacted leaves this function.
-        try:
-            parsed = stdout_parser(completed.stdout, exact_secrets)
-        except Exception:
-            parsed = None
-            parse_failed = True
+    # systemd and journal output carries unit names as structural identity in
+    # every column, so those reads preserve unit tokens; everything else, and
+    # all free text in these reads, stays under the default redaction.
+    redactor = _redact_preserving_unit_names if preserve_unit_identity else _redact
     stdout, stdout_truncated = _bounded(
-        _redact(completed.stdout, exact_secrets=exact_secrets)
+        redactor(completed.stdout, exact_secrets=exact_secrets)
     )
     stderr, stderr_truncated = _bounded(
-        _redact(completed.stderr, exact_secrets=exact_secrets),
+        redactor(completed.stderr, exact_secrets=exact_secrets),
         32_000,
     )
-    result: dict[str, Any] = {
+    return {
         "returncode": completed.returncode,
         "stdout": stdout,
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
     }
-    if stdout_parser is not None:
-        result["parsed"] = parsed
-        result["parse_failed"] = parse_failed
-    return result
 
 
 def _resolve_repo(repo: str) -> Path:
@@ -510,24 +537,22 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     }
 
 
-def _parse_service_units(
-    raw_stdout: str, exact_secrets: tuple[str, ...]
-) -> tuple[list[dict[str, str]], bool]:
-    """Parse `systemctl list-units` rows from raw output, redacting only free text.
+def _parse_service_units(text: str) -> tuple[list[dict[str, str]], bool]:
+    """Parse `systemctl list-units` rows.
 
-    The unit, load, active and sub columns are structural systemd identity read
-    from a local trusted interface and constrained by `_UNIT_RE` / the systemd
-    state vocabulary; they are never rewritten by secret redaction, because a
-    legitimate unit name may incidentally resemble a secret pattern. Only the
-    free-text description is redacted.
+    The unit column survives redaction because systemd reads use
+    `_redact_preserving_unit_names`, so the emitted unit identity is byte-exact
+    and identical to the raw source evidence in the same response. Load, active
+    and sub are structural systemd state tokens and are checked against that
+    vocabulary; the description stays free text under normal redaction.
     """
     units: list[dict[str, str]] = []
     complete = True
-    for raw in raw_stdout.splitlines():
+    for raw in text.splitlines():
         if not raw.strip():
             continue
         row = raw.strip()
-        if row.startswith("●"):
+        if row.startswith("\u25cf"):
             row = row[1:].lstrip()
         parts = row.split(None, 4)
         if len(parts) < 4 or not _UNIT_RE.fullmatch(parts[0]):
@@ -536,13 +561,12 @@ def _parse_service_units(
         if any(_SYSTEMD_STATE_RE.fullmatch(part) is None for part in parts[1:4]):
             complete = False
             continue
-        description = parts[4] if len(parts) > 4 else ""
         units.append({
             "unit": parts[0],
             "load": parts[1],
             "active": parts[2],
             "sub": parts[3],
-            "description": _redact(description, exact_secrets=exact_secrets),
+            "description": parts[4] if len(parts) > 4 else "",
         })
     return units, complete
 
@@ -553,14 +577,13 @@ def list_user_services() -> dict[str, Any]:
     result = _run(
         ["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"],
         timeout=20,
-        stdout_parser=_parse_service_units,
+        preserve_unit_identity=True,
     )
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     units: list[dict[str, str]] = []
     parse_complete = False
-    parsed = result.get("parsed")
-    if source_complete and not result.get("parse_failed") and parsed is not None:
-        units, parse_complete = parsed
+    if source_complete:
+        units, parse_complete = _parse_service_units(result["stdout"])
     observation_complete = source_complete and parse_complete
     if not observation_complete:
         units = []
@@ -591,7 +614,7 @@ def _service_show_argv(unit: str, scope: Literal["user", "system"]) -> list[str]
 
 
 def _observe_service_scope(unit: str, scope: Literal["user", "system"]) -> dict[str, Any]:
-    result = _run(_service_show_argv(unit, scope))
+    result = _run(_service_show_argv(unit, scope), preserve_unit_identity=True)
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     properties: dict[str, str] = {}
     parse_complete = False
@@ -844,7 +867,7 @@ def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     else:
         argv.append("--system")
     argv.extend(["-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso"])
-    result = _run(argv, timeout=20)
+    result = _run(argv, timeout=20, preserve_unit_identity=True)
     diagnostics_present = bool(result["stderr"].strip())
     observation_complete = (
         result["returncode"] == 0

@@ -434,21 +434,6 @@ def test_list_user_services_redacts_secrets_in_the_description_column(
     assert token not in json.dumps(result)
 
 
-def test_list_user_services_redacts_the_gh_token_in_a_description(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Exact-secret redaction must still reach parser-emitted free text.
-    secret = "plain-credential-value"
-    monkeypatch.setattr(
-        server.os, "environ", {**os.environ, "GROSSER_ADLER_GITHUB_TOKEN": secret}
-    )
-    units, complete = server._parse_service_units(
-        f"nixer-mcp.service loaded active running desc {secret}\n", (secret,)
-    )
-    assert complete is True
-    assert units[0]["description"] == "desc <REDACTED>"
-
-
 def test_list_user_services_marks_bullet_and_malformed_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -479,13 +464,98 @@ def test_list_user_services_fails_closed_on_non_structural_state_columns(
     assert result["services"] == []
 
 
-def test_run_reports_parser_failure_without_returning_raw_output() -> None:
-    def explode(raw_stdout: str, exact_secrets: tuple[str, ...]):
-        raise RuntimeError("parser is broken")
+def test_systemd_reads_preserve_unit_identity_in_every_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for the sibling paths of audit finding 1: service_status and
+    # service_logs parse the same redacted text list_user_services does.
+    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
+    assert server._redact(unit) != unit
+    properties = "".join(
+        f"{key}={value}\n"
+        for key, value in (
+            ("LoadState", "loaded"),
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("Result", "success"),
+            ("ExecMainCode", "0"),
+            ("ExecMainStatus", "0"),
+            ("MainPID", "123"),
+            ("FragmentPath", f"/home/alex/.config/systemd/user/{unit}"),
+            ("NRestarts", "0"),
+            ("ActiveEnterTimestamp", "x"),
+            ("ExecMainStartTimestamp", "y"),
+            ("ControlGroup", f"/user.slice/app.slice/{unit}"),
+            ("MemoryCurrent", "1"),
+            ("TasksCurrent", "1"),
+            ("CPUUsageNSec", "1"),
+        )
+    )
+    _systemctl_stdout(monkeypatch, properties)
+    observation = server._observe_service_scope(unit, "user")
+    assert observation["observation_complete"] is True
+    assert observation["properties"]["FragmentPath"].endswith(unit)
+    assert observation["properties"]["ControlGroup"].endswith(unit)
 
-    result = server._run(["/usr/bin/true"], stdout_parser=explode)
-    assert result["parse_failed"] is True
-    assert result["parsed"] is None
+    _systemctl_stdout(monkeypatch, f"-- Logs begin --\nJan 01 00:00:00 host {unit}: started\n")
+    assert unit in server._run(["/usr/bin/journalctl"], preserve_unit_identity=True)["stdout"]
+
+
+def test_structured_unit_claim_matches_the_raw_source_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An auditor must be able to cross-check services[].unit against source.stdout.
+    unit = "grabowski-task-" + ("b" * 24) + "-a1.service"
+    token = "sk-" + ("c" * 30)
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Task api_key: {token}\n")
+    result = server.list_user_services()
+    assert result["services"][0]["unit"] == unit
+    assert unit in result["source"]["stdout"]
+    assert result["services"][0]["description"] == "Task <REDACTED>"
+    assert token not in json.dumps(result)
+
+
+def test_unit_name_exemption_is_structural_and_yields_to_exact_secrets() -> None:
+    unit = "grabowski-task-" + ("d" * 24) + "-a1.service"
+    # Exempt only a token that is a valid unit name in full.
+    assert server._redact_preserving_unit_names(unit) == unit
+    # A secret-shaped token without the .service suffix stays redacted, and so
+    # does free text on the same line as an exempt unit name.
+    assert server._redact_preserving_unit_names("sk-" + ("e" * 30)) == "<REDACTED>"
+    assert server._redact_preserving_unit_names("sk-" + ("e" * 30) + ".timer") == "<REDACTED>.timer"
+    line = server._redact_preserving_unit_names(f"{unit} desc api_key: " + "g" * 30)
+    assert line.startswith(unit)
+    assert line.endswith("<REDACTED>")
+    # A journal separator after the suffix must not suppress the exemption.
+    assert unit in server._redact_preserving_unit_names(f"host {unit}: started")
+    # A configured exact secret always wins over the structural exemption.
+    assert server._redact_preserving_unit_names(unit, exact_secrets=(unit,)) == "<REDACTED>"
+    # Documented residual risk: a deliberately credential-shaped unit name is
+    # reported verbatim, because unit identity is structural, not free text.
+    credential_shaped = "deploy-ghp_" + ("F" * 24) + ".service"
+    assert server._redact_preserving_unit_names(credential_shaped) == credential_shaped
+
+
+def test_list_user_services_never_returns_a_parsed_payload_past_the_output_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A parsed structure is evidence too: truncation must not be undone by it.
+    rows = "".join(
+        f"svc-{index:05d}.service loaded active running Description {index}\n"
+        for index in range(4000)
+    )
+    assert len(rows.encode("utf-8")) > server.MAX_OUTPUT_BYTES
+    _systemctl_stdout(monkeypatch, rows)
+    result = server.list_user_services()
+
+    assert result["source"]["stdout_truncated"] is True
+    assert result["observation_complete"] is False
+    assert result["parse_complete"] is False
+    assert result["services"] == []
+    # Nothing may reintroduce what truncation removed, in any field.
+    encoded = len(json.dumps(result).encode("utf-8"))
+    assert encoded < 2 * server.MAX_OUTPUT_BYTES
+    assert "svc-03999.service" not in json.dumps(result)
 
 
 def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
