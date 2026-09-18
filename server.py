@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import ctypes
 import fcntl
 import hashlib
@@ -12,6 +13,7 @@ import re
 import stat
 import subprocess
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -143,7 +145,9 @@ def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     return result
 
 
-def _secret_spans(text: str, exact_secrets: tuple[str, ...]) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+def _secret_spans(
+    text: str, exact_secrets: tuple[str, ...]
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     pattern_spans = [
         match.span()
         for pattern in _SECRET_PATTERNS
@@ -160,51 +164,115 @@ def _secret_spans(text: str, exact_secrets: tuple[str, ...]) -> tuple[list[tuple
     return pattern_spans, exact_spans
 
 
-def _redact_preserving_unit_names(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
-    """Redact free text while leaving syntactically valid systemd unit names intact.
+def _literal_spans(text: str, literals: tuple[str, ...]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for literal in literals:
+        if not literal:
+            continue
+        start = text.find(literal)
+        while start != -1:
+            spans.append((start, start + len(literal)))
+            start = text.find(literal, start + 1)
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for span in spans:
+        if merged and span[0] < merged[-1][1]:
+            continue
+        merged.append(span)
+    return merged
+
+
+class _SpanIndex:
+    """Sorted span lookup, so identity checks stay linear on large outputs.
+
+    A flat scan per candidate is quadratic: `ps` over a busy host produces one
+    secret-pattern false positive per row *and* one identity occurrence per row.
+    Spans are sorted by start and queried through a window bounded by the
+    longest span, so only spans that can actually overlap are examined.
+    """
+
+    __slots__ = ("_spans", "_starts", "_longest")
+
+    def __init__(self, spans: list[tuple[int, int]]) -> None:
+        self._spans = sorted(spans)
+        self._starts = [span[0] for span in self._spans]
+        self._longest = max((end - begin for begin, end in self._spans), default=0)
+
+    def overlaps(self, start: int, stop: int, *, must_exceed: bool = False) -> bool:
+        if not self._spans:
+            return False
+        first = bisect.bisect_left(self._starts, start - self._longest)
+        last = bisect.bisect_left(self._starts, stop)
+        for index in range(first, last):
+            begin, end = self._spans[index]
+            if begin < stop and end > start:
+                if not must_exceed or begin < start or end > stop:
+                    return True
+        return False
+
+
+def _redact_preserving_identity(
+    text: str,
+    *,
+    exact_secrets: tuple[str, ...] = (),
+    preserved_identity: tuple[str, ...] = (),
+) -> str:
+    """Redact free text while keeping named, already-validated identity intact.
 
     Secret patterns match inside legitimate unit names (`sk-` matches inside
     `grabowski-task-...`), and rewriting a unit name destroys the identity the
-    observer exists to report: the name would no longer match `_UNIT_RE`, no
-    longer agree between a structured claim and its raw receipt, and no longer
+    observer exists to report: it would no longer match `_UNIT_RE`, no longer
+    agree between a structured claim and its raw receipt, and no longer
     cross-check against `FragmentPath`, `ControlGroup` or the cgroup column of
     the process and socket views.
 
-    A token is exempt only when it is a complete unit name *and* every secret
-    match touching it lies entirely inside it, which is exactly the false
-    positive this addresses. A match that reaches beyond the token is a real
-    secret that merely happens to abut or contain a unit-shaped run, so the
-    token is left in the redacted text: `secret=sk-<24>.service` and
-    `api_key: abc.service` stay redacted. Any overlap with a configured exact
-    secret also disqualifies the token, including one straddling its boundary.
+    The exemption is bound to identity, never to shape. Callers pass the exact
+    unit names they already validated - the unit under observation, or the unit
+    column of a listing - and only literal occurrences of those strings are
+    preserved. Text that merely looks like a unit name is redacted normally, so
+    a credential in arbitrary journal output stays redacted even when it is
+    followed by `.service`.
 
-    Accepted and documented residual risk: a unit deliberately named with a
-    credential-shaped substring, and nothing else on the line, is reported
-    verbatim. Creating such a unit already requires code execution as this user.
+    An occurrence is still dropped from the exemption when a configured exact
+    secret overlaps it, or when a secret pattern match reaches beyond it, since
+    such a match is a real secret rather than the in-name false positive.
     """
+    if not preserved_identity:
+        return _redact(text, exact_secrets=exact_secrets)
     pattern_spans, exact_spans = _secret_spans(text, exact_secrets)
-    exempt: list[tuple[int, int]] = []
-    for match in _UNIT_TOKEN_RE.finditer(text):
-        start, stop = match.span()
-        if _UNIT_RE.fullmatch(match.group(0)) is None:
-            continue
-        if any(begin < stop and end > start for begin, end in exact_spans):
-            continue
-        if any(
-            begin < stop and end > start and (begin < start or end > stop)
-            for begin, end in pattern_spans
-        ):
-            continue
-        exempt.append((start, stop))
-
+    exact_index = _SpanIndex(exact_spans)
+    pattern_index = _SpanIndex(pattern_spans)
     parts: list[str] = []
     last = 0
-    for start, stop in exempt:
+    for start, stop in _literal_spans(text, preserved_identity):
+        if exact_index.overlaps(start, stop):
+            continue
+        if pattern_index.overlaps(start, stop, must_exceed=True):
+            continue
         parts.append(_redact(text[last:start], exact_secrets=exact_secrets))
         parts.append(text[start:stop])
         last = stop
     parts.append(_redact(text[last:], exact_secrets=exact_secrets))
     return "".join(parts)
+
+
+def _listed_unit_names(text: str) -> tuple[str, ...]:
+    """Collect unit names from the identity column of `systemctl list-units`.
+
+    Only the first column of a row can be a unit name, so a credential
+    elsewhere on the line is never turned into preserved identity.
+    """
+    names: list[str] = []
+    for raw in text.splitlines():
+        row = raw.strip()
+        if not row:
+            continue
+        if row.startswith("\u25cf"):
+            row = row[1:].lstrip()
+        candidate = row.split(None, 1)[0] if row.split(None, 1) else ""
+        if _UNIT_RE.fullmatch(candidate) is not None:
+            names.append(candidate)
+    return tuple(dict.fromkeys(names))
 
 
 def _bounded(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]:
@@ -220,7 +288,8 @@ def _run(
     *,
     cwd: Path | None = None,
     timeout: int = 15,
-    preserve_unit_identity: bool = False,
+    preserved_identity: tuple[str, ...] = (),
+    identity_extractor: Callable[[str], tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     if not argv or not argv[0].startswith("/usr/bin/"):
         raise ValueError("only fixed absolute /usr/bin executables are allowed")
@@ -258,17 +327,26 @@ def _run(
         check=False,
     )
     exact_secrets = (gh_token,) if gh_token else ()
-    # systemd and journal output carries unit names as structural identity in
-    # every column, so those reads preserve unit tokens; everything else, and
-    # all free text in these reads, stays under the default redaction.
-    redactor = _redact_preserving_unit_names if preserve_unit_identity else _redact
-    stdout, stdout_truncated = _bounded(
-        redactor(completed.stdout, exact_secrets=exact_secrets)
-    )
-    stderr, stderr_truncated = _bounded(
-        redactor(completed.stderr, exact_secrets=exact_secrets),
-        32_000,
-    )
+    # systemd and journal reads name the exact units whose identity must
+    # survive; everything else in those streams stays under normal redaction.
+    identity = preserved_identity
+    if identity_extractor is not None:
+        # Derived names are used only to preserve literals inside otherwise
+        # redacted text; nothing derived is returned to the caller.
+        try:
+            identity = identity + tuple(identity_extractor(completed.stdout))
+        except Exception:
+            identity = preserved_identity
+
+    def redact(value: str) -> str:
+        return _redact_preserving_identity(
+            value,
+            exact_secrets=exact_secrets,
+            preserved_identity=identity,
+        )
+
+    stdout, stdout_truncated = _bounded(redact(completed.stdout))
+    stderr, stderr_truncated = _bounded(redact(completed.stderr), 32_000)
     return {
         "returncode": completed.returncode,
         "stdout": stdout,
@@ -425,10 +503,6 @@ def _split_github_repo(repo: str) -> tuple[str, str]:
         raise ValueError("GitHub repository segment is invalid")
     return owner, name
 
-
-def _validate_github_repo(repo: str) -> str:
-    owner, name = _split_github_repo(repo)
-    return f"{owner}/{name}"
 
 
 def _validate_revision(revision: str) -> str:
@@ -609,7 +683,7 @@ def list_user_services() -> dict[str, Any]:
     result = _run(
         ["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"],
         timeout=20,
-        preserve_unit_identity=True,
+        identity_extractor=_listed_unit_names,
     )
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     units: list[dict[str, str]] = []
@@ -646,7 +720,7 @@ def _service_show_argv(unit: str, scope: Literal["user", "system"]) -> list[str]
 
 
 def _observe_service_scope(unit: str, scope: Literal["user", "system"]) -> dict[str, Any]:
-    result = _run(_service_show_argv(unit, scope), preserve_unit_identity=True)
+    result = _run(_service_show_argv(unit, scope), preserved_identity=(unit,))
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     properties: dict[str, str] = {}
     parse_complete = False
@@ -757,11 +831,11 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
     if not isinstance(control_group, str) or not control_group.strip():
         raise ValueError("control_group must be non-empty")
     # The cgroup column is compared against systemd's ControlGroup, so both
-    # sides must preserve unit identity or _cgroup_within never matches.
+    # sides must preserve that exact path or _cgroup_within never matches.
     table = _run([
         "/usr/bin/ps", "-ww", "-eo",
         "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,comm=,cgroup=",
-    ], timeout=20, preserve_unit_identity=True)
+    ], timeout=20, preserved_identity=(control_group,))
     source_complete = table["returncode"] == 0 and not table["stdout_truncated"]
     rows: list[dict[str, Any]] = []
     parse_complete = False
@@ -826,7 +900,11 @@ def service_runtime(unit: str) -> dict[str, Any]:
             missing.append("process_tree")
 
     # Same cgroup comparison, same requirement.
-    sockets = _run(["/usr/bin/ss", "-H", "-lntue"], timeout=20, preserve_unit_identity=True)
+    sockets = _run(
+        ["/usr/bin/ss", "-H", "-lntue"],
+        timeout=20,
+        preserved_identity=(control_group,) if control_group else (),
+    )
     socket_lines = [line for line in sockets["stdout"].splitlines() if line.strip()]
     sockets_source_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
     socket_cgroups: list[tuple[str, str]] = []
@@ -902,7 +980,7 @@ def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     else:
         argv.append("--system")
     argv.extend(["-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso"])
-    result = _run(argv, timeout=20, preserve_unit_identity=True)
+    result = _run(argv, timeout=20, preserved_identity=(safe_unit,))
     diagnostics_present = bool(result["stderr"].strip())
     observation_complete = (
         result["returncode"] == 0

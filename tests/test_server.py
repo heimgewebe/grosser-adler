@@ -147,7 +147,6 @@ def test_github_read_fails_closed_without_dedicated_credential(monkeypatch: pyte
     ],
 )
 def test_github_repo_accepts_canonical_owner_and_name(repo: str) -> None:
-    assert server._validate_github_repo(repo) == repo
     owner, name = server._split_github_repo(repo)
     assert f"{owner}/{name}" == repo
 
@@ -181,15 +180,13 @@ def test_github_repo_accepts_canonical_owner_and_name(repo: str) -> None:
 )
 def test_github_repo_rejects_traversal_and_boundary_tricks(repo: str) -> None:
     with pytest.raises(ValueError):
-        server._validate_github_repo(repo)
-    with pytest.raises(ValueError):
         server._split_github_repo(repo)
 
 
 def test_github_repo_rejects_non_string() -> None:
     for value in (None, 7, ["heimgewebe", "grosser-adler"]):
         with pytest.raises(ValueError):
-            server._validate_github_repo(value)
+            server._split_github_repo(value)
 
 
 def test_accepted_github_repo_cannot_escape_the_repos_api_prefix() -> None:
@@ -498,7 +495,8 @@ def test_systemd_reads_preserve_unit_identity_in_every_column(
     assert observation["properties"]["ControlGroup"].endswith(unit)
 
     _systemctl_stdout(monkeypatch, f"-- Logs begin --\nJan 01 00:00:00 host {unit}: started\n")
-    assert unit in server._run(["/usr/bin/journalctl"], preserve_unit_identity=True)["stdout"]
+    logs = server._run(["/usr/bin/journalctl"], preserved_identity=(unit,))
+    assert unit in logs["stdout"]
 
 
 def test_structured_unit_claim_matches_the_raw_source_evidence(
@@ -513,6 +511,72 @@ def test_structured_unit_claim_matches_the_raw_source_evidence(
     assert unit in result["source"]["stdout"]
     assert result["services"][0]["description"] == "Task <REDACTED>"
     assert token not in json.dumps(result)
+
+
+def test_identity_exemption_is_bound_to_named_units_not_to_shape() -> None:
+    unit = "grabowski-task-" + ("d" * 24) + "-a1.service"
+    # The named, already-validated unit survives verbatim.
+    assert server._redact(unit) != unit
+    assert server._redact_preserving_identity(unit, preserved_identity=(unit,)) == unit
+    assert (
+        server._redact_preserving_identity(f"host {unit}: started", preserved_identity=(unit,))
+        == f"host {unit}: started"
+    )
+    # Nothing is exempt merely for looking like a unit name. These reach the
+    # caller through service_logs, which returns arbitrary application text.
+    leaky = [
+        "api_key:abc.service",
+        "api_key: abc.service",
+        "secret:sk-" + ("A" * 24) + ".service",
+        "ghp_" + ("A" * 24) + ".service",
+        "sk-" + ("A" * 24) + ".service",
+        "github_pat_" + ("A" * 24) + ".service",
+        "token=my-thing.service-secret",
+    ]
+    for probe in leaky:
+        assert "<REDACTED>" in server._redact(probe)
+        assert "<REDACTED>" in server._redact_preserving_identity(
+            probe, preserved_identity=(unit,)
+        )
+
+
+def test_identity_exemption_yields_to_exact_and_spanning_secrets() -> None:
+    unit = "grabowski-task-" + ("e" * 24) + "-a1.service"
+    # A configured exact secret always wins, including one straddling the name.
+    assert server._redact_preserving_identity(
+        unit, exact_secrets=(unit,), preserved_identity=(unit,)
+    ) == "<REDACTED>"
+    straddling = f"tok-{unit}-tail"
+    assert server._redact_preserving_identity(
+        straddling, exact_secrets=(straddling,), preserved_identity=(unit,)
+    ) == "<REDACTED>"
+    # A pattern match reaching beyond the name is a real secret, not the
+    # in-name false positive, so the name is not exempted out of it.
+    spanning = f"password={unit}"
+    assert "<REDACTED>" in server._redact_preserving_identity(
+        spanning, preserved_identity=(unit,)
+    )
+
+
+def test_listed_unit_names_only_trusts_the_identity_column() -> None:
+    unit = "grabowski-task-" + ("f" * 24) + "-a1.service"
+    credential = "ghp_" + ("A" * 24) + ".service"
+    text = f"{unit} loaded active running desc {credential}\n\u25cf {unit} loaded active running d\n"
+    assert server._listed_unit_names(text) == (unit,)
+    # A credential in the description column never becomes preserved identity.
+    assert credential not in server._listed_unit_names(text)
+
+
+def test_list_user_services_redacts_a_credential_in_the_description_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "grabowski-task-" + ("g" * 24) + "-a1.service"
+    credential = "ghp_" + ("A" * 24) + ".service"
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Task {credential}\n")
+    result = server.list_user_services()
+    assert result["services"][0]["unit"] == unit
+    assert unit in result["source"]["stdout"]
+    assert credential not in json.dumps(result)
 
 
 def test_service_runtime_correlates_a_secret_shaped_unit_across_ps_and_ss(
@@ -571,49 +635,6 @@ def test_service_runtime_correlates_a_secret_shaped_unit_across_ps_and_ss(
     assert len(result["listeners"]) == 1
     assert result["missing_evidence"] == []
     assert result["complete"] is True
-
-
-def test_unit_exemption_never_suppresses_a_secret_that_spans_the_token() -> None:
-    # A secret match reaching beyond the unit-shaped run is a real secret, and
-    # splitting the text around an exempt token must not hide it.
-    spanning = [
-        "secret=sk-" + ("A" * 24) + ".service",
-        "api_key: abc.service",
-        "token=my-thing.service-secret",
-        "Set secret=/run/user/1000/creds/foo.service-key",
-    ]
-    for probe in spanning:
-        assert "<REDACTED>" in server._redact(probe)
-        assert "<REDACTED>" in server._redact_preserving_unit_names(probe)
-
-    unit = "grabowski-task-" + ("b" * 24) + "-a1.service"
-    straddling = f"tok-{unit}-tail"
-    assert server._redact_preserving_unit_names(
-        straddling, exact_secrets=(straddling,)
-    ) == "<REDACTED>"
-    # The false positive this exists for is still exempt.
-    assert server._redact_preserving_unit_names(unit) == unit
-
-
-def test_unit_name_exemption_is_structural_and_yields_to_exact_secrets() -> None:
-    unit = "grabowski-task-" + ("d" * 24) + "-a1.service"
-    # Exempt only a token that is a valid unit name in full.
-    assert server._redact_preserving_unit_names(unit) == unit
-    # A secret-shaped token without the .service suffix stays redacted, and so
-    # does free text on the same line as an exempt unit name.
-    assert server._redact_preserving_unit_names("sk-" + ("e" * 30)) == "<REDACTED>"
-    assert server._redact_preserving_unit_names("sk-" + ("e" * 30) + ".timer") == "<REDACTED>.timer"
-    line = server._redact_preserving_unit_names(f"{unit} desc api_key: " + "g" * 30)
-    assert line.startswith(unit)
-    assert line.endswith("<REDACTED>")
-    # A journal separator after the suffix must not suppress the exemption.
-    assert unit in server._redact_preserving_unit_names(f"host {unit}: started")
-    # A configured exact secret always wins over the structural exemption.
-    assert server._redact_preserving_unit_names(unit, exact_secrets=(unit,)) == "<REDACTED>"
-    # Documented residual risk: a deliberately credential-shaped unit name is
-    # reported verbatim, because unit identity is structural, not free text.
-    credential_shaped = "deploy-ghp_" + ("F" * 24) + ".service"
-    assert server._redact_preserving_unit_names(credential_shaped) == credential_shaped
 
 
 def test_list_user_services_never_returns_a_parsed_payload_past_the_output_bound(
