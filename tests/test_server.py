@@ -144,12 +144,18 @@ def test_github_pr_requests_base_oid(monkeypatch: pytest.MonkeyPatch) -> None:
         return {"returncode": 0, "stdout": "{}", "stderr": ""}
 
     monkeypatch.setattr(server, "_run", fake_run)
-    server.github_pr("heimgewebe/grosser-adler", 2)
+    result = server.github_pr("heimgewebe/grosser-adler", 2)
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     fields = calls[0][calls[0].index("--json") + 1].split(",")
     assert "headRefOid" in fields
     assert "baseRefOid" in fields
+    assert calls[1][2] == "repos/heimgewebe/grosser-adler/pulls/2/reviews"
+    assert calls[1][-1] == "--paginate"
+    assert calls[2][2] == "repos/heimgewebe/grosser-adler/pulls/2/comments"
+    assert calls[2][-1] == "--paginate"
+    assert result["review_comments"]["returncode"] == 0
+    assert "inline review comments" in (server.github_pr.__doc__ or "")
 
 
 def test_deploy_templates_keep_credentials_separate() -> None:

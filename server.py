@@ -468,7 +468,7 @@ def git_show(repo: str, revision: str = "HEAD") -> dict[str, Any]:
 
 @mcp.tool(name="github_pr", annotations=READ_ANNOTATIONS)
 def github_pr(repo: str, pr: int) -> dict[str, Any]:
-    """Read live GitHub pull-request metadata, reviews and checks without mutation authority."""
+    """Read live GitHub PR metadata, review submissions, inline review comments and checks read-only."""
     gh_repo = _validate_github_repo(repo)
     if not isinstance(pr, int) or isinstance(pr, bool) or not 1 <= pr <= 2_147_483_647:
         raise ValueError("invalid pull request number")
@@ -479,7 +479,17 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     reviews = _run([
         "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/reviews", "--paginate",
     ], timeout=20)
-    return {"repo": gh_repo, "pr": pr, "metadata": metadata, "reviews": reviews, "observed_at": _utc_now()}
+    review_comments = _run([
+        "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/comments", "--paginate",
+    ], timeout=20)
+    return {
+        "repo": gh_repo,
+        "pr": pr,
+        "metadata": metadata,
+        "reviews": reviews,
+        "review_comments": review_comments,
+        "observed_at": _utc_now(),
+    }
 
 
 @mcp.tool(name="list_user_services", annotations=READ_ANNOTATIONS)
