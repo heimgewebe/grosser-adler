@@ -515,6 +515,86 @@ def test_structured_unit_claim_matches_the_raw_source_evidence(
     assert token not in json.dumps(result)
 
 
+def test_service_runtime_correlates_a_secret_shaped_unit_across_ps_and_ss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ControlGroup, the ps cgroup column and the ss cgroup field are compared
+    # against each other, so all three must redact identically or the process
+    # tree and listeners silently vanish for exactly the canonical task units.
+    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
+    assert server._redact(unit) != unit
+    control_group = f"/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}"
+    properties = "".join(
+        f"{key}={value}\n"
+        for key, value in (
+            ("LoadState", "loaded"),
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("Result", "success"),
+            ("ExecMainCode", "0"),
+            ("ExecMainStatus", "0"),
+            ("MainPID", "4242"),
+            ("FragmentPath", f"/home/alex/.config/systemd/user/{unit}"),
+            ("NRestarts", "0"),
+            ("ActiveEnterTimestamp", "x"),
+            ("ExecMainStartTimestamp", "y"),
+            ("ControlGroup", control_group),
+            ("MemoryCurrent", "1"),
+            ("TasksCurrent", "1"),
+            ("CPUUsageNSec", "1"),
+        )
+    )
+    absent = properties.replace("LoadState=loaded", "LoadState=not-found")
+    process_row = f" 4242    1 {os.getuid()} Ss 10 100 0.1 python 0::{control_group}\n"
+    socket_row = (
+        f"tcp LISTEN 0 128 127.0.0.1:18186 0.0.0.0:* uid:1000 cgroup:{control_group}\n"
+    )
+
+    def fake_run(argv, **kwargs):
+        joined = " ".join(argv)
+        if "/usr/bin/ps" in joined:
+            stdout = process_row
+        elif "/usr/bin/ss" in joined:
+            stdout = socket_row
+        elif "--user" in argv:
+            stdout = properties
+        else:
+            stdout = absent
+        return server.subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: fake_run(a[0], **k))
+    result = server.service_runtime(unit)
+
+    assert result["control_group"] == control_group
+    assert len(result["processes"]) == 1
+    assert result["processes"][0]["pid"] == 4242
+    assert len(result["listeners"]) == 1
+    assert result["missing_evidence"] == []
+    assert result["complete"] is True
+
+
+def test_unit_exemption_never_suppresses_a_secret_that_spans_the_token() -> None:
+    # A secret match reaching beyond the unit-shaped run is a real secret, and
+    # splitting the text around an exempt token must not hide it.
+    spanning = [
+        "secret=sk-" + ("A" * 24) + ".service",
+        "api_key: abc.service",
+        "token=my-thing.service-secret",
+        "Set secret=/run/user/1000/creds/foo.service-key",
+    ]
+    for probe in spanning:
+        assert "<REDACTED>" in server._redact(probe)
+        assert "<REDACTED>" in server._redact_preserving_unit_names(probe)
+
+    unit = "grabowski-task-" + ("b" * 24) + "-a1.service"
+    straddling = f"tok-{unit}-tail"
+    assert server._redact_preserving_unit_names(
+        straddling, exact_secrets=(straddling,)
+    ) == "<REDACTED>"
+    # The false positive this exists for is still exempt.
+    assert server._redact_preserving_unit_names(unit) == unit
+
+
 def test_unit_name_exemption_is_structural_and_yields_to_exact_secrets() -> None:
     unit = "grabowski-task-" + ("d" * 24) + "-a1.service"
     # Exempt only a token that is a valid unit name in full.

@@ -143,6 +143,23 @@ def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     return result
 
 
+def _secret_spans(text: str, exact_secrets: tuple[str, ...]) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    pattern_spans = [
+        match.span()
+        for pattern in _SECRET_PATTERNS
+        for match in pattern.finditer(text)
+    ]
+    exact_spans: list[tuple[int, int]] = []
+    for secret in exact_secrets:
+        if not secret:
+            continue
+        start = text.find(secret)
+        while start != -1:
+            exact_spans.append((start, start + len(secret)))
+            start = text.find(secret, start + 1)
+    return pattern_spans, exact_spans
+
+
 def _redact_preserving_unit_names(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     """Redact free text while leaving syntactically valid systemd unit names intact.
 
@@ -150,27 +167,42 @@ def _redact_preserving_unit_names(text: str, *, exact_secrets: tuple[str, ...] =
     `grabowski-task-...`), and rewriting a unit name destroys the identity the
     observer exists to report: the name would no longer match `_UNIT_RE`, no
     longer agree between a structured claim and its raw receipt, and no longer
-    cross-check against `FragmentPath` or `ControlGroup`.
+    cross-check against `FragmentPath`, `ControlGroup` or the cgroup column of
+    the process and socket views.
 
-    A token is exempt only if it fully matches `_UNIT_RE`, i.e. the strict unit
-    charset plus a `.service` suffix, and does not contain a configured exact
-    secret. This is structural identity from a local trusted interface, not a
-    naming-convention allowlist. Residual risk, accepted deliberately: a unit
-    deliberately named with a credential-shaped substring is reported verbatim.
-    Creating such a unit already requires code execution as this user, and
-    exact configured secrets are still redacted everywhere.
+    A token is exempt only when it is a complete unit name *and* every secret
+    match touching it lies entirely inside it, which is exactly the false
+    positive this addresses. A match that reaches beyond the token is a real
+    secret that merely happens to abut or contain a unit-shaped run, so the
+    token is left in the redacted text: `secret=sk-<24>.service` and
+    `api_key: abc.service` stay redacted. Any overlap with a configured exact
+    secret also disqualifies the token, including one straddling its boundary.
+
+    Accepted and documented residual risk: a unit deliberately named with a
+    credential-shaped substring, and nothing else on the line, is reported
+    verbatim. Creating such a unit already requires code execution as this user.
     """
+    pattern_spans, exact_spans = _secret_spans(text, exact_secrets)
+    exempt: list[tuple[int, int]] = []
+    for match in _UNIT_TOKEN_RE.finditer(text):
+        start, stop = match.span()
+        if _UNIT_RE.fullmatch(match.group(0)) is None:
+            continue
+        if any(begin < stop and end > start for begin, end in exact_spans):
+            continue
+        if any(
+            begin < stop and end > start and (begin < start or end > stop)
+            for begin, end in pattern_spans
+        ):
+            continue
+        exempt.append((start, stop))
+
     parts: list[str] = []
     last = 0
-    for match in _UNIT_TOKEN_RE.finditer(text):
-        token = match.group(0)
-        if _UNIT_RE.fullmatch(token) is None:
-            continue
-        if any(secret and secret in token for secret in exact_secrets):
-            continue
-        parts.append(_redact(text[last:match.start()], exact_secrets=exact_secrets))
-        parts.append(token)
-        last = match.end()
+    for start, stop in exempt:
+        parts.append(_redact(text[last:start], exact_secrets=exact_secrets))
+        parts.append(text[start:stop])
+        last = stop
     parts.append(_redact(text[last:], exact_secrets=exact_secrets))
     return "".join(parts)
 
@@ -724,10 +756,12 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
         raise ValueError("pid must be a positive integer")
     if not isinstance(control_group, str) or not control_group.strip():
         raise ValueError("control_group must be non-empty")
+    # The cgroup column is compared against systemd's ControlGroup, so both
+    # sides must preserve unit identity or _cgroup_within never matches.
     table = _run([
         "/usr/bin/ps", "-ww", "-eo",
         "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,comm=,cgroup=",
-    ], timeout=20)
+    ], timeout=20, preserve_unit_identity=True)
     source_complete = table["returncode"] == 0 and not table["stdout_truncated"]
     rows: list[dict[str, Any]] = []
     parse_complete = False
@@ -791,7 +825,8 @@ def service_runtime(unit: str) -> dict[str, Any]:
         if not process_observation["complete"]:
             missing.append("process_tree")
 
-    sockets = _run(["/usr/bin/ss", "-H", "-lntue"], timeout=20)
+    # Same cgroup comparison, same requirement.
+    sockets = _run(["/usr/bin/ss", "-H", "-lntue"], timeout=20, preserve_unit_identity=True)
     socket_lines = [line for line in sockets["stdout"].splitlines() if line.strip()]
     sockets_source_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
     socket_cgroups: list[tuple[str, str]] = []
