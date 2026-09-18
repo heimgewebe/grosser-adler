@@ -525,16 +525,21 @@ def test_redaction_never_merges_rows_across_a_newline(
         "c.service loaded active running Third unit\n",
     )
     result = server.list_user_services()
-    assert [item["unit"] for item in result["services"]] == [
-        "a.service",
-        "b.service",
-        "c.service",
-    ]
-    assert result["observation_complete"] is True
-    # Journal text is affected by the same pattern and must stay line-aligned.
-    assert server._redact("Jan 01 host: password:\nJan 02 host: next") == (
-        "Jan 01 host: password:\nJan 02 host: next"
-    )
+    # The row survives as a row: redaction re-emits the newline it spanned, so
+    # the next unit is never swallowed. Its name is consumed as the redacted
+    # value, which the structural parse reports as incomplete rather than
+    # silently returning a listing that is missing a unit.
+    assert result["source"]["rows_intact"] is True
+    assert len(result["source"]["stdout"].splitlines()) == 3
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+    # Journal text is affected by the same pattern. The value that follows the
+    # keyword is still redacted even across the newline, but the newline is
+    # re-emitted, so the second record stays a record instead of disappearing.
+    redacted = server._redact("Jan 01 host: password:\nJan 02 host: next")
+    assert len(redacted.splitlines()) == 2
+    assert "<REDACTED>" in redacted
+    assert "password:" not in redacted
     # Same-line assignments are still redacted, with or without whitespace.
     assert server._redact("password: hunter2") == "<REDACTED>"
     assert server._redact("api_key:abc123") == "<REDACTED>"
@@ -546,20 +551,89 @@ def test_list_user_services_fails_closed_if_redaction_merges_rows(
 ) -> None:
     # A multi-line private-key block legitimately collapses lines; the row-count
     # invariant must then refuse to publish a short inventory.
-    key = "-----BEGIN PRIVATE KEY-----\nAAA\n-----END PRIVATE KEY-----"
+    key = "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----"
     _systemctl_stdout(
         monkeypatch,
         f"a.service loaded active running {key}\nb.service loaded active running Second\n",
     )
     result = server.list_user_services()
-    assert result["observation_complete"] is False
-    assert result["services"] == []
-    assert key not in json.dumps(result)
+    # The block spans three lines; re-emitting its newlines keeps both units
+    # addressable instead of collapsing the listing.
+    assert [item["unit"] for item in result["services"]] == ["a.service", "b.service"]
+    assert result["observation_complete"] is True
+    assert "MIIabc" not in json.dumps(result)
 
 
-def test_run_reports_the_raw_row_count(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_reports_the_raw_row_count_and_proves_rows_survived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _systemctl_stdout(monkeypatch, "one\n\ntwo\nthree\n")
-    assert server._run(["/usr/bin/true"])["stdout_line_count"] == 3
+    result = server._run(["/usr/bin/true"])
+    assert result["stdout_line_count"] == 4
+    assert result["rows_intact"] is True
+
+    key = "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----"
+    _systemctl_stdout(monkeypatch, f"first\n{key}\nlast\n")
+    result = server._run(["/usr/bin/true"])
+    assert result["rows_intact"] is True
+    assert len(result["stdout"].splitlines()) == 5
+    assert "MIIabc" not in result["stdout"]
+
+
+def test_derived_identity_is_scoped_to_the_stream_it_was_read_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # list_user_services derives identity from the listing's first column.
+    # stderr was never inspected by that extractor, so it must not inherit the
+    # exemption.
+    credential_named_unit = "ghp_" + ("A" * 24) + ".service"
+    _systemctl_stdout(
+        monkeypatch,
+        f"{credential_named_unit} loaded active running desc\n",
+        stderr=f"warning {credential_named_unit}\n",
+    )
+    result = server.list_user_services()
+    assert credential_named_unit not in result["source"]["stderr"]
+    assert "<REDACTED>" in result["source"]["stderr"]
+    # Documented residual risk of the column-bound mode: a unit whose own name
+    # is credential-shaped is reported verbatim in the identity column.
+    assert result["services"][0]["unit"] == credential_named_unit
+
+
+def test_service_logs_fails_closed_when_redaction_changes_the_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "show" in argv:
+            stdout = (
+                _complete_service_show_fixture()
+                if "--user" in argv
+                else _missing_system_service_show_fixture()
+            )
+            return {
+                "returncode": 0,
+                "stdout": stdout,
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+        return {
+            "returncode": 0,
+            "stdout": "Jan 01 h u: a\n",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout_line_count": 3,
+            "rows_intact": False,
+        }
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_logs("nixer-mcp.service")
+    assert result["rows_intact"] is False
+    assert result["observation_complete"] is False
 
 
 def test_identity_exemption_is_bound_to_named_units_not_to_shape() -> None:

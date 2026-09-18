@@ -120,10 +120,7 @@ _SECRET_PATTERNS = (
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
-    # [ \t] rather than \s: with \s the value could start on the next line, so
-    # a line ending in "password:" swallowed the following line - dropping a
-    # whole evidence row while the result still looked complete.
-    re.compile(r"(?i)(authorization|api[_-]?key|token|password|secret)[ \t]*[:=][ \t]*[^\s,;]+"),
+    re.compile(r"(?i)(authorization|api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+"),
 )
 
 
@@ -131,13 +128,28 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _redaction_for(match: re.Match[str]) -> str:
+    """Replace a secret with a marker, keeping the line structure it spanned.
+
+    A match may legitimately cross newlines - a value written on the line after
+    its keyword, or a multi-line private-key block. Collapsing it would delete
+    evidence rows: a description ending in `password:` used to swallow the next
+    unit row, and a key block swallowed the journal lines it spanned, in both
+    cases leaving a result that still looked complete. Re-emitting the newlines
+    keeps every row addressable while the secret itself is gone.
+    """
+    return "<REDACTED>" + "\n" * match.group(0).count("\n")
+
+
 def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     result = text
     for secret in exact_secrets:
         if secret:
-            result = result.replace(secret, "<REDACTED>")
+            result = result.replace(
+                secret, "<REDACTED>" + "\n" * secret.count("\n")
+            )
     for pattern in _SECRET_PATTERNS:
-        result = pattern.sub("<REDACTED>", result)
+        result = pattern.sub(_redaction_for, result)
     return result
 
 
@@ -222,12 +234,21 @@ def _redact_preserving_identity(
     cross-check against `FragmentPath`, `ControlGroup` or the cgroup column of
     the process and socket views.
 
-    The exemption is bound to identity, never to shape. Callers pass the exact
-    unit names they already validated - the unit under observation, or the unit
-    column of a listing - and only literal occurrences of those strings are
-    preserved. Text that merely looks like a unit name is redacted normally, so
-    a credential in arbitrary journal output stays redacted even when it is
-    followed by `.service`.
+    The exemption is bound to named identity, never to shape found anywhere in
+    the text: callers pass exact strings and only literal occurrences of those
+    are preserved. A credential in arbitrary journal output therefore stays
+    redacted even when it is followed by `.service`.
+
+    Two binding modes exist. Most callers pass identity they validated before
+    the read - the unit under observation, or the exact control-group path they
+    are about to compare against. `list_user_services` cannot know the names in
+    advance and derives them from the identity column of the listing, which is
+    positional: only the first field of a row can be a unit name, so a
+    credential anywhere else on the line never becomes preserved identity.
+    Residual risk of that second mode, accepted deliberately: a unit whose own
+    name is credential-shaped is reported verbatim in that column. Creating
+    such a unit already requires code execution as this user, and a configured
+    exact secret still overrides the exemption.
 
     An occurrence is still dropped from the exemption when a configured exact
     secret overlaps it, or when a secret pattern match reaches beyond it, since
@@ -325,32 +346,40 @@ def _run(
     exact_secrets = (gh_token,) if gh_token else ()
     # systemd and journal reads name the exact units whose identity must
     # survive; everything else in those streams stays under normal redaction.
-    identity = preserved_identity
+    stdout_identity = preserved_identity
     if identity_extractor is not None:
-        # Derived names are used only to preserve literals inside otherwise
-        # redacted text; nothing derived is returned to the caller.
+        # Derived names are scoped to the stream they were read from; stderr
+        # was never inspected by the extractor, so it keeps caller-supplied
+        # identity only. Nothing derived is returned to the caller.
         try:
-            identity = identity + tuple(identity_extractor(completed.stdout))
+            stdout_identity = preserved_identity + tuple(
+                identity_extractor(completed.stdout)
+            )
         except Exception:
-            identity = preserved_identity
+            stdout_identity = preserved_identity
 
-    def redact(value: str) -> str:
+    def redact(value: str, identity: tuple[str, ...]) -> str:
         return _redact_preserving_identity(
             value,
             exact_secrets=exact_secrets,
             preserved_identity=identity,
         )
 
-    stdout, stdout_truncated = _bounded(redact(completed.stdout))
-    stderr, stderr_truncated = _bounded(redact(completed.stderr), 32_000)
+    stdout, stdout_truncated = _bounded(redact(completed.stdout, stdout_identity))
+    stderr, stderr_truncated = _bounded(
+        redact(completed.stderr, preserved_identity), 32_000
+    )
     return {
         "returncode": completed.returncode,
         "stdout": stdout,
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
-        # Raw row count, so a caller can prove redaction did not merge rows.
-        "stdout_line_count": sum(1 for line in completed.stdout.splitlines() if line.strip()),
+        # Raw row count plus the proof that redaction preserved it, so no
+        # caller has to reconstruct whether an evidence row disappeared.
+        "stdout_line_count": len(completed.stdout.splitlines()),
+        "rows_intact": stdout_truncated
+        or len(stdout.splitlines()) == len(completed.stdout.splitlines()),
     }
 
 
@@ -687,10 +716,7 @@ def list_user_services() -> dict[str, Any]:
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     # Redaction must never merge rows: a dropped unit would otherwise be
     # indistinguishable from a unit that does not exist.
-    rows_intact = (
-        sum(1 for line in result["stdout"].splitlines() if line.strip())
-        == result.get("stdout_line_count")
-    )
+    rows_intact = result.get("rows_intact", True)
     units: list[dict[str, str]] = []
     parse_complete = False
     if source_complete and rows_intact:
@@ -841,7 +867,11 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
         "/usr/bin/ps", "-ww", "-eo",
         "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,comm=,cgroup=",
     ], timeout=20, preserved_identity=(control_group,))
-    source_complete = table["returncode"] == 0 and not table["stdout_truncated"]
+    source_complete = (
+        table["returncode"] == 0
+        and not table["stdout_truncated"]
+        and table.get("rows_intact", True)
+    )
     rows: list[dict[str, Any]] = []
     parse_complete = False
     if source_complete:
@@ -987,17 +1017,20 @@ def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     argv.extend(["-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso"])
     result = _run(argv, timeout=20, preserved_identity=(safe_unit,))
     diagnostics_present = bool(result["stderr"].strip())
+    rows_intact = result.get("rows_intact", True)
     observation_complete = (
         result["returncode"] == 0
         and not result["stdout_truncated"]
         and not result["stderr_truncated"]
         and not diagnostics_present
+        and rows_intact
     )
     return {
         "unit": safe_unit,
         "scope": scope,
         "scope_selection_reason": status.get("scope_selection_reason"),
         "journal_diagnostics_present": diagnostics_present,
+        "rows_intact": rows_intact,
         "logs": result,
         "observation_complete": observation_complete,
         "observed_at": _utc_now(),
