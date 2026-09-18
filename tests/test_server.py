@@ -278,6 +278,51 @@ def test_process_reader_marks_unparseable_rows_incomplete(monkeypatch: pytest.Mo
     assert result["processes"] == []
 
 
+def test_redact_can_preserve_canonical_grabowski_task_unit_without_weakening_default_redaction() -> None:
+    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
+    token = "sk-" + ("b" * 24)
+    assert server._redact(unit) != unit
+    for prefix in ("", "  ", "● "):
+        assert server._redact(
+            f"{prefix}{unit} {token}",
+            protected_patterns=server._SAFE_REDACTION_LITERAL_PATTERNS,
+        ) == f"{prefix}{unit} <REDACTED>"
+    assert server._redact(
+        unit,
+        exact_secrets=(unit,),
+        protected_patterns=server._SAFE_REDACTION_LITERAL_PATTERNS,
+    ) == "<REDACTED>"
+
+
+def test_list_user_services_protects_only_unit_column_from_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    unit = "grabowski-task-" + ("c" * 24) + "-a2.service"
+    description_unit = "grabowski-task-" + ("e" * 24) + "-a3.service"
+    token = "sk-" + ("d" * 24)
+    raw_stdout = f"  {unit} loaded active running decoy {description_unit} token {token}\n"
+    raw_stderr = f"warning {description_unit}\n"
+
+    def fake_run(*args, **kwargs):
+        return server.subprocess.CompletedProcess(
+            args[0], 0, stdout=raw_stdout, stderr=raw_stderr
+        )
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    result = server.list_user_services()
+
+    assert result["observation_complete"] is True
+    assert result["services"] == [{
+        "unit": unit,
+        "load": "loaded",
+        "active": "active",
+        "sub": "running",
+        "description": "decoy grabowski-ta<REDACTED>.service token <REDACTED>",
+    }]
+    assert result["source"]["stdout"].startswith("  " + unit + " ")
+    assert description_unit not in result["source"]["stdout"]
+    assert description_unit not in result["source"]["stderr"]
+    assert token not in result["source"]["stdout"]
+
+
 def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     observations = [
         {"returncode": 0, "stdout": "nixer-mcp.service loaded active running Nixer\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False},
