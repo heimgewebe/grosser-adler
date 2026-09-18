@@ -513,6 +513,55 @@ def test_structured_unit_claim_matches_the_raw_source_evidence(
     assert token not in json.dumps(result)
 
 
+def test_redaction_never_merges_rows_across_a_newline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A description ending in "password:" used to swallow the next row, so a
+    # unit disappeared while the listing still claimed to be complete.
+    _systemctl_stdout(
+        monkeypatch,
+        "a.service loaded active running Nixer password:\n"
+        "b.service loaded active running Second unit\n"
+        "c.service loaded active running Third unit\n",
+    )
+    result = server.list_user_services()
+    assert [item["unit"] for item in result["services"]] == [
+        "a.service",
+        "b.service",
+        "c.service",
+    ]
+    assert result["observation_complete"] is True
+    # Journal text is affected by the same pattern and must stay line-aligned.
+    assert server._redact("Jan 01 host: password:\nJan 02 host: next") == (
+        "Jan 01 host: password:\nJan 02 host: next"
+    )
+    # Same-line assignments are still redacted, with or without whitespace.
+    assert server._redact("password: hunter2") == "<REDACTED>"
+    assert server._redact("api_key:abc123") == "<REDACTED>"
+    assert server._redact("Authorization\t=\tBearer-xyz") == "<REDACTED>"
+
+
+def test_list_user_services_fails_closed_if_redaction_merges_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A multi-line private-key block legitimately collapses lines; the row-count
+    # invariant must then refuse to publish a short inventory.
+    key = "-----BEGIN PRIVATE KEY-----\nAAA\n-----END PRIVATE KEY-----"
+    _systemctl_stdout(
+        monkeypatch,
+        f"a.service loaded active running {key}\nb.service loaded active running Second\n",
+    )
+    result = server.list_user_services()
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+    assert key not in json.dumps(result)
+
+
+def test_run_reports_the_raw_row_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    _systemctl_stdout(monkeypatch, "one\n\ntwo\nthree\n")
+    assert server._run(["/usr/bin/true"])["stdout_line_count"] == 3
+
+
 def test_identity_exemption_is_bound_to_named_units_not_to_shape() -> None:
     unit = "grabowski-task-" + ("d" * 24) + "-a1.service"
     # The named, already-validated unit survives verbatim.

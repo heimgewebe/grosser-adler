@@ -71,13 +71,6 @@ _GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
 _GITHUB_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
-# Anchors on the `.service` suffix and takes the whole preceding unit-charset
-# run. `:` is a legal unit-name character, so a trailing separator (as in a
-# journal line `... host some.service: started`) must not suppress the match;
-# \b ends the token at the suffix without consuming the separator.
-_UNIT_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_.@:-])[A-Za-z0-9_.@:-]{1,180}?\.service\b"
-)
 _LANE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _LANE_SUBJECT_RE = re.compile(r"^lane:([0-9a-f]{32})$")
 _FINDING_ID_RE = re.compile(r"^ga-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
@@ -127,7 +120,10 @@ _SECRET_PATTERNS = (
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
-    re.compile(r"(?i)(authorization|api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+"),
+    # [ \t] rather than \s: with \s the value could start on the next line, so
+    # a line ending in "password:" swallowed the following line - dropping a
+    # whole evidence row while the result still looked complete.
+    re.compile(r"(?i)(authorization|api[_-]?key|token|password|secret)[ \t]*[:=][ \t]*[^\s,;]+"),
 )
 
 
@@ -353,6 +349,8 @@ def _run(
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
+        # Raw row count, so a caller can prove redaction did not merge rows.
+        "stdout_line_count": sum(1 for line in completed.stdout.splitlines() if line.strip()),
     }
 
 
@@ -646,8 +644,9 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
 def _parse_service_units(text: str) -> tuple[list[dict[str, str]], bool]:
     """Parse `systemctl list-units` rows.
 
-    The unit column survives redaction because systemd reads use
-    `_redact_preserving_unit_names`, so the emitted unit identity is byte-exact
+    The unit column survives redaction because systemd reads pass their
+    validated identity to `_redact_preserving_identity`, so the emitted unit
+    identity is byte-exact
     and identical to the raw source evidence in the same response. Load, active
     and sub are structural systemd state tokens and are checked against that
     vocabulary; the description stays free text under normal redaction.
@@ -686,9 +685,15 @@ def list_user_services() -> dict[str, Any]:
         identity_extractor=_listed_unit_names,
     )
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    # Redaction must never merge rows: a dropped unit would otherwise be
+    # indistinguishable from a unit that does not exist.
+    rows_intact = (
+        sum(1 for line in result["stdout"].splitlines() if line.strip())
+        == result.get("stdout_line_count")
+    )
     units: list[dict[str, str]] = []
     parse_complete = False
-    if source_complete:
+    if source_complete and rows_intact:
         units, parse_complete = _parse_service_units(result["stdout"])
     observation_complete = source_complete and parse_complete
     if not observation_complete:
