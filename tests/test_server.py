@@ -525,11 +525,10 @@ def test_redaction_never_merges_rows_across_a_newline(
         "c.service loaded active running Third unit\n",
     )
     result = server.list_user_services()
-    # The row survives as a row: redaction re-emits the newline it spanned, so
-    # the next unit is never swallowed. Its name is consumed as the redacted
-    # value, which the structural parse reports as incomplete rather than
-    # silently returning a listing that is missing a unit.
-    assert result["source"]["rows_intact"] is True
+    # The physical line break survives, but b.service's structured identity
+    # does not. rows_intact therefore fails even though the newline count still
+    # matches: physical line count alone is not a completeness proof.
+    assert result["source"]["rows_intact"] is False
     assert len(result["source"]["stdout"].splitlines()) == 3
     assert result["observation_complete"] is False
     assert result["services"] == []
@@ -562,6 +561,30 @@ def test_list_user_services_fails_closed_if_redaction_merges_rows(
     assert [item["unit"] for item in result["services"]] == ["a.service", "b.service"]
     assert result["observation_complete"] is True
     assert "MIIabc" not in json.dumps(result)
+
+
+def test_list_user_services_fails_closed_if_private_key_spans_complete_unit_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for a multi-line secret whose match starts in one unit row,
+    # consumes complete following unit rows, and ends inside another unit row.
+    raw = (
+        "a.service loaded active running -----BEGIN PRIVATE KEY-----\n"
+        "b.service loaded active running Second\n"
+        "c.service loaded active running -----END PRIVATE KEY-----\n"
+        "d.service loaded active running Fourth\n"
+    )
+    _systemctl_stdout(monkeypatch, raw)
+    result = server.list_user_services()
+
+    assert result["source"]["rows_intact"] is False
+    assert result["parse_complete"] is False
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+    encoded = json.dumps(result)
+    assert "PRIVATE KEY" not in encoded
+    assert "b.service" not in result["source"]["stdout"]
+    assert "c.service" not in result["source"]["stdout"]
 
 
 def test_run_reports_the_raw_row_count_and_proves_rows_survived(

@@ -347,16 +347,18 @@ def _run(
     # systemd and journal reads name the exact units whose identity must
     # survive; everything else in those streams stays under normal redaction.
     stdout_identity = preserved_identity
+    derived_stdout_identity: tuple[str, ...] = ()
+    structured_rows_intact = True
     if identity_extractor is not None:
         # Derived names are scoped to the stream they were read from; stderr
         # was never inspected by the extractor, so it keeps caller-supplied
         # identity only. Nothing derived is returned to the caller.
         try:
-            stdout_identity = preserved_identity + tuple(
-                identity_extractor(completed.stdout)
-            )
+            derived_stdout_identity = tuple(identity_extractor(completed.stdout))
+            stdout_identity = preserved_identity + derived_stdout_identity
         except Exception:
             stdout_identity = preserved_identity
+            structured_rows_intact = False
 
     def redact(value: str, identity: tuple[str, ...]) -> str:
         return _redact_preserving_identity(
@@ -365,7 +367,22 @@ def _run(
             preserved_identity=identity,
         )
 
-    stdout, stdout_truncated = _bounded(redact(completed.stdout, stdout_identity))
+    redacted_stdout = redact(completed.stdout, stdout_identity)
+    if identity_extractor is not None and structured_rows_intact:
+        # Equal newline counts are not a structural completeness proof: one
+        # multi-line secret can consume whole rows and re-emit their newlines
+        # as blanks. For structured streams, require the exact identity
+        # sequence seen before redaction to remain observable afterwards.
+        try:
+            structured_rows_intact = (
+                tuple(identity_extractor(redacted_stdout)) == derived_stdout_identity
+            )
+        except Exception:
+            structured_rows_intact = False
+    physical_rows_intact = (
+        len(redacted_stdout.splitlines()) == len(completed.stdout.splitlines())
+    )
+    stdout, stdout_truncated = _bounded(redacted_stdout)
     stderr, stderr_truncated = _bounded(
         redact(completed.stderr, preserved_identity), 32_000
     )
@@ -375,11 +392,10 @@ def _run(
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
-        # Raw row count plus the proof that redaction preserved it, so no
-        # caller has to reconstruct whether an evidence row disappeared.
+        # The structured proof is internal only; raw identities are never
+        # returned as an unbounded side channel.
         "stdout_line_count": len(completed.stdout.splitlines()),
-        "rows_intact": stdout_truncated
-        or len(stdout.splitlines()) == len(completed.stdout.splitlines()),
+        "rows_intact": physical_rows_intact and structured_rows_intact,
     }
 
 
