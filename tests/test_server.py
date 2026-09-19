@@ -303,7 +303,7 @@ def test_process_reader_is_internal_and_cgroup_bound(monkeypatch: pytest.MonkeyP
             ),
             "stderr": "",
             "stdout_truncated": False,
-            "stderr_truncated": False,
+            "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)
@@ -326,7 +326,7 @@ def test_process_reader_fails_closed_on_foreign_uid_cgroup_member(monkeypatch: p
             f"100 1 {own_uid} S 10 512 0.0 python 0::/user.slice/nixer\n"
             f"101 1 {own_uid + 1} S 8 256 0.0 foreign 0::/user.slice/nixer/helper\n"
         ),
-        "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+        "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
     })
     result = server._process_snapshot(100, "/user.slice/nixer")
     assert result["uid_complete"] is False
@@ -344,7 +344,7 @@ def test_process_reader_marks_unparseable_rows_incomplete(monkeypatch: pytest.Mo
         ),
         "stderr": "",
         "stdout_truncated": False,
-        "stderr_truncated": False,
+        "stderr_truncated": False, "rows_intact": True,
     })
     result = server._process_snapshot(100, "/user.slice/nixer")
     assert result["parse_complete"] is False
@@ -783,6 +783,77 @@ def test_service_runtime_correlates_a_secret_shaped_unit_across_ps_and_ss(
     assert result["complete"] is True
 
 
+def test_service_runtime_fails_closed_when_socket_redaction_drops_a_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "nixer-mcp.service"
+    control_group = "/user.slice/app.slice/nixer-mcp.service"
+    properties = "".join(
+        f"{key}={value}\n"
+        for key, value in (
+            ("LoadState", "loaded"),
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("Result", "success"),
+            ("ExecMainCode", "0"),
+            ("ExecMainStatus", "0"),
+            ("MainPID", "4242"),
+            ("FragmentPath", f"/home/alex/.config/systemd/user/{unit}"),
+            ("NRestarts", "0"),
+            ("ActiveEnterTimestamp", "x"),
+            ("ExecMainStartTimestamp", "y"),
+            ("ControlGroup", control_group),
+            ("MemoryCurrent", "1"),
+            ("TasksCurrent", "1"),
+            ("CPUUsageNSec", "1"),
+        )
+    )
+    absent = properties.replace("LoadState=loaded", "LoadState=not-found")
+    process_row = f"4242 1 {os.getuid()} Ss 10 100 0.1 python 0::{control_group}\n"
+    socket_row = (
+        f"tcp LISTEN 0 128 127.0.0.1:18186 0.0.0.0:* uid:1000 cgroup:{control_group}\n"
+    )
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/ps":
+            return {
+                "returncode": 0,
+                "stdout": process_row,
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "rows_intact": True,
+            }
+        if argv[0] == "/usr/bin/ss":
+            return {
+                "returncode": 0,
+                "stdout": socket_row,
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "rows_intact": False,
+            }
+        if argv[0] == "/usr/bin/systemctl":
+            return {
+                "returncode": 0,
+                "stdout": properties if "--user" in argv else absent,
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "rows_intact": True,
+            }
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_runtime(unit)
+
+    assert result["processes"][0]["pid"] == 4242
+    assert result["listeners"] == []
+    assert result["listener_observation_complete"] is False
+    assert "listeners" in result["missing_evidence"]
+    assert result["complete"] is False
+
+
 def test_list_user_services_never_returns_a_parsed_payload_past_the_output_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -807,8 +878,8 @@ def test_list_user_services_never_returns_a_parsed_payload_past_the_output_bound
 
 def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     observations = [
-        {"returncode": 0, "stdout": "nixer-mcp.service loaded active running Nixer\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False},
-        {"returncode": 1, "stdout": "", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False},
+        {"returncode": 0, "stdout": "nixer-mcp.service loaded active running Nixer\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False, "rows_intact": True},
+        {"returncode": 1, "stdout": "", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True},
     ]
     for observation in observations:
         monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
@@ -823,7 +894,7 @@ def test_list_user_services_fails_closed_on_unparseable_rows(monkeypatch: pytest
         "stdout": "nixer-mcp.service loaded active running Nixer\nmalformed-row\n",
         "stderr": "",
         "stdout_truncated": False,
-        "stderr_truncated": False,
+        "stderr_truncated": False, "rows_intact": True,
     })
     result = server.list_user_services()
     assert result["parse_complete"] is False
@@ -985,14 +1056,14 @@ def test_service_logs_uses_resolved_system_scope(monkeypatch: pytest.MonkeyPatch
                 )
             return {
                 "returncode": 0, "stdout": stdout, "stderr": "",
-                "stdout_truncated": False, "stderr_truncated": False,
+                "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         if argv[0] == "/usr/bin/journalctl":
             assert "--user" not in argv
             assert "--system" in argv
             return {
                 "returncode": 0, "stdout": "system-log\n", "stderr": "",
-                "stdout_truncated": False, "stderr_truncated": False,
+                "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
 
@@ -1021,7 +1092,7 @@ def test_service_logs_fails_closed_on_successful_journal_access_diagnostic(
             )
             return {
                 "returncode": 0, "stdout": stdout, "stderr": "",
-                "stdout_truncated": False, "stderr_truncated": False,
+                "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         if argv[0] == "/usr/bin/journalctl":
             return {
@@ -1029,7 +1100,7 @@ def test_service_logs_fails_closed_on_successful_journal_access_diagnostic(
                 "stdout": "",
                 "stderr": "Hint: journal access is restricted\n",
                 "stdout_truncated": False,
-                "stderr_truncated": False,
+                "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
 
@@ -1049,7 +1120,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
             return {
                 "returncode": 0,
                 "stdout": stdout,
-                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         if argv[0] == "/usr/bin/ps":
             return {
@@ -1059,7 +1130,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
                     f"101 100 {own_uid} S 60 1024 0.2 nix 0::/user.slice/nixer/child\n"
                     f"102 100 {own_uid} S 60 1024 0.2 stray 0::/user.slice/other\n"
                 ),
-                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         if argv[0] == "/usr/bin/ss":
             assert argv == ["/usr/bin/ss", "-H", "-lntue"]
@@ -1067,7 +1138,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
             return {
                 "returncode": 0,
                 "stdout": f'tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/user.slice/nixer <->\n',
-                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
@@ -1087,12 +1158,12 @@ def test_service_runtime_zero_listener_match_does_not_establish_absence(monkeypa
             stdout = (
                 _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
             )
-            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ps":
-            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ss":
             assert argv == ["/usr/bin/ss", "-H", "-lntue"]
-            return {"returncode": 0, "stdout": f"tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:* uid:{own_uid} ino:9 cgroup:/other <->\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:* uid:{own_uid} ino:9 cgroup:/other <->\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
     runtime = server.service_runtime("nixer-mcp.service")
@@ -1112,9 +1183,9 @@ def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkey
             stdout = (
                 _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
             )
-            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ps":
-            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ss":
             return {
                 "returncode": 0,
@@ -1122,7 +1193,7 @@ def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkey
                     f"tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/cg <->\n"
                     "tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:*\n"
                 ),
-                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
@@ -1142,11 +1213,11 @@ def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(mo
             stdout = (
                 _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
             )
-            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ps":
-            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ss":
-            return {"returncode": 0, "stdout": "", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": "", "stderr": "", "stdout_truncated": True, "stderr_truncated": False, "rows_intact": True}
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
     runtime = server.service_runtime("nixer-mcp.service")

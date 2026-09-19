@@ -732,7 +732,7 @@ def list_user_services() -> dict[str, Any]:
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
     # Redaction must never merge rows: a dropped unit would otherwise be
     # indistinguishable from a unit that does not exist.
-    rows_intact = result.get("rows_intact", True)
+    rows_intact = result["rows_intact"]
     units: list[dict[str, str]] = []
     parse_complete = False
     if source_complete and rows_intact:
@@ -886,7 +886,7 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
     source_complete = (
         table["returncode"] == 0
         and not table["stdout_truncated"]
-        and table.get("rows_intact", True)
+        and table["rows_intact"]
     )
     rows: list[dict[str, Any]] = []
     parse_complete = False
@@ -957,7 +957,11 @@ def service_runtime(unit: str) -> dict[str, Any]:
         preserved_identity=(control_group,) if control_group else (),
     )
     socket_lines = [line for line in sockets["stdout"].splitlines() if line.strip()]
-    sockets_source_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
+    sockets_source_complete = (
+        sockets["returncode"] == 0
+        and not sockets["stdout_truncated"]
+        and sockets["rows_intact"]
+    )
     socket_cgroups: list[tuple[str, str]] = []
     unattributed_socket_lines = 0
     if sockets_source_complete:
@@ -1033,7 +1037,7 @@ def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     argv.extend(["-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso"])
     result = _run(argv, timeout=20, preserved_identity=(safe_unit,))
     diagnostics_present = bool(result["stderr"].strip())
-    rows_intact = result.get("rows_intact", True)
+    rows_intact = result["rows_intact"]
     observation_complete = (
         result["returncode"] == 0
         and not result["stdout_truncated"]
