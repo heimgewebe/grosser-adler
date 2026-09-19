@@ -1647,9 +1647,18 @@ def test_inbox_snapshot_waits_for_external_inbox_store_lock(tmp_path: Path, monk
     })
     entered_projection = threading.Event()
     real_projection = server._current_lane_projection
-    def observed_projection(lane: str, checkpoint: str):
+    def observed_projection(
+        lane: str,
+        checkpoint: str,
+        *,
+        incremental_record=None,
+    ):
         entered_projection.set()
-        return real_projection(lane, checkpoint)
+        return real_projection(
+            lane,
+            checkpoint,
+            incremental_record=incremental_record,
+        )
     monkeypatch.setattr(server, "_current_lane_projection", observed_projection)
     lock_fd = server.os.open(target.parent, server.os.O_RDONLY | server.os.O_DIRECTORY | server.os.O_CLOEXEC)
     server.fcntl.flock(lock_fd, server.fcntl.LOCK_EX)
