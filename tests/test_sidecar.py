@@ -322,6 +322,84 @@ def test_other_checkpoint_is_not_projected_as_current(tmp_path: Path, monkeypatc
     assert not target.exists()
 
 
+def test_inbox_findings_are_ordered_by_severity_meaning_not_alphabetically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "6" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
+    # Submitted in an order that alphabetical sorting would not repair.
+    for severity in ("medium", "critical", "low", "high"):
+        server.submit_finding(
+            **_finding_args(
+                severity=severity, subject=f"lane:{lane_id}", checkpoint=OID_A
+            )
+        )
+    server.publish_worktree_inbox(lane_id)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert [item["severity"] for item in payload["findings"]] == [
+        "critical",
+        "high",
+        "medium",
+        "low",
+    ]
+
+
+def test_equal_severity_stays_deterministically_ordered_by_finding_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "7" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
+    for _ in range(4):
+        server.submit_finding(
+            **_finding_args(
+                severity="high", subject=f"lane:{lane_id}", checkpoint=OID_A
+            )
+        )
+    server.publish_worktree_inbox(lane_id)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    ids = [item["finding_id"] for item in payload["findings"]]
+    assert ids == sorted(ids)
+    assert len(ids) == 4
+
+
+def test_severity_rank_orders_every_contract_value_and_keeps_unknown_last() -> None:
+    assert server._SEVERITIES == ("critical", "high", "medium", "low")
+    ranks = [server._severity_rank(value) for value in server._SEVERITIES]
+    assert ranks == sorted(ranks) == [0, 1, 2, 3]
+    # Unknown or malformed values cannot reach the sort through a valid record;
+    # if one ever does it sorts last and stays visible rather than disappearing.
+    for unknown in ("moderate", "", None, 3, ["high"]):
+        assert server._severity_rank(unknown) == server._UNKNOWN_SEVERITY_RANK
+    assert server._UNKNOWN_SEVERITY_RANK > max(ranks)
+
+
+def test_unknown_severity_is_not_dropped_from_the_current_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = "8" * 32
+    server.submit_finding(
+        **_finding_args(severity="low", subject=f"lane:{lane_id}", checkpoint=OID_A)
+    )
+    findings = server._current_lane_findings(lane_id, OID_A)
+    findings.append({"severity": "moderate", "finding_id": "ga-unknown"})
+    findings.sort(
+        key=lambda item: (
+            server._severity_rank(item.get("severity")),
+            str(item.get("finding_id", "")),
+        )
+    )
+    assert findings[-1]["severity"] == "moderate"
+    assert len(findings) == 2
+    assert (state / "findings").is_dir()
+
+
 def test_free_text_secrets_are_redacted_before_persistence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     secret = "sk-proj-" + "A" * 24

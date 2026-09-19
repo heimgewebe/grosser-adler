@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import ctypes
 import fcntl
 import hashlib
@@ -12,6 +13,7 @@ import re
 import stat
 import subprocess
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -65,7 +67,8 @@ INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and ad
 
 mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
-_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+_GITHUB_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
 _LANE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -80,6 +83,9 @@ _LEGACY_STATUSES = {
     "missing_evidence", "risk", "advice", "recheck_required",
 }
 _LEGACY_BASE_STATUSES = {"observation", "finding", "recheck_suggested"}
+_SEVERITIES = ("critical", "high", "medium", "low")
+_SEVERITY_ORDER = {value: index for index, value in enumerate(_SEVERITIES)}
+_UNKNOWN_SEVERITY_RANK = len(_SEVERITIES)
 _LEGACY_ENRICHED_FIELDS = ("target_actor", "binding", "recommendation", "rationale", "confidence")
 _LEGACY_RELATIONAL_FIELDS = (
     "checkpoint_mode", "checkpoint_components", "checkpoint_set_sha256", "checkpoint_contract",
@@ -108,11 +114,7 @@ _SYSTEMD_SERVICE_PROPERTIES = (
 _SYSTEMD_SCOPES: tuple[Literal["user", "system"], ...] = ("user", "system")
 _SYSTEMD_RUNNING_ACTIVE_STATES = frozenset({"active", "reloading"})
 _SYSTEMD_TRANSITIONAL_ACTIVE_STATES = frozenset({"activating", "deactivating"})
-_SAFE_REDACTION_LITERAL_PATTERNS = (
-    re.compile(
-        r"(?m)^(?:●[ \t]+|[ \t]+)?grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service(?=[ \t])"
-    ),
-)
+_SYSTEMD_STATE_RE = re.compile(r"^[a-z][a-z-]{0,31}$")
 _SECRET_PATTERNS = (
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -126,31 +128,168 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _redact(
-    text: str,
-    *,
-    exact_secrets: tuple[str, ...] = (),
-    protected_patterns: tuple[re.Pattern[str], ...] = (),
-) -> str:
+def _redaction_for(match: re.Match[str]) -> str:
+    """Replace a secret with a marker, keeping the line structure it spanned.
+
+    A match may legitimately cross newlines - a value written on the line after
+    its keyword, or a multi-line private-key block. Collapsing it would delete
+    evidence rows: a description ending in `password:` used to swallow the next
+    unit row, and a key block swallowed the journal lines it spanned, in both
+    cases leaving a result that still looked complete. Re-emitting the newlines
+    keeps every row addressable while the secret itself is gone.
+    """
+    return "<REDACTED>" + "\n" * match.group(0).count("\n")
+
+
+def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     result = text
     for secret in exact_secrets:
         if secret:
-            result = result.replace(secret, "<REDACTED>")
-
-    protected_literals: list[str] = []
-
-    def protect_literal(match: re.Match[str]) -> str:
-        marker = f"\x00GROSSER_ADLER_SAFE_{len(protected_literals)}\x00"
-        protected_literals.append(match.group(0))
-        return marker
-
-    for pattern in protected_patterns:
-        result = pattern.sub(protect_literal, result)
+            result = result.replace(
+                secret, "<REDACTED>" + "\n" * secret.count("\n")
+            )
     for pattern in _SECRET_PATTERNS:
-        result = pattern.sub("<REDACTED>", result)
-    for index, literal in enumerate(protected_literals):
-        result = result.replace(f"\x00GROSSER_ADLER_SAFE_{index}\x00", literal)
+        result = pattern.sub(_redaction_for, result)
     return result
+
+
+def _secret_spans(
+    text: str, exact_secrets: tuple[str, ...]
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    pattern_spans = [
+        match.span()
+        for pattern in _SECRET_PATTERNS
+        for match in pattern.finditer(text)
+    ]
+    exact_spans: list[tuple[int, int]] = []
+    for secret in exact_secrets:
+        if not secret:
+            continue
+        start = text.find(secret)
+        while start != -1:
+            exact_spans.append((start, start + len(secret)))
+            start = text.find(secret, start + 1)
+    return pattern_spans, exact_spans
+
+
+def _literal_spans(text: str, literals: tuple[str, ...]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for literal in literals:
+        if not literal:
+            continue
+        start = text.find(literal)
+        while start != -1:
+            spans.append((start, start + len(literal)))
+            start = text.find(literal, start + 1)
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for span in spans:
+        if merged and span[0] < merged[-1][1]:
+            continue
+        merged.append(span)
+    return merged
+
+
+class _SpanIndex:
+    """Sorted span lookup, so identity checks stay linear on large outputs.
+
+    A flat scan per candidate is quadratic: `ps` over a busy host produces one
+    secret-pattern false positive per row *and* one identity occurrence per row.
+    Spans are sorted by start and queried through a window bounded by the
+    longest span, so only spans that can actually overlap are examined.
+    """
+
+    __slots__ = ("_spans", "_starts", "_longest")
+
+    def __init__(self, spans: list[tuple[int, int]]) -> None:
+        self._spans = sorted(spans)
+        self._starts = [span[0] for span in self._spans]
+        self._longest = max((end - begin for begin, end in self._spans), default=0)
+
+    def overlaps(self, start: int, stop: int, *, must_exceed: bool = False) -> bool:
+        if not self._spans:
+            return False
+        first = bisect.bisect_left(self._starts, start - self._longest)
+        last = bisect.bisect_left(self._starts, stop)
+        for index in range(first, last):
+            begin, end = self._spans[index]
+            if begin < stop and end > start:
+                if not must_exceed or begin < start or end > stop:
+                    return True
+        return False
+
+
+def _redact_preserving_identity(
+    text: str,
+    *,
+    exact_secrets: tuple[str, ...] = (),
+    preserved_identity: tuple[str, ...] = (),
+) -> str:
+    """Redact free text while keeping named, already-validated identity intact.
+
+    Secret patterns match inside legitimate unit names (`sk-` matches inside
+    `grabowski-task-...`), and rewriting a unit name destroys the identity the
+    observer exists to report: it would no longer match `_UNIT_RE`, no longer
+    agree between a structured claim and its raw receipt, and no longer
+    cross-check against `FragmentPath`, `ControlGroup` or the cgroup column of
+    the process and socket views.
+
+    The exemption is bound to named identity, never to shape found anywhere in
+    the text: callers pass exact strings and only literal occurrences of those
+    are preserved. A credential in arbitrary journal output therefore stays
+    redacted even when it is followed by `.service`.
+
+    Two binding modes exist. Most callers pass identity they validated before
+    the read - the unit under observation, or the exact control-group path they
+    are about to compare against. `list_user_services` cannot know the names in
+    advance and derives them from the identity column of the listing, which is
+    positional: only the first field of a row can be a unit name, so a
+    credential anywhere else on the line never becomes preserved identity.
+    Residual risk of that second mode, accepted deliberately: a unit whose own
+    name is credential-shaped is reported verbatim in that column. Creating
+    such a unit already requires code execution as this user, and a configured
+    exact secret still overrides the exemption.
+
+    An occurrence is still dropped from the exemption when a configured exact
+    secret overlaps it, or when a secret pattern match reaches beyond it, since
+    such a match is a real secret rather than the in-name false positive.
+    """
+    if not preserved_identity:
+        return _redact(text, exact_secrets=exact_secrets)
+    pattern_spans, exact_spans = _secret_spans(text, exact_secrets)
+    exact_index = _SpanIndex(exact_spans)
+    pattern_index = _SpanIndex(pattern_spans)
+    parts: list[str] = []
+    last = 0
+    for start, stop in _literal_spans(text, preserved_identity):
+        if exact_index.overlaps(start, stop):
+            continue
+        if pattern_index.overlaps(start, stop, must_exceed=True):
+            continue
+        parts.append(_redact(text[last:start], exact_secrets=exact_secrets))
+        parts.append(text[start:stop])
+        last = stop
+    parts.append(_redact(text[last:], exact_secrets=exact_secrets))
+    return "".join(parts)
+
+
+def _listed_unit_names(text: str) -> tuple[str, ...]:
+    """Collect unit names from the identity column of `systemctl list-units`.
+
+    Only the first column of a row can be a unit name, so a credential
+    elsewhere on the line is never turned into preserved identity.
+    """
+    names: list[str] = []
+    for raw in text.splitlines():
+        row = raw.strip()
+        if not row:
+            continue
+        if row.startswith("\u25cf"):
+            row = row[1:].lstrip()
+        candidate = row.split(None, 1)[0] if row.split(None, 1) else ""
+        if _UNIT_RE.fullmatch(candidate) is not None:
+            names.append(candidate)
+    return tuple(dict.fromkeys(names))
 
 
 def _bounded(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]:
@@ -166,7 +305,8 @@ def _run(
     *,
     cwd: Path | None = None,
     timeout: int = 15,
-    protected_stdout_redaction_patterns: tuple[re.Pattern[str], ...] = (),
+    preserved_identity: tuple[str, ...] = (),
+    identity_extractor: Callable[[str], tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     if not argv or not argv[0].startswith("/usr/bin/"):
         raise ValueError("only fixed absolute /usr/bin executables are allowed")
@@ -204,16 +344,47 @@ def _run(
         check=False,
     )
     exact_secrets = (gh_token,) if gh_token else ()
-    stdout, stdout_truncated = _bounded(
-        _redact(
-            completed.stdout,
+    # systemd and journal reads name the exact units whose identity must
+    # survive; everything else in those streams stays under normal redaction.
+    stdout_identity = preserved_identity
+    derived_stdout_identity: tuple[str, ...] = ()
+    structured_rows_intact = True
+    if identity_extractor is not None:
+        # Derived names are scoped to the stream they were read from; stderr
+        # was never inspected by the extractor, so it keeps caller-supplied
+        # identity only. Nothing derived is returned to the caller.
+        try:
+            derived_stdout_identity = tuple(identity_extractor(completed.stdout))
+            stdout_identity = preserved_identity + derived_stdout_identity
+        except Exception:
+            stdout_identity = preserved_identity
+            structured_rows_intact = False
+
+    def redact(value: str, identity: tuple[str, ...]) -> str:
+        return _redact_preserving_identity(
+            value,
             exact_secrets=exact_secrets,
-            protected_patterns=protected_stdout_redaction_patterns,
+            preserved_identity=identity,
         )
+
+    redacted_stdout = redact(completed.stdout, stdout_identity)
+    if identity_extractor is not None and structured_rows_intact:
+        # Equal newline counts are not a structural completeness proof: one
+        # multi-line secret can consume whole rows and re-emit their newlines
+        # as blanks. For structured streams, require the exact identity
+        # sequence seen before redaction to remain observable afterwards.
+        try:
+            structured_rows_intact = (
+                tuple(identity_extractor(redacted_stdout)) == derived_stdout_identity
+            )
+        except Exception:
+            structured_rows_intact = False
+    physical_rows_intact = (
+        len(redacted_stdout.splitlines()) == len(completed.stdout.splitlines())
     )
+    stdout, stdout_truncated = _bounded(redacted_stdout)
     stderr, stderr_truncated = _bounded(
-        _redact(completed.stderr, exact_secrets=exact_secrets),
-        32_000,
+        redact(completed.stderr, preserved_identity), 32_000
     )
     return {
         "returncode": completed.returncode,
@@ -221,6 +392,10 @@ def _run(
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
+        # The structured proof is internal only; raw identities are never
+        # returned as an unbounded side channel.
+        "stdout_line_count": len(completed.stdout.splitlines()),
+        "rows_intact": physical_rows_intact and structured_rows_intact,
     }
 
 
@@ -349,10 +524,28 @@ def _status_is_clean(status_stdout: str) -> bool:
     return bool(lines) and all(line.startswith("##") for line in lines)
 
 
-def _validate_github_repo(repo: str) -> str:
-    if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
+def _split_github_repo(repo: str) -> tuple[str, str]:
+    """Validate owner and name as separate path segments, never as one string.
+
+    Every accepted value must expand to exactly `repos/<owner>/<name>/...`:
+    the input carries exactly one separator, neither segment may traverse
+    (`.`, `..`), start an option (`-`), or contain an escape (`%`) that could
+    re-cross a segment boundary after URL handling.
+    """
+    if not isinstance(repo, str):
         raise ValueError("GitHub repo must be owner/name")
-    return repo
+    segments = repo.split("/")
+    if len(segments) != 2:
+        raise ValueError("GitHub repo must be owner/name")
+    owner, name = segments
+    if _GITHUB_OWNER_RE.fullmatch(owner) is None:
+        raise ValueError("GitHub owner segment is invalid")
+    if _GITHUB_REPO_NAME_RE.fullmatch(name) is None:
+        raise ValueError("GitHub repository segment is invalid")
+    if name.startswith("-") or set(name) <= {"."}:
+        raise ValueError("GitHub repository segment is invalid")
+    return owner, name
+
 
 
 def _validate_revision(revision: str) -> str:
@@ -469,7 +662,8 @@ def git_show(repo: str, revision: str = "HEAD") -> dict[str, Any]:
 @mcp.tool(name="github_pr", annotations=READ_ANNOTATIONS)
 def github_pr(repo: str, pr: int) -> dict[str, Any]:
     """Read live GitHub PR metadata, review submissions, inline review comments and checks read-only."""
-    gh_repo = _validate_github_repo(repo)
+    owner, name = _split_github_repo(repo)
+    gh_repo = f"{owner}/{name}"
     if not isinstance(pr, int) or isinstance(pr, bool) or not 1 <= pr <= 2_147_483_647:
         raise ValueError("invalid pull request number")
     metadata = _run([
@@ -477,10 +671,10 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
         "--json", "number,title,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,url,reviewDecision,statusCheckRollup",
     ], timeout=20)
     reviews = _run([
-        "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/reviews", "--paginate",
+        "/usr/bin/gh", "api", f"repos/{owner}/{name}/pulls/{pr}/reviews", "--paginate",
     ], timeout=20)
     review_comments = _run([
-        "/usr/bin/gh", "api", f"repos/{gh_repo}/pulls/{pr}/comments", "--paginate",
+        "/usr/bin/gh", "api", f"repos/{owner}/{name}/pulls/{pr}/comments", "--paginate",
     ], timeout=20)
     return {
         "repo": gh_repo,
@@ -492,28 +686,59 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     }
 
 
+def _parse_service_units(text: str) -> tuple[list[dict[str, str]], bool]:
+    """Parse bounded, already-redacted `systemctl list-units` rows.
+
+    `_run` performs redaction first and preserves only the identities extracted
+    from the raw listing's first column. This parser never receives privileged
+    raw stdout: it parses the bounded redacted receipt returned by `_run`.
+    The unit identity therefore remains byte-exact only because
+    `_redact_preserving_identity` left that validated first-column identity
+    intact. Load, active and sub are structural systemd state tokens and are
+    checked against that vocabulary; the description remains ordinary redacted
+    free text.
+    """
+    units: list[dict[str, str]] = []
+    complete = True
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        row = raw.strip()
+        if row.startswith("\u25cf"):
+            row = row[1:].lstrip()
+        parts = row.split(None, 4)
+        if len(parts) < 4 or not _UNIT_RE.fullmatch(parts[0]):
+            complete = False
+            continue
+        if any(_SYSTEMD_STATE_RE.fullmatch(part) is None for part in parts[1:4]):
+            complete = False
+            continue
+        units.append({
+            "unit": parts[0],
+            "load": parts[1],
+            "active": parts[2],
+            "sub": parts[3],
+            "description": parts[4] if len(parts) > 4 else "",
+        })
+    return units, complete
+
+
 @mcp.tool(name="list_user_services", annotations=READ_ANNOTATIONS)
 def list_user_services() -> dict[str, Any]:
     """Discover user-systemd services without a name allowlist or mutation authority."""
     result = _run(
         ["/usr/bin/systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"],
         timeout=20,
-        protected_stdout_redaction_patterns=_SAFE_REDACTION_LITERAL_PATTERNS,
+        identity_extractor=_listed_unit_names,
     )
     source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
-    parse_complete = source_complete
+    # Redaction must never merge rows: a dropped unit would otherwise be
+    # indistinguishable from a unit that does not exist.
+    rows_intact = result["rows_intact"]
     units: list[dict[str, str]] = []
-    if source_complete:
-        for raw in result["stdout"].splitlines():
-            if not raw.strip():
-                continue
-            parts = raw.strip().split(None, 4)
-            if parts and parts[0] == "●":
-                parts = parts[1:]
-            if len(parts) < 4 or not _UNIT_RE.fullmatch(parts[0]):
-                parse_complete = False
-                continue
-            units.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
+    parse_complete = False
+    if source_complete and rows_intact:
+        units, parse_complete = _parse_service_units(result["stdout"])
     observation_complete = source_complete and parse_complete
     if not observation_complete:
         units = []
@@ -544,8 +769,12 @@ def _service_show_argv(unit: str, scope: Literal["user", "system"]) -> list[str]
 
 
 def _observe_service_scope(unit: str, scope: Literal["user", "system"]) -> dict[str, Any]:
-    result = _run(_service_show_argv(unit, scope))
-    source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    result = _run(_service_show_argv(unit, scope), preserved_identity=(unit,))
+    source_complete = (
+        result["returncode"] == 0
+        and not result["stdout_truncated"]
+        and result["rows_intact"]
+    )
     properties: dict[str, str] = {}
     parse_complete = False
     if source_complete:
@@ -654,11 +883,17 @@ def _process_snapshot(pid: int, control_group: str) -> dict[str, Any]:
         raise ValueError("pid must be a positive integer")
     if not isinstance(control_group, str) or not control_group.strip():
         raise ValueError("control_group must be non-empty")
+    # The cgroup column is compared against systemd's ControlGroup, so both
+    # sides must preserve that exact path or _cgroup_within never matches.
     table = _run([
         "/usr/bin/ps", "-ww", "-eo",
         "pid=,ppid=,uid=,stat=,etimes=,rss=,pcpu=,comm=,cgroup=",
-    ], timeout=20)
-    source_complete = table["returncode"] == 0 and not table["stdout_truncated"]
+    ], timeout=20, preserved_identity=(control_group,))
+    source_complete = (
+        table["returncode"] == 0
+        and not table["stdout_truncated"]
+        and table["rows_intact"]
+    )
     rows: list[dict[str, Any]] = []
     parse_complete = False
     if source_complete:
@@ -721,9 +956,18 @@ def service_runtime(unit: str) -> dict[str, Any]:
         if not process_observation["complete"]:
             missing.append("process_tree")
 
-    sockets = _run(["/usr/bin/ss", "-H", "-lntue"], timeout=20)
+    # Same cgroup comparison, same requirement.
+    sockets = _run(
+        ["/usr/bin/ss", "-H", "-lntue"],
+        timeout=20,
+        preserved_identity=(control_group,) if control_group else (),
+    )
     socket_lines = [line for line in sockets["stdout"].splitlines() if line.strip()]
-    sockets_source_complete = sockets["returncode"] == 0 and not sockets["stdout_truncated"]
+    sockets_source_complete = (
+        sockets["returncode"] == 0
+        and not sockets["stdout_truncated"]
+        and sockets["rows_intact"]
+    )
     socket_cgroups: list[tuple[str, str]] = []
     unattributed_socket_lines = 0
     if sockets_source_complete:
@@ -797,19 +1041,22 @@ def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     else:
         argv.append("--system")
     argv.extend(["-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso"])
-    result = _run(argv, timeout=20)
+    result = _run(argv, timeout=20, preserved_identity=(safe_unit,))
     diagnostics_present = bool(result["stderr"].strip())
+    rows_intact = result["rows_intact"]
     observation_complete = (
         result["returncode"] == 0
         and not result["stdout_truncated"]
         and not result["stderr_truncated"]
         and not diagnostics_present
+        and rows_intact
     )
     return {
         "unit": safe_unit,
         "scope": scope,
         "scope_selection_reason": status.get("scope_selection_reason"),
         "journal_diagnostics_present": diagnostics_present,
+        "rows_intact": rows_intact,
         "logs": result,
         "observation_complete": observation_complete,
         "observed_at": _utc_now(),
@@ -1039,7 +1286,7 @@ def _validate_legacy_finding_payload(payload: dict[str, Any], path: Path) -> Non
     checkpoint = payload.get("checkpoint")
     if checkpoint is not None and (not isinstance(checkpoint, str) or len(checkpoint) > 500):
         raise RuntimeError("legacy finding checkpoint is invalid")
-    if payload.get("severity") not in {"low", "medium", "high", "critical"}:
+    if payload.get("severity") not in _SEVERITY_ORDER:
         raise RuntimeError("legacy finding severity is invalid")
     if payload.get("status") not in _LEGACY_STATUSES:
         raise RuntimeError("legacy finding status is invalid")
@@ -1154,7 +1401,7 @@ def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
 
     if payload.get("kind") not in {"observation", "risk", "contradiction", "missing_evidence", "advice"}:
         raise RuntimeError("V1 finding kind is invalid")
-    if payload.get("severity") not in {"low", "medium", "high", "critical"}:
+    if payload.get("severity") not in _SEVERITY_ORDER:
         raise RuntimeError("V1 finding severity is invalid")
     if payload.get("binding_strength") not in {"exact", "strong", "heuristic", "unbound"}:
         raise RuntimeError("V1 finding binding strength is invalid")
@@ -1265,6 +1512,19 @@ def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[st
     return records, errors
 
 
+def _severity_rank(value: Any) -> int:
+    """Order severities by meaning, never by string comparison.
+
+    Alphabetical ordering would place `medium` below `low`. Stored findings are
+    contract-validated against `_SEVERITIES`, so an unknown value cannot reach
+    this function through a valid record; should one appear, it sorts last and
+    stays visible rather than being silently dropped.
+    """
+    if not isinstance(value, str):
+        return _UNKNOWN_SEVERITY_RANK
+    return _SEVERITY_ORDER.get(value, _UNKNOWN_SEVERITY_RANK)
+
+
 def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]]:
     subject = f"lane:{lane_id}"
     loaded, errors = _load_finding_payloads()
@@ -1313,7 +1573,7 @@ def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]
         current.append(item)
     for path, payload in legacy_records:
         current.append(_finding_record_view(payload, path))
-    current.sort(key=lambda item: (str(item.get("severity", "")), str(item.get("finding_id", ""))))
+    current.sort(key=lambda item: (_severity_rank(item.get("severity")), str(item.get("finding_id", ""))))
     return current
 
 
@@ -1825,7 +2085,7 @@ def submit_finding_legacy(
     _ensure_state()
     if subject_kind not in {"repo", "pr", "commit", "runtime", "bureau_task", "grabowski_lane"}:
         raise ValueError("unsupported legacy subject_kind")
-    if severity not in {"low", "medium", "high", "critical"}:
+    if severity not in _SEVERITY_ORDER:
         raise ValueError("invalid severity")
     if status not in _LEGACY_BASE_STATUSES:
         raise ValueError("unsupported legacy status")

@@ -42,7 +42,8 @@ def test_repo_path_escape_is_rejected(tmp_path: Path) -> None:
 def test_service_validation_is_syntax_bound_not_name_allowlisted() -> None:
     assert server._validate_unit("nixer-mcp.service") == "nixer-mcp.service"
     assert server._validate_unit("future-observer-target.service") == "future-observer-target.service"
-    with pytest.raises(ValueError): server._validate_unit("ssh.timer")
+    with pytest.raises(ValueError):
+        server._validate_unit("ssh.timer")
 
 
 def test_bad_revision_is_rejected() -> None:
@@ -134,6 +135,79 @@ def test_github_read_fails_closed_without_dedicated_credential(monkeypatch: pyte
     with pytest.raises(RuntimeError, match="GitHub credential is not configured"):
         server._run(["/usr/bin/gh", "--version"])
     assert called is False
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "heimgewebe/grosser-adler",
+        "heimgewebe/.github",
+        "a/b",
+        "Owner-1/repo_name.v2",
+    ],
+)
+def test_github_repo_accepts_canonical_owner_and_name(repo: str) -> None:
+    owner, name = server._split_github_repo(repo)
+    assert f"{owner}/{name}" == repo
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "../..",
+        "foo/..",
+        "../bar",
+        "./x",
+        "foo/.",
+        "-owner/repo",
+        "owner/-repo",
+        "owner/repo/extra",
+        "owner//repo",
+        "/owner/repo",
+        "owner/repo/",
+        "owner",
+        "",
+        "owner/re%2Fpo",
+        "owner%2Frepo",
+        "owner/repo%00",
+        "own er/repo",
+        "owner/repo\n",
+        "owner/re\npo",
+        "owner-/repo",
+        "own/er/repo",
+        "..%2F..",
+    ],
+)
+def test_github_repo_rejects_traversal_and_boundary_tricks(repo: str) -> None:
+    with pytest.raises(ValueError):
+        server._split_github_repo(repo)
+
+
+def test_github_repo_rejects_non_string() -> None:
+    for value in (None, 7, ["heimgewebe", "grosser-adler"]):
+        with pytest.raises(ValueError):
+            server._split_github_repo(value)
+
+
+def test_accepted_github_repo_cannot_escape_the_repos_api_prefix() -> None:
+    # Every accepted identifier must expand to exactly repos/<owner>/<name>/...
+    for repo in ("heimgewebe/grosser-adler", "heimgewebe/.github", "a/b"):
+        owner, name = server._split_github_repo(repo)
+        path = f"repos/{owner}/{name}/pulls/1/reviews"
+        assert path.count("/") == 5
+        assert ".." not in path.split("/")
+        assert "." not in path.split("/")
+        assert "%" not in path
+
+
+def test_github_pr_rejects_traversal_before_any_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(server, "_run", lambda argv, **kwargs: calls.append(argv))
+    with pytest.raises(ValueError):
+        server.github_pr("../..", 1)
+    assert calls == []
 
 
 def test_github_pr_requests_base_oid(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,7 +303,7 @@ def test_process_reader_is_internal_and_cgroup_bound(monkeypatch: pytest.MonkeyP
             ),
             "stderr": "",
             "stdout_truncated": False,
-            "stderr_truncated": False,
+            "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)
@@ -252,7 +326,7 @@ def test_process_reader_fails_closed_on_foreign_uid_cgroup_member(monkeypatch: p
             f"100 1 {own_uid} S 10 512 0.0 python 0::/user.slice/nixer\n"
             f"101 1 {own_uid + 1} S 8 256 0.0 foreign 0::/user.slice/nixer/helper\n"
         ),
-        "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+        "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
     })
     result = server._process_snapshot(100, "/user.slice/nixer")
     assert result["uid_complete"] is False
@@ -270,7 +344,7 @@ def test_process_reader_marks_unparseable_rows_incomplete(monkeypatch: pytest.Mo
         ),
         "stderr": "",
         "stdout_truncated": False,
-        "stderr_truncated": False,
+        "stderr_truncated": False, "rows_intact": True,
     })
     result = server._process_snapshot(100, "/user.slice/nixer")
     assert result["parse_complete"] is False
@@ -278,55 +352,534 @@ def test_process_reader_marks_unparseable_rows_incomplete(monkeypatch: pytest.Mo
     assert result["processes"] == []
 
 
-def test_redact_can_preserve_canonical_grabowski_task_unit_without_weakening_default_redaction() -> None:
-    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
-    token = "sk-" + ("b" * 24)
-    assert server._redact(unit) != unit
-    for prefix in ("", "  ", "● "):
-        assert server._redact(
-            f"{prefix}{unit} {token}",
-            protected_patterns=server._SAFE_REDACTION_LITERAL_PATTERNS,
-        ) == f"{prefix}{unit} <REDACTED>"
-    assert server._redact(
-        unit,
-        exact_secrets=(unit,),
-        protected_patterns=server._SAFE_REDACTION_LITERAL_PATTERNS,
-    ) == "<REDACTED>"
-
-
-def test_list_user_services_protects_only_unit_column_from_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
-    unit = "grabowski-task-" + ("c" * 24) + "-a2.service"
-    description_unit = "grabowski-task-" + ("e" * 24) + "-a3.service"
-    token = "sk-" + ("d" * 24)
-    raw_stdout = f"  {unit} loaded active running decoy {description_unit} token {token}\n"
-    raw_stderr = f"warning {description_unit}\n"
-
+def _systemctl_stdout(monkeypatch: pytest.MonkeyPatch, stdout: str, stderr: str = "") -> None:
     def fake_run(*args, **kwargs):
-        return server.subprocess.CompletedProcess(
-            args[0], 0, stdout=raw_stdout, stderr=raw_stderr
-        )
+        return server.subprocess.CompletedProcess(args[0], 0, stdout=stdout, stderr=stderr)
 
     monkeypatch.setattr(server.subprocess, "run", fake_run)
-    result = server.list_user_services()
 
+
+def test_redact_still_rewrites_secret_shaped_text_without_any_literal_exception() -> None:
+    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
+    token = "sk-" + ("b" * 24)
+    # The unit name is only protected by structural parsing, never by _redact.
+    assert server._redact(unit) != unit
+    assert server._redact(f"api_key: {token}") == "<REDACTED>"
+    assert server._redact(unit, exact_secrets=(unit,)) == "<REDACTED>"
+    assert not hasattr(server, "_SAFE_REDACTION_LITERAL_PATTERNS")
+
+
+def test_list_user_services_keeps_canonical_grabowski_unit_identity_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "grabowski-task-" + ("c" * 24) + "-a1.service"
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Grabowski task\n")
+    result = server.list_user_services()
     assert result["observation_complete"] is True
+    assert [item["unit"] for item in result["services"]] == [unit]
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        # Not covered by the removed whitelist: different suffix, different id
+        # length, and a name whose "sk-" run alone matches the OpenAI pattern.
+        "grabowski-task-" + ("d" * 24) + "-b2.service",
+        "grabowski-task-" + ("e" * 32) + "-a1.service",
+        "my-desk-" + ("f" * 24) + ".service",
+    ],
+)
+def test_list_user_services_preserves_secret_shaped_but_legitimate_unit_names(
+    monkeypatch: pytest.MonkeyPatch, unit: str
+) -> None:
+    # Each of these is rewritten by raw secret redaction; structural parsing
+    # must still report the whole listing with byte-exact unit identity.
+    assert server._redact(unit) != unit
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Example unit\n")
+    result = server.list_user_services()
+    assert result["observation_complete"] is True
+    assert result["parse_complete"] is True
     assert result["services"] == [{
         "unit": unit,
         "load": "loaded",
         "active": "active",
         "sub": "running",
-        "description": "decoy grabowski-ta<REDACTED>.service token <REDACTED>",
+        "description": "Example unit",
     }]
-    assert result["source"]["stdout"].startswith("  " + unit + " ")
-    assert description_unit not in result["source"]["stdout"]
-    assert description_unit not in result["source"]["stderr"]
+
+
+def test_list_user_services_redacts_secrets_in_the_description_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "nixer-mcp.service"
+    token = "ghp_" + ("g" * 24)
+    _systemctl_stdout(
+        monkeypatch,
+        f"{unit} loaded active running Nixer token: {token}\n",
+        stderr=f"warning {token}\n",
+    )
+    result = server.list_user_services()
+    assert result["services"] == [{
+        "unit": unit,
+        "load": "loaded",
+        "active": "active",
+        "sub": "running",
+        "description": "Nixer <REDACTED>",
+    }]
     assert token not in result["source"]["stdout"]
+    assert token not in result["source"]["stderr"]
+    assert token not in json.dumps(result)
+
+
+def test_list_user_services_marks_bullet_and_malformed_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "nixer-mcp.service"
+    _systemctl_stdout(monkeypatch, f"\u25cf {unit} loaded failed failed Nixer\n")
+    result = server.list_user_services()
+    assert result["observation_complete"] is True
+    assert result["services"][0]["unit"] == unit
+    assert result["services"][0]["active"] == "failed"
+
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Nixer\nmalformed-row\n")
+    result = server.list_user_services()
+    assert result["parse_complete"] is False
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+
+
+def test_list_user_services_fails_closed_on_non_structural_state_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A state column that is not systemd state vocabulary is never emitted.
+    _systemctl_stdout(
+        monkeypatch, "nixer-mcp.service loaded active token:leak Nixer\n"
+    )
+    result = server.list_user_services()
+    assert result["parse_complete"] is False
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+
+
+def test_systemd_reads_preserve_unit_identity_in_every_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for the sibling paths of audit finding 1: service_status and
+    # service_logs parse the same redacted text list_user_services does.
+    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
+    assert server._redact(unit) != unit
+    properties = "".join(
+        f"{key}={value}\n"
+        for key, value in (
+            ("LoadState", "loaded"),
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("Result", "success"),
+            ("ExecMainCode", "0"),
+            ("ExecMainStatus", "0"),
+            ("MainPID", "123"),
+            ("FragmentPath", f"/home/alex/.config/systemd/user/{unit}"),
+            ("NRestarts", "0"),
+            ("ActiveEnterTimestamp", "x"),
+            ("ExecMainStartTimestamp", "y"),
+            ("ControlGroup", f"/user.slice/app.slice/{unit}"),
+            ("MemoryCurrent", "1"),
+            ("TasksCurrent", "1"),
+            ("CPUUsageNSec", "1"),
+        )
+    )
+    _systemctl_stdout(monkeypatch, properties)
+    observation = server._observe_service_scope(unit, "user")
+    assert observation["observation_complete"] is True
+    assert observation["properties"]["FragmentPath"].endswith(unit)
+    assert observation["properties"]["ControlGroup"].endswith(unit)
+
+    _systemctl_stdout(monkeypatch, f"-- Logs begin --\nJan 01 00:00:00 host {unit}: started\n")
+    logs = server._run(["/usr/bin/journalctl"], preserved_identity=(unit,))
+    assert unit in logs["stdout"]
+
+
+def test_structured_unit_claim_matches_the_raw_source_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An auditor must be able to cross-check services[].unit against source.stdout.
+    unit = "grabowski-task-" + ("b" * 24) + "-a1.service"
+    token = "sk-" + ("c" * 30)
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Task api_key: {token}\n")
+    result = server.list_user_services()
+    assert result["services"][0]["unit"] == unit
+    assert unit in result["source"]["stdout"]
+    assert result["services"][0]["description"] == "Task <REDACTED>"
+    assert token not in json.dumps(result)
+
+
+def test_redaction_never_merges_rows_across_a_newline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A description ending in "password:" used to swallow the next row, so a
+    # unit disappeared while the listing still claimed to be complete.
+    _systemctl_stdout(
+        monkeypatch,
+        "a.service loaded active running Nixer password:\n"
+        "b.service loaded active running Second unit\n"
+        "c.service loaded active running Third unit\n",
+    )
+    result = server.list_user_services()
+    # The physical line break survives, but b.service's structured identity
+    # does not. rows_intact therefore fails even though the newline count still
+    # matches: physical line count alone is not a completeness proof.
+    assert result["source"]["rows_intact"] is False
+    assert len(result["source"]["stdout"].splitlines()) == 3
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+    # Journal text is affected by the same pattern. The value that follows the
+    # keyword is still redacted even across the newline, but the newline is
+    # re-emitted, so the second record stays a record instead of disappearing.
+    redacted = server._redact("Jan 01 host: password:\nJan 02 host: next")
+    assert len(redacted.splitlines()) == 2
+    assert "<REDACTED>" in redacted
+    assert "password:" not in redacted
+    # Same-line assignments are still redacted, with or without whitespace.
+    assert server._redact("password: hunter2") == "<REDACTED>"
+    assert server._redact("api_key:abc123") == "<REDACTED>"
+    assert server._redact("Authorization\t=\tBearer-xyz") == "<REDACTED>"
+
+
+def test_list_user_services_preserves_rows_across_multiline_secret_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A multi-line private-key block legitimately collapses lines; the row-count
+    # invariant must then refuse to publish a short inventory.
+    key = "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----"
+    _systemctl_stdout(
+        monkeypatch,
+        f"a.service loaded active running {key}\nb.service loaded active running Second\n",
+    )
+    result = server.list_user_services()
+    # The block spans three lines; re-emitting its newlines keeps both units
+    # addressable instead of collapsing the listing.
+    assert [item["unit"] for item in result["services"]] == ["a.service", "b.service"]
+    assert result["observation_complete"] is True
+    assert "MIIabc" not in json.dumps(result)
+
+
+def test_list_user_services_fails_closed_if_private_key_spans_complete_unit_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for a multi-line secret whose match starts in one unit row,
+    # consumes complete following unit rows, and ends inside another unit row.
+    raw = (
+        "a.service loaded active running -----BEGIN PRIVATE KEY-----\n"
+        "b.service loaded active running Second\n"
+        "c.service loaded active running -----END PRIVATE KEY-----\n"
+        "d.service loaded active running Fourth\n"
+    )
+    _systemctl_stdout(monkeypatch, raw)
+    result = server.list_user_services()
+
+    assert result["source"]["rows_intact"] is False
+    assert result["parse_complete"] is False
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+    encoded = json.dumps(result)
+    assert "PRIVATE KEY" not in encoded
+    assert "b.service" not in result["source"]["stdout"]
+    assert "c.service" not in result["source"]["stdout"]
+
+
+def test_run_reports_the_raw_row_count_and_proves_rows_survived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _systemctl_stdout(monkeypatch, "one\n\ntwo\nthree\n")
+    result = server._run(["/usr/bin/true"])
+    assert result["stdout_line_count"] == 4
+    assert result["rows_intact"] is True
+
+    key = "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----"
+    _systemctl_stdout(monkeypatch, f"first\n{key}\nlast\n")
+    result = server._run(["/usr/bin/true"])
+    assert result["rows_intact"] is True
+    assert len(result["stdout"].splitlines()) == 5
+    assert "MIIabc" not in result["stdout"]
+
+
+def test_derived_identity_is_scoped_to_the_stream_it_was_read_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # list_user_services derives identity from the listing's first column.
+    # stderr was never inspected by that extractor, so it must not inherit the
+    # exemption.
+    credential_named_unit = "ghp_" + ("A" * 24) + ".service"
+    _systemctl_stdout(
+        monkeypatch,
+        f"{credential_named_unit} loaded active running desc\n",
+        stderr=f"warning {credential_named_unit}\n",
+    )
+    result = server.list_user_services()
+    assert credential_named_unit not in result["source"]["stderr"]
+    assert "<REDACTED>" in result["source"]["stderr"]
+    # Documented residual risk of the column-bound mode: a unit whose own name
+    # is credential-shaped is reported verbatim in the identity column.
+    assert result["services"][0]["unit"] == credential_named_unit
+
+
+def test_service_logs_fails_closed_when_redaction_changes_the_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "show" in argv:
+            stdout = (
+                _complete_service_show_fixture()
+                if "--user" in argv
+                else _missing_system_service_show_fixture()
+            )
+            return {
+                "returncode": 0,
+                "stdout": stdout,
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False, "rows_intact": True,
+            }
+        return {
+            "returncode": 0,
+            "stdout": "Jan 01 h u: a\n",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout_line_count": 3,
+            "rows_intact": False,
+        }
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_logs("nixer-mcp.service")
+    assert result["rows_intact"] is False
+    assert result["observation_complete"] is False
+
+
+def test_identity_exemption_is_bound_to_named_units_not_to_shape() -> None:
+    unit = "grabowski-task-" + ("d" * 24) + "-a1.service"
+    # The named, already-validated unit survives verbatim.
+    assert server._redact(unit) != unit
+    assert server._redact_preserving_identity(unit, preserved_identity=(unit,)) == unit
+    assert (
+        server._redact_preserving_identity(f"host {unit}: started", preserved_identity=(unit,))
+        == f"host {unit}: started"
+    )
+    # Nothing is exempt merely for looking like a unit name. These reach the
+    # caller through service_logs, which returns arbitrary application text.
+    leaky = [
+        "api_key:abc.service",
+        "api_key: abc.service",
+        "secret:sk-" + ("A" * 24) + ".service",
+        "ghp_" + ("A" * 24) + ".service",
+        "sk-" + ("A" * 24) + ".service",
+        "github_pat_" + ("A" * 24) + ".service",
+        "token=my-thing.service-secret",
+    ]
+    for probe in leaky:
+        assert "<REDACTED>" in server._redact(probe)
+        assert "<REDACTED>" in server._redact_preserving_identity(
+            probe, preserved_identity=(unit,)
+        )
+
+
+def test_identity_exemption_yields_to_exact_and_spanning_secrets() -> None:
+    unit = "grabowski-task-" + ("e" * 24) + "-a1.service"
+    # A configured exact secret always wins, including one straddling the name.
+    assert server._redact_preserving_identity(
+        unit, exact_secrets=(unit,), preserved_identity=(unit,)
+    ) == "<REDACTED>"
+    straddling = f"tok-{unit}-tail"
+    assert server._redact_preserving_identity(
+        straddling, exact_secrets=(straddling,), preserved_identity=(unit,)
+    ) == "<REDACTED>"
+    # A pattern match reaching beyond the name is a real secret, not the
+    # in-name false positive, so the name is not exempted out of it.
+    spanning = f"password={unit}"
+    assert "<REDACTED>" in server._redact_preserving_identity(
+        spanning, preserved_identity=(unit,)
+    )
+
+
+def test_listed_unit_names_only_trusts_the_identity_column() -> None:
+    unit = "grabowski-task-" + ("f" * 24) + "-a1.service"
+    credential = "ghp_" + ("A" * 24) + ".service"
+    text = f"{unit} loaded active running desc {credential}\n\u25cf {unit} loaded active running d\n"
+    assert server._listed_unit_names(text) == (unit,)
+    # A credential in the description column never becomes preserved identity.
+    assert credential not in server._listed_unit_names(text)
+
+
+def test_list_user_services_redacts_a_credential_in_the_description_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "grabowski-task-" + ("g" * 24) + "-a1.service"
+    credential = "ghp_" + ("A" * 24) + ".service"
+    _systemctl_stdout(monkeypatch, f"{unit} loaded active running Task {credential}\n")
+    result = server.list_user_services()
+    assert result["services"][0]["unit"] == unit
+    assert unit in result["source"]["stdout"]
+    assert credential not in json.dumps(result)
+
+
+def test_service_runtime_correlates_a_secret_shaped_unit_across_ps_and_ss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ControlGroup, the ps cgroup column and the ss cgroup field are compared
+    # against each other, so all three must redact identically or the process
+    # tree and listeners silently vanish for exactly the canonical task units.
+    unit = "grabowski-task-" + ("a" * 24) + "-a1.service"
+    assert server._redact(unit) != unit
+    control_group = f"/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}"
+    properties = "".join(
+        f"{key}={value}\n"
+        for key, value in (
+            ("LoadState", "loaded"),
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("Result", "success"),
+            ("ExecMainCode", "0"),
+            ("ExecMainStatus", "0"),
+            ("MainPID", "4242"),
+            ("FragmentPath", f"/home/alex/.config/systemd/user/{unit}"),
+            ("NRestarts", "0"),
+            ("ActiveEnterTimestamp", "x"),
+            ("ExecMainStartTimestamp", "y"),
+            ("ControlGroup", control_group),
+            ("MemoryCurrent", "1"),
+            ("TasksCurrent", "1"),
+            ("CPUUsageNSec", "1"),
+        )
+    )
+    absent = properties.replace("LoadState=loaded", "LoadState=not-found")
+    process_row = f" 4242    1 {os.getuid()} Ss 10 100 0.1 python 0::{control_group}\n"
+    socket_row = (
+        f"tcp LISTEN 0 128 127.0.0.1:18186 0.0.0.0:* uid:1000 cgroup:{control_group}\n"
+    )
+
+    def fake_run(argv, **kwargs):
+        joined = " ".join(argv)
+        if "/usr/bin/ps" in joined:
+            stdout = process_row
+        elif "/usr/bin/ss" in joined:
+            stdout = socket_row
+        elif "--user" in argv:
+            stdout = properties
+        else:
+            stdout = absent
+        return server.subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: fake_run(a[0], **k))
+    result = server.service_runtime(unit)
+
+    assert result["control_group"] == control_group
+    assert len(result["processes"]) == 1
+    assert result["processes"][0]["pid"] == 4242
+    assert len(result["listeners"]) == 1
+    assert result["missing_evidence"] == []
+    assert result["complete"] is True
+
+
+def test_service_runtime_fails_closed_when_socket_redaction_drops_a_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "nixer-mcp.service"
+    control_group = "/user.slice/app.slice/nixer-mcp.service"
+    properties = "".join(
+        f"{key}={value}\n"
+        for key, value in (
+            ("LoadState", "loaded"),
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("Result", "success"),
+            ("ExecMainCode", "0"),
+            ("ExecMainStatus", "0"),
+            ("MainPID", "4242"),
+            ("FragmentPath", f"/home/alex/.config/systemd/user/{unit}"),
+            ("NRestarts", "0"),
+            ("ActiveEnterTimestamp", "x"),
+            ("ExecMainStartTimestamp", "y"),
+            ("ControlGroup", control_group),
+            ("MemoryCurrent", "1"),
+            ("TasksCurrent", "1"),
+            ("CPUUsageNSec", "1"),
+        )
+    )
+    absent = properties.replace("LoadState=loaded", "LoadState=not-found")
+    process_row = f"4242 1 {os.getuid()} Ss 10 100 0.1 python 0::{control_group}\n"
+    socket_row = (
+        f"tcp LISTEN 0 128 127.0.0.1:18186 0.0.0.0:* uid:1000 cgroup:{control_group}\n"
+    )
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/ps":
+            return {
+                "returncode": 0,
+                "stdout": process_row,
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "rows_intact": True,
+            }
+        if argv[0] == "/usr/bin/ss":
+            return {
+                "returncode": 0,
+                "stdout": socket_row,
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "rows_intact": False,
+            }
+        if argv[0] == "/usr/bin/systemctl":
+            return {
+                "returncode": 0,
+                "stdout": properties if "--user" in argv else absent,
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "rows_intact": True,
+            }
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    result = server.service_runtime(unit)
+
+    assert result["processes"][0]["pid"] == 4242
+    assert result["listeners"] == []
+    assert result["listener_observation_complete"] is False
+    assert "listeners" in result["missing_evidence"]
+    assert result["complete"] is False
+
+
+def test_list_user_services_never_returns_a_parsed_payload_past_the_output_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A parsed structure is evidence too: truncation must not be undone by it.
+    rows = "".join(
+        f"svc-{index:05d}.service loaded active running Description {index}\n"
+        for index in range(4000)
+    )
+    assert len(rows.encode("utf-8")) > server.MAX_OUTPUT_BYTES
+    _systemctl_stdout(monkeypatch, rows)
+    result = server.list_user_services()
+
+    assert result["source"]["stdout_truncated"] is True
+    assert result["observation_complete"] is False
+    assert result["parse_complete"] is False
+    assert result["services"] == []
+    # Nothing may reintroduce what truncation removed, in any field.
+    encoded = len(json.dumps(result).encode("utf-8"))
+    assert encoded < 2 * server.MAX_OUTPUT_BYTES
+    assert "svc-03999.service" not in json.dumps(result)
 
 
 def test_list_user_services_fails_closed_on_truncated_or_failed_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     observations = [
-        {"returncode": 0, "stdout": "nixer-mcp.service loaded active running Nixer\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False},
-        {"returncode": 1, "stdout": "", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False},
+        {"returncode": 0, "stdout": "nixer-mcp.service loaded active running Nixer\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False, "rows_intact": True},
+        {"returncode": 1, "stdout": "", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True},
     ]
     for observation in observations:
         monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
@@ -341,7 +894,7 @@ def test_list_user_services_fails_closed_on_unparseable_rows(monkeypatch: pytest
         "stdout": "nixer-mcp.service loaded active running Nixer\nmalformed-row\n",
         "stderr": "",
         "stdout_truncated": False,
-        "stderr_truncated": False,
+        "stderr_truncated": False, "rows_intact": True,
     })
     result = server.list_user_services()
     assert result["parse_complete"] is False
@@ -351,8 +904,8 @@ def test_list_user_services_fails_closed_on_unparseable_rows(monkeypatch: pytest
 
 def test_service_status_fails_closed_on_truncated_or_failed_show(monkeypatch: pytest.MonkeyPatch) -> None:
     observations = [
-        {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False},
-        {"returncode": 1, "stdout": "ActiveState=active\n", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False},
+        {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False, "rows_intact": True},
+        {"returncode": 1, "stdout": "ActiveState=active\n", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True},
     ]
     for observation in observations:
         monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
@@ -363,8 +916,8 @@ def test_service_status_fails_closed_on_truncated_or_failed_show(monkeypatch: py
 
 def test_service_status_fails_closed_on_missing_or_malformed_properties(monkeypatch: pytest.MonkeyPatch) -> None:
     observations = [
-        {"returncode": 0, "stdout": "ActiveState=active\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False},
-        {"returncode": 0, "stdout": _complete_service_show_fixture() + "malformed-row\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False},
+        {"returncode": 0, "stdout": "ActiveState=active\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True},
+        {"returncode": 0, "stdout": _complete_service_show_fixture() + "malformed-row\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True},
     ]
     for observation in observations:
         monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
@@ -388,7 +941,7 @@ def test_service_status_selects_system_scope_when_user_shadow_is_inactive(monkey
             )
         return {
             "returncode": 0, "stdout": stdout, "stderr": "",
-            "stdout_truncated": False, "stderr_truncated": False,
+            "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)
@@ -408,7 +961,7 @@ def test_service_status_fails_closed_when_same_name_is_active_in_both_scopes(mon
         "stdout": _complete_service_show_fixture(),
         "stderr": "",
         "stdout_truncated": False,
-        "stderr_truncated": False,
+        "stderr_truncated": False, "rows_intact": True,
     })
     result = server.service_status("nixer-mcp.service")
     assert result["observation_complete"] is False
@@ -454,7 +1007,7 @@ def test_service_status_fails_closed_for_competing_running_or_transition_states(
             "stdout": stdout,
             "stderr": "",
             "stdout_truncated": False,
-            "stderr_truncated": False,
+            "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)
@@ -476,7 +1029,7 @@ def test_service_logs_refuses_ambiguous_transition_scope(monkeypatch: pytest.Mon
             "stdout": _complete_service_show_fixture(main_pid=100, active_state=state),
             "stderr": "",
             "stdout_truncated": False,
-            "stderr_truncated": False,
+            "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)
@@ -503,14 +1056,14 @@ def test_service_logs_uses_resolved_system_scope(monkeypatch: pytest.MonkeyPatch
                 )
             return {
                 "returncode": 0, "stdout": stdout, "stderr": "",
-                "stdout_truncated": False, "stderr_truncated": False,
+                "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         if argv[0] == "/usr/bin/journalctl":
             assert "--user" not in argv
             assert "--system" in argv
             return {
                 "returncode": 0, "stdout": "system-log\n", "stderr": "",
-                "stdout_truncated": False, "stderr_truncated": False,
+                "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
 
@@ -539,7 +1092,7 @@ def test_service_logs_fails_closed_on_successful_journal_access_diagnostic(
             )
             return {
                 "returncode": 0, "stdout": stdout, "stderr": "",
-                "stdout_truncated": False, "stderr_truncated": False,
+                "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         if argv[0] == "/usr/bin/journalctl":
             return {
@@ -547,7 +1100,7 @@ def test_service_logs_fails_closed_on_successful_journal_access_diagnostic(
                 "stdout": "",
                 "stderr": "Hint: journal access is restricted\n",
                 "stdout_truncated": False,
-                "stderr_truncated": False,
+                "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
 
@@ -567,7 +1120,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
             return {
                 "returncode": 0,
                 "stdout": stdout,
-                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         if argv[0] == "/usr/bin/ps":
             return {
@@ -577,7 +1130,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
                     f"101 100 {own_uid} S 60 1024 0.2 nix 0::/user.slice/nixer/child\n"
                     f"102 100 {own_uid} S 60 1024 0.2 stray 0::/user.slice/other\n"
                 ),
-                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         if argv[0] == "/usr/bin/ss":
             assert argv == ["/usr/bin/ss", "-H", "-lntue"]
@@ -585,7 +1138,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
             return {
                 "returncode": 0,
                 "stdout": f'tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/user.slice/nixer <->\n',
-                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
@@ -605,12 +1158,12 @@ def test_service_runtime_zero_listener_match_does_not_establish_absence(monkeypa
             stdout = (
                 _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
             )
-            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ps":
-            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ss":
             assert argv == ["/usr/bin/ss", "-H", "-lntue"]
-            return {"returncode": 0, "stdout": f"tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:* uid:{own_uid} ino:9 cgroup:/other <->\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:* uid:{own_uid} ino:9 cgroup:/other <->\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
     runtime = server.service_runtime("nixer-mcp.service")
@@ -630,9 +1183,9 @@ def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkey
             stdout = (
                 _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
             )
-            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ps":
-            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ss":
             return {
                 "returncode": 0,
@@ -640,7 +1193,7 @@ def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkey
                     f"tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/cg <->\n"
                     "tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:*\n"
                 ),
-                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
@@ -660,11 +1213,11 @@ def test_service_runtime_marks_truncated_process_or_socket_sources_incomplete(mo
             stdout = (
                 _complete_service_show_fixture(control_group="/cg") if "--user" in argv else _missing_system_service_show_fixture()
             )
-            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": stdout, "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ps":
-            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": f"100 1 {own_uid} S 1 1 0.0 python 0::/cg\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False, "rows_intact": True}
         if argv[0] == "/usr/bin/ss":
-            return {"returncode": 0, "stdout": "", "stderr": "", "stdout_truncated": True, "stderr_truncated": False}
+            return {"returncode": 0, "stdout": "", "stderr": "", "stdout_truncated": True, "stderr_truncated": False, "rows_intact": True}
         raise AssertionError(argv)
     monkeypatch.setattr(server, "_run", fake_run)
     runtime = server.service_runtime("nixer-mcp.service")
@@ -816,8 +1369,11 @@ def test_work_target_reads_exact_active_grabowski_lane(tmp_path: Path, monkeypat
     repo = tmp_path / "repo"
     worktree = tmp_path / "worktree"
     lanes = tmp_path / "lanes"
-    repo.mkdir(); worktree.mkdir(); lanes.mkdir()
-    (repo / ".git").mkdir(); (worktree / ".git").write_text("gitdir: fixture", encoding="utf-8")
+    repo.mkdir()
+    worktree.mkdir()
+    lanes.mkdir()
+    (repo / ".git").mkdir()
+    (worktree / ".git").write_text("gitdir: fixture", encoding="utf-8")
     lane_id = "1" * 32
     lane = _seal_lane({
         "lane_id": lane_id,
@@ -856,7 +1412,8 @@ def test_work_target_reads_exact_active_grabowski_lane(tmp_path: Path, monkeypat
 
 
 def test_work_target_rejects_terminal_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    lanes = tmp_path / "lanes"; lanes.mkdir()
+    lanes = tmp_path / "lanes"
+    lanes.mkdir()
     lane_id = "2" * 32
     lane = _seal_lane({"lane_id": lane_id, "state": "ready", "terminal_closeout": {"closeout_state": "no_change_proven"}, "inputs": {"lane_id": lane_id, "repo": str(tmp_path), "target_path": str(tmp_path), "branch": "fixture", "purpose": "fixture", "base_head": OID_A}})
     (lanes / f"{lane_id}.json").write_text(json.dumps(lane), encoding="utf-8")
@@ -866,12 +1423,14 @@ def test_work_target_rejects_terminal_lane(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_work_target_rejects_tampered_lane_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    lanes = tmp_path / "lanes"; lanes.mkdir()
+    lanes = tmp_path / "lanes"
+    lanes.mkdir()
     lane_id = "8" * 32
     lane = _seal_lane({"lane_id": lane_id, "state": "ready", "terminal_closeout": None, "inputs": {"lane_id": lane_id, "repo": str(tmp_path), "target_path": str(tmp_path), "branch": "fixture", "purpose": "before", "base_head": OID_A}})
     lane["inputs"]["purpose"] = "tampered-after-seal"
     path = lanes / f"{lane_id}.json"
-    path.write_text(json.dumps(lane), encoding="utf-8"); path.chmod(0o600)
+    path.write_text(json.dumps(lane), encoding="utf-8")
+    path.chmod(0o600)
     monkeypatch.setattr(server, "GRABOWSKI_WORK_LANES_ROOT", lanes.resolve())
     with pytest.raises(RuntimeError, match="receipt digest is invalid"):
         server.get_work_target(lane_id)
@@ -901,8 +1460,10 @@ def test_lane_finding_automatically_publishes_external_current_view(tmp_path: Pa
 
 def test_sidecar_rejects_symlink_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; worktree.mkdir()
-    outside = tmp_path / "outside"; outside.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
     (worktree / ".adler").symlink_to(outside, target_is_directory=True)
     lane_id = "4" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
@@ -945,8 +1506,11 @@ def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeyp
     worktree = tmp_path / "worktree"
     lane_id = "9" * 32
     target = _install_pointer(worktree, state, lane_id)
-    findings = state / "findings"; findings.mkdir(mode=0o700)
-    bad = findings / "broken.json"; bad.write_text("{broken", encoding="utf-8"); bad.chmod(0o600)
+    findings = state / "findings"
+    findings.mkdir(mode=0o700)
+    bad = findings / "broken.json"
+    bad.write_text("{broken", encoding="utf-8")
+    bad.chmod(0o600)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
         "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
@@ -958,8 +1522,10 @@ def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeyp
 
 def test_worktree_root_limits_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
-    allowed = tmp_path / "allowed"; allowed.mkdir()
-    worktree = tmp_path / "outside"; worktree.mkdir()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    worktree = tmp_path / "outside"
+    worktree.mkdir()
     monkeypatch.setattr(server, "WORKTREE_ROOT", allowed.resolve())
     lane_id = "a" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
@@ -974,7 +1540,8 @@ def test_worktree_root_limits_delivery(tmp_path: Path, monkeypatch: pytest.Monke
 
 def test_delivery_failure_keeps_finding_durable_and_does_not_create_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _configure_state(tmp_path, monkeypatch)
-    worktree = tmp_path / "worktree"; worktree.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
     lane_id = "7" * 32
     monkeypatch.setattr(server, "_read_work_target", lambda lane: {
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
