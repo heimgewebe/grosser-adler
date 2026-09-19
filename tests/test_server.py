@@ -1501,7 +1501,9 @@ def test_recheck_preserves_history_and_removes_no_longer_current_finding(tmp_pat
     assert inbox["findings"] == []
 
 
-def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_incomplete_finding_store_publishes_degraded_visible_inbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
     lane_id = "9" * 32
@@ -1515,9 +1517,18 @@ def test_incomplete_finding_store_refuses_complete_inbox(tmp_path: Path, monkeyp
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
         "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
     })
-    with pytest.raises(RuntimeError, match="finding store observation is incomplete"):
-        server.publish_worktree_inbox(lane_id)
-    assert not target.exists()
+    result = server.publish_worktree_inbox(lane_id)
+    assert result["state"] == "published"
+    assert result["source_complete"] is False
+    assert result["source_error_count"] == 1
+    assert result["quarantined_record_count"] == 1
+    inbox = json.loads(target.read_text(encoding="utf-8"))
+    assert inbox["source_complete"] is False
+    assert inbox["projection_complete"] is True
+    assert inbox["findings"] == []
+    assert inbox["quarantined_records"] == [
+        {"record": "broken.json", "error_type": "RuntimeError"}
+    ]
 
 
 def test_worktree_root_limits_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1574,7 +1585,9 @@ def test_finding_short_write_does_not_install_truncated_json(tmp_path: Path, mon
     server._validate_v1_finding_payload(payload, path)
 
 
-def test_finding_digest_mismatch_cannot_be_published_as_complete_empty_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_finding_digest_mismatch_is_visible_in_degraded_inbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
     lane_id = "c" * 32
@@ -1583,19 +1596,29 @@ def test_finding_digest_mismatch_cannot_be_published_as_complete_empty_view(tmp_
         "lane_id": lane, "repository": "fixture", "worktree": str(worktree), "branch": "feature",
         "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
     })
-    submitted = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}", checkpoint=OID_A))
-    before_inbox = target.read_bytes()
+    submitted = server.submit_finding(
+        **_finding_args(subject=f"lane:{lane_id}", checkpoint=OID_A)
+    )
     finding = state / "findings" / f"{submitted['finding_id']}.json"
     payload = json.loads(finding.read_text(encoding="utf-8"))
     payload["checkpoint"] = OID_B
-    finding.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    finding.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
     finding.chmod(0o600)
 
-    with pytest.raises(RuntimeError, match="finding store observation is incomplete"):
-        server.publish_worktree_inbox(lane_id)
-    assert target.read_bytes() == before_inbox
+    result = server.publish_worktree_inbox(lane_id)
+    assert result["state"] == "published"
+    assert result["source_complete"] is False
+    inbox = json.loads(target.read_text(encoding="utf-8"))
+    assert inbox["source_complete"] is False
+    assert inbox["findings"] == []
+    assert inbox["quarantined_record_count"] == 1
+    assert inbox["quarantined_records"][0]["record"] == finding.name
     listing = server.list_findings(limit=10)
     assert listing["source_complete"] is False
+    assert listing["store_health"]["quarantined_record_count"] == 1
 
 
 def test_finding_install_is_atomic_when_final_noreplace_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1623,11 +1646,11 @@ def test_inbox_snapshot_waits_for_external_inbox_store_lock(tmp_path: Path, monk
         "purpose": "fixture", "base_head": OID_B, "checkpoint": OID_A, "source": "fixture", "observed_at": "fixture",
     })
     entered_projection = threading.Event()
-    real_projection = server._current_lane_findings
+    real_projection = server._current_lane_projection
     def observed_projection(lane: str, checkpoint: str):
         entered_projection.set()
         return real_projection(lane, checkpoint)
-    monkeypatch.setattr(server, "_current_lane_findings", observed_projection)
+    monkeypatch.setattr(server, "_current_lane_projection", observed_projection)
     lock_fd = server.os.open(target.parent, server.os.O_RDONLY | server.os.O_DIRECTORY | server.os.O_CLOEXEC)
     server.fcntl.flock(lock_fd, server.fcntl.LOCK_EX)
     try:

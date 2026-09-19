@@ -39,6 +39,7 @@ MAX_EVIDENCE_REFS = 32
 MAX_EVIDENCE_REF_CHARS = 1_000
 MAX_AFFECTED_EFFECTS = 16
 MAX_AFFECTED_EFFECT_CHARS = 120
+MAX_QUARANTINE_RECORDS = 20
 LEGACY_CONNECTOR_CONTRACT = "adler-legacy-connector-submit-v1"
 
 READ_ANNOTATIONS = ToolAnnotations(
@@ -1478,16 +1479,21 @@ def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
         raise RuntimeError("V1 finding digest mismatch")
 
 
-def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[str]]:
+def _finding_quarantine_evidence(path: Path, exc: BaseException) -> dict[str, str]:
+    return {"record": path.name, "error_type": type(exc).__name__}
+
+
+def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[dict[str, str]]]:
+    """Read immutable history while keeping malformed records explicit and isolated."""
     _ensure_state()
     records: list[tuple[Path, dict[str, Any]]] = []
-    errors: list[str] = []
+    errors: list[dict[str, str]] = []
     for path in sorted(FINDINGS_ROOT.glob("*.json")):
         try:
             payload = _read_json_file_no_symlink(path)
             _validate_v1_finding_payload(payload, path)
         except Exception as exc:
-            errors.append(type(exc).__name__)
+            errors.append(_finding_quarantine_evidence(path, exc))
             continue
         records.append((path, payload))
 
@@ -1496,7 +1502,8 @@ def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[st
         for _, payload in records
         if payload.get("finding_contract") == FINDING_CONTRACT
     }
-    for _, payload in records:
+    invalid_paths: set[Path] = set()
+    for path, payload in records:
         if payload.get("finding_contract") != FINDING_CONTRACT:
             continue
         parent_id = payload.get("recheck_of")
@@ -1508,7 +1515,14 @@ def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[st
             or parent.get("recheck_of") is not None
             or parent.get("subject") != payload.get("subject")
         ):
-            errors.append("RuntimeError")
+            errors.append({"record": path.name, "error_type": "RuntimeError"})
+            invalid_paths.add(path)
+    if invalid_paths:
+        records = [
+            (path, payload)
+            for path, payload in records
+            if path not in invalid_paths
+        ]
     return records, errors
 
 
@@ -1525,38 +1539,54 @@ def _severity_rank(value: Any) -> int:
     return _SEVERITY_ORDER.get(value, _UNKNOWN_SEVERITY_RANK)
 
 
-def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]]:
+def _lane_findings_from_loaded(
+    lane_id: str,
+    checkpoint: str,
+    loaded: list[tuple[Path, dict[str, Any]]],
+) -> list[dict[str, Any]]:
     subject = f"lane:{lane_id}"
-    loaded, errors = _load_finding_payloads()
-    if errors:
-        raise RuntimeError("finding store observation is incomplete")
-    records = [
-        payload for _, payload in loaded
-        if payload.get("finding_contract") == FINDING_CONTRACT and payload.get("subject") == subject
+    v1_records = [
+        (path, payload)
+        for path, payload in loaded
+        if payload.get("finding_contract") == FINDING_CONTRACT
+        and payload.get("subject") == subject
     ]
     legacy_subjects = {lane_id, subject}
     legacy_records = [
-        (path, payload) for path, payload in loaded
+        (path, payload)
+        for path, payload in loaded
         if payload.get("finding_contract") != FINDING_CONTRACT
         and payload.get("compatibility_contract") == LEGACY_CONNECTOR_CONTRACT
         and payload.get("subject_kind") == "grabowski_lane"
         and payload.get("subject") in legacy_subjects
         and payload.get("checkpoint") == checkpoint
     ]
-    records.sort(key=lambda item: (str(item.get("observed_at", "")), str(item.get("finding_id", ""))))
-    roots = {str(item["finding_id"]): item for item in records if not item.get("recheck_of")}
-    rechecks: dict[str, list[dict[str, Any]]] = {}
-    for item in records:
-        parent = item.get("recheck_of")
+    v1_records.sort(
+        key=lambda pair: (
+            str(pair[1].get("observed_at", "")),
+            str(pair[1].get("finding_id", "")),
+        )
+    )
+    roots = {
+        str(payload["finding_id"]): (path, payload)
+        for path, payload in v1_records
+        if not payload.get("recheck_of")
+    }
+    rechecks: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+    for path, payload in v1_records:
+        parent = payload.get("recheck_of")
         if isinstance(parent, str):
-            rechecks.setdefault(parent, []).append(item)
+            rechecks.setdefault(parent, []).append((path, payload))
 
     current: list[dict[str, Any]] = []
-    for finding_id, root in roots.items():
+    for finding_id, (root_path, root) in roots.items():
         matching_rechecks = [
-            item for item in rechecks.get(finding_id, []) if item.get("checkpoint") == checkpoint
+            pair
+            for pair in rechecks.get(finding_id, [])
+            if pair[1].get("checkpoint") == checkpoint
         ]
-        latest_recheck = matching_rechecks[-1] if matching_rechecks else None
+        latest_pair = matching_rechecks[-1] if matching_rechecks else None
+        latest_recheck = latest_pair[1] if latest_pair is not None else None
         if latest_recheck is not None:
             if latest_recheck.get("conclusion") == "no_longer_reproduced":
                 continue
@@ -1564,17 +1594,55 @@ def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]
                 continue
         elif root.get("checkpoint") != checkpoint:
             continue
-        item = _finding_record_view(root, FINDINGS_ROOT / f"{finding_id}.json")
+        item = _finding_record_view(root, root_path)
         if latest_recheck is not None:
             item["current_recheck"] = {
                 key: latest_recheck.get(key)
-                for key in ("finding_id", "finding_sha256", "checkpoint", "conclusion", "summary", "evidence_refs", "observed_at")
+                for key in (
+                    "finding_id",
+                    "finding_sha256",
+                    "checkpoint",
+                    "conclusion",
+                    "summary",
+                    "evidence_refs",
+                    "observed_at",
+                )
             }
         current.append(item)
     for path, payload in legacy_records:
         current.append(_finding_record_view(payload, path))
-    current.sort(key=lambda item: (_severity_rank(item.get("severity")), str(item.get("finding_id", ""))))
+    current.sort(
+        key=lambda item: (
+            _severity_rank(item.get("severity")),
+            str(item.get("finding_id", "")),
+        )
+    )
     return current
+
+
+def _current_lane_projection(lane_id: str, checkpoint: str) -> dict[str, Any]:
+    loaded, errors = _load_finding_payloads()
+    findings = _lane_findings_from_loaded(lane_id, checkpoint, loaded)
+    quarantined = errors[:MAX_QUARANTINE_RECORDS]
+    return {
+        "findings": findings,
+        "total_current_finding_count": len(findings),
+        "source_complete": not errors,
+        "source_error_count": len(errors),
+        "quarantined_record_count": len(errors),
+        "quarantined_records": quarantined,
+        "quarantine_details_truncated": len(errors) > len(quarantined),
+        "valid_history_record_count": len(loaded),
+        "source_scan_mode": "full-history-scan",
+        "source_health_inherited": False,
+        "source_rescan_required": False,
+        "store_health_observed_at": _utc_now(),
+    }
+
+
+def _current_lane_findings(lane_id: str, checkpoint: str) -> list[dict[str, Any]]:
+    """Reconstruct current valid lane findings; store-health gaps are reported separately."""
+    return _current_lane_projection(lane_id, checkpoint)["findings"]
 
 
 def _worktree_inbox_path(lane_id: str) -> Path:
@@ -1681,6 +1749,145 @@ def _revalidate_open_state_inbox(fd: int, expected_raw: bytes) -> os.stat_result
     if payload.get("writer_identity") != IDENTITY or payload.get("contract") != SIDECAR_CONTRACT:
         raise RuntimeError("external inbox changed before atomic publication")
     return opened
+
+
+def _existing_lane_inbox_payload(
+    dir_fd: int,
+    name: str,
+    *,
+    lane_id: str,
+    checkpoint: str,
+) -> dict[str, Any] | None:
+    opened = _open_secure_state_inbox(dir_fd, name)
+    if opened is None:
+        return None
+    fd, raw = opened
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    finally:
+        os.close(fd)
+    supplied_digest = payload.get("projection_sha256")
+    projection_core = dict(payload)
+    projection_core.pop("projection_sha256", None)
+    if (
+        not isinstance(supplied_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", supplied_digest) is None
+        or supplied_digest != _sha256_json(projection_core)
+        or payload.get("lane_id") != lane_id
+        or payload.get("checkpoint") != checkpoint
+        or payload.get("source_store") != str(FINDINGS_ROOT)
+        or not isinstance(payload.get("findings"), list)
+        or any(not isinstance(item, dict) for item in payload["findings"])
+    ):
+        return None
+    return payload
+
+
+def _incremental_lane_projection(
+    existing: dict[str, Any],
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    lane_id: str,
+    checkpoint: str,
+) -> dict[str, Any] | None:
+    """Advance one same-checkpoint current view without rescanning immutable history."""
+    if payload.get("finding_contract") == FINDING_CONTRACT:
+        if payload.get("recheck_of") is not None:
+            return None
+        if (
+            payload.get("subject") != f"lane:{lane_id}"
+            or payload.get("checkpoint") != checkpoint
+        ):
+            return None
+        view = _finding_record_view(payload, path)
+    elif (
+        payload.get("compatibility_contract") == LEGACY_CONNECTOR_CONTRACT
+        and payload.get("subject_kind") == "grabowski_lane"
+        and payload.get("subject") in {lane_id, f"lane:{lane_id}"}
+        and payload.get("checkpoint") == checkpoint
+    ):
+        view = _finding_record_view(payload, path)
+    else:
+        return None
+
+    findings = [dict(item) for item in existing["findings"]]
+    findings.append(view)
+    findings.sort(
+        key=lambda item: (
+            _severity_rank(item.get("severity")),
+            str(item.get("finding_id", "")),
+        )
+    )
+    prior_total = existing.get(
+        "total_current_finding_count", len(existing["findings"])
+    )
+    if type(prior_total) is not int or prior_total < len(existing["findings"]):
+        return None
+    errors = existing.get("source_error_count", 0)
+    quarantined_count = existing.get("quarantined_record_count", errors)
+    quarantined = existing.get("quarantined_records", [])
+    if (
+        type(errors) is not int
+        or errors < 0
+        or type(quarantined_count) is not int
+        or quarantined_count < 0
+        or not isinstance(quarantined, list)
+        or any(not isinstance(item, dict) for item in quarantined)
+    ):
+        return None
+    return {
+        "findings": findings,
+        "total_current_finding_count": prior_total + 1,
+        "source_complete": False,
+        "source_error_count": errors,
+        "quarantined_record_count": quarantined_count,
+        "quarantined_records": quarantined[:MAX_QUARANTINE_RECORDS],
+        "quarantine_details_truncated": bool(
+            existing.get("quarantine_details_truncated", False)
+        ),
+        "valid_history_record_count": existing.get("valid_history_record_count"),
+        "source_scan_mode": "incremental-current-view",
+        "source_health_inherited": True,
+        "source_rescan_required": True,
+        "store_health_observed_at": existing.get(
+            "store_health_observed_at", existing.get("generated_at")
+        ),
+    }
+
+
+def _encode_bounded_inbox_payload(
+    base_payload: dict[str, Any],
+    findings: list[dict[str, Any]],
+    *,
+    total_current_finding_count: int,
+) -> tuple[dict[str, Any], bytes]:
+    visible = list(findings)
+    while True:
+        omitted = max(0, total_current_finding_count - len(visible))
+        payload = {
+            **base_payload,
+            "findings": visible,
+            "finding_count": len(visible),
+            "total_current_finding_count": total_current_finding_count,
+            "projection_complete": omitted == 0,
+            "omitted_finding_count": omitted,
+            "omission_reason": (
+                None if omitted == 0 else "bounded_current_view"
+            ),
+            "omitted_identity_complete": omitted == 0,
+        }
+        payload["projection_sha256"] = _sha256_json(payload)
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+            + "\n"
+        ).encode("utf-8")
+        if len(encoded) <= MAX_OUTPUT_BYTES:
+            return payload, encoded
+        if visible:
+            visible.pop()
+            continue
+        raise RuntimeError("worktree inbox metadata exceeds bounded size")
 
 
 def _renameat2(dir_fd: int, left: str, right: str, flags: int) -> None:
@@ -1792,10 +1999,16 @@ def _atomic_write_inbox(dir_fd: int, name: str, encoded: bytes) -> None:
 
 
 def _publish_worktree_inbox(
-    lane_id: str, *, expected_checkpoint: str | None = None
+    lane_id: str,
+    *,
+    expected_checkpoint: str | None = None,
+    incremental_record: tuple[Path, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     initial_target = _read_work_target(lane_id)
-    if expected_checkpoint is not None and initial_target["checkpoint"] != expected_checkpoint:
+    if (
+        expected_checkpoint is not None
+        and initial_target["checkpoint"] != expected_checkpoint
+    ):
         raise RuntimeError("lane checkpoint changed before inbox publication")
     worktree = Path(initial_target["worktree"])
     inbox_path = _validate_worktree_inbox_pointer(worktree, lane_id)
@@ -1811,12 +2024,36 @@ def _publish_worktree_inbox(
         target = _read_work_target(lane_id)
         if Path(target["worktree"]) != worktree:
             raise RuntimeError("lane worktree changed during inbox publication")
-        if expected_checkpoint is not None and target["checkpoint"] != expected_checkpoint:
+        if (
+            expected_checkpoint is not None
+            and target["checkpoint"] != expected_checkpoint
+        ):
             raise RuntimeError("lane checkpoint changed during inbox publication")
         if _validate_worktree_inbox_pointer(worktree, lane_id) != inbox_path:
             raise RuntimeError("worktree inbox pointer changed during publication")
-        findings = _current_lane_findings(lane_id, target["checkpoint"])
-        payload = {
+
+        projection: dict[str, Any] | None = None
+        if incremental_record is not None:
+            existing = _existing_lane_inbox_payload(
+                inbox_dir_fd,
+                inbox_path.name,
+                lane_id=lane_id,
+                checkpoint=target["checkpoint"],
+            )
+            if existing is not None:
+                projection = _incremental_lane_projection(
+                    existing,
+                    incremental_record[0],
+                    incremental_record[1],
+                    lane_id=lane_id,
+                    checkpoint=target["checkpoint"],
+                )
+        if projection is None:
+            projection = _current_lane_projection(
+                lane_id, target["checkpoint"]
+            )
+
+        base_payload = {
             "schema_version": 1,
             "contract": SIDECAR_CONTRACT,
             "writer_identity": IDENTITY,
@@ -1826,10 +2063,32 @@ def _publish_worktree_inbox(
             "worktree": target["worktree"],
             "branch": target["branch"],
             "checkpoint": target["checkpoint"],
-            "source_complete": True,
+            "source_complete": projection["source_complete"],
+            "source_error_count": projection["source_error_count"],
+            "quarantined_record_count": projection[
+                "quarantined_record_count"
+            ],
+            "quarantined_records": projection["quarantined_records"],
+            "quarantine_details_truncated": projection[
+                "quarantine_details_truncated"
+            ],
+            "valid_history_record_count": projection[
+                "valid_history_record_count"
+            ],
+            "source_scan_mode": projection["source_scan_mode"],
+            "source_health_inherited": projection[
+                "source_health_inherited"
+            ],
+            "source_rescan_required": projection[
+                "source_rescan_required"
+            ],
+            "store_health_observed_at": projection[
+                "store_health_observed_at"
+            ],
+            "history_mutation_model": "immutable_append_only",
+            "current_view_model": "bounded_reconstructible_projection",
             "source_store": str(FINDINGS_ROOT),
             "inbox_store": str(inbox_path),
-            "findings": findings,
             "generated_at": _utc_now(),
             "effect_contract": "advisory_only_no_automatic_action",
             "does_not_establish": [
@@ -1839,9 +2098,13 @@ def _publish_worktree_inbox(
                 "effect_permission",
             ],
         }
-        encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
-        if len(encoded) > MAX_OUTPUT_BYTES:
-            raise RuntimeError("worktree inbox exceeds bounded size")
+        payload, encoded = _encode_bounded_inbox_payload(
+            base_payload,
+            projection["findings"],
+            total_current_finding_count=projection[
+                "total_current_finding_count"
+            ],
+        )
         _atomic_write_inbox(inbox_dir_fd, inbox_path.name, encoded)
         published_target = _read_work_target(lane_id)
         if Path(published_target["worktree"]) != worktree:
@@ -1858,10 +2121,21 @@ def _publish_worktree_inbox(
         "state": "published",
         "lane_id": lane_id,
         "checkpoint": target["checkpoint"],
-        "finding_count": len(findings),
+        "finding_count": payload["finding_count"],
+        "total_current_finding_count": payload[
+            "total_current_finding_count"
+        ],
+        "projection_complete": payload["projection_complete"],
+        "omitted_finding_count": payload["omitted_finding_count"],
         "sidecar": str(worktree / ".adler" / "inbox.json"),
         "inbox_store": str(inbox_path),
-        "source_complete": True,
+        "source_complete": payload["source_complete"],
+        "source_error_count": payload["source_error_count"],
+        "quarantined_record_count": payload[
+            "quarantined_record_count"
+        ],
+        "source_scan_mode": payload["source_scan_mode"],
+        "source_rescan_required": payload["source_rescan_required"],
         "observed_at": _utc_now(),
     }
 
@@ -1874,17 +2148,33 @@ def publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
 
 @mcp.tool(name="list_findings", annotations=READ_ANNOTATIONS)
 def list_findings(limit: int = 20) -> dict[str, Any]:
-    """List recent immutable findings while keeping legacy records readable."""
+    """List recent valid findings and expose bounded health for immutable history."""
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
     records, errors = _load_finding_payloads()
     selected = records[-limit:]
-    items = [_finding_record_view(payload, path) for path, payload in reversed(selected)]
+    items = [
+        _finding_record_view(payload, path)
+        for path, payload in reversed(selected)
+    ]
+    quarantined = errors[:MAX_QUARANTINE_RECORDS]
+    store_health = {
+        "source_complete": not errors,
+        "valid_record_count": len(records),
+        "quarantined_record_count": len(errors),
+        "quarantined_records": quarantined,
+        "quarantine_details_truncated": len(errors) > len(quarantined),
+        "history_mutation_model": "immutable_append_only",
+        "current_view_model": "bounded_reconstructible_projection",
+        "observed_at": _utc_now(),
+    }
     return {
         "count": len(items),
         "findings": items,
         "source_complete": not errors,
         "source_error_count": len(errors),
+        "quarantined_record_count": len(errors),
+        "store_health": store_health,
         "observed_at": _utc_now(),
     }
 
@@ -2044,6 +2334,9 @@ def submit_finding(
         payload["conclusion"] = conclusion
 
     finding_sha256, record_sha256 = _persist_finding(payload)
+    persisted_payload = dict(payload)
+    persisted_payload["finding_sha256"] = finding_sha256
+    persisted_path = FINDINGS_ROOT / f"{finding_id}.json"
     delivery: dict[str, Any] = {"state": "not_applicable"}
     lane_match = _LANE_SUBJECT_RE.fullmatch(subject_clean)
     if lane_match is not None:
@@ -2051,6 +2344,7 @@ def submit_finding(
             delivery = _publish_worktree_inbox(
                 lane_match.group(1),
                 expected_checkpoint=checkpoint_clean,
+                incremental_record=(persisted_path, persisted_payload),
             )
         except Exception as exc:
             delivery = {
@@ -2133,12 +2427,15 @@ def submit_finding_legacy(
         "effect_contract": "advisory_only_no_automatic_action",
     }
     finding_sha256, record_sha256 = _persist_finding(payload)
+    persisted_path = FINDINGS_ROOT / f"{finding_id}.json"
 
     delivery: dict[str, Any] = {"state": "not_applicable"}
     if lane_id is not None and checkpoint_clean not in {None, ""}:
         try:
             delivery = _publish_worktree_inbox(
-                lane_id, expected_checkpoint=checkpoint_clean
+                lane_id,
+                expected_checkpoint=checkpoint_clean,
+                incremental_record=(persisted_path, payload),
             )
         except Exception as exc:
             delivery = {

@@ -294,14 +294,16 @@ def test_publish_changes_only_external_inbox_not_worktree_metadata(tmp_path: Pat
     assert (sidecar / ".gitignore").read_bytes() == gitignore_before
 
 
-def test_sidecar_size_limit_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sidecar_metadata_limit_still_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
     lane_id = "4" * 32
     target = _install_pointer(worktree, state, lane_id)
     monkeypatch.setattr(server, "_read_work_target", lambda lane: _target(worktree, lane))
     monkeypatch.setattr(server, "MAX_OUTPUT_BYTES", 64)
-    with pytest.raises(RuntimeError, match="inbox exceeds bounded size"):
+    with pytest.raises(RuntimeError, match="metadata exceeds bounded size"):
         server.publish_worktree_inbox(lane_id)
     assert not target.exists()
 
