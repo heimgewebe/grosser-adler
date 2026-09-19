@@ -687,14 +687,16 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
 
 
 def _parse_service_units(text: str) -> tuple[list[dict[str, str]], bool]:
-    """Parse `systemctl list-units` rows.
+    """Parse bounded, already-redacted `systemctl list-units` rows.
 
-    The unit column survives redaction because systemd reads pass their
-    validated identity to `_redact_preserving_identity`, so the emitted unit
-    identity is byte-exact
-    and identical to the raw source evidence in the same response. Load, active
-    and sub are structural systemd state tokens and are checked against that
-    vocabulary; the description stays free text under normal redaction.
+    `_run` performs redaction first and preserves only the identities extracted
+    from the raw listing's first column. This parser never receives privileged
+    raw stdout: it parses the bounded redacted receipt returned by `_run`.
+    The unit identity therefore remains byte-exact only because
+    `_redact_preserving_identity` left that validated first-column identity
+    intact. Load, active and sub are structural systemd state tokens and are
+    checked against that vocabulary; the description remains ordinary redacted
+    free text.
     """
     units: list[dict[str, str]] = []
     complete = True
