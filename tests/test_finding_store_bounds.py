@@ -110,10 +110,10 @@ def test_same_checkpoint_hot_submit_does_not_rescan_unrelated_history(
     real_loader = server._load_finding_payloads
     scans = 0
 
-    def counted_loader():
+    def counted_loader(names=None):
         nonlocal scans
         scans += 1
-        return real_loader()
+        return real_loader(names)
 
     monkeypatch.setattr(server, "_load_finding_payloads", counted_loader)
     first = server.submit_finding(**_finding_args(lane_id))
@@ -234,10 +234,10 @@ def test_tampered_current_view_never_defines_incremental_membership(
     real_loader = server._load_finding_payloads
     scans = 0
 
-    def counted_loader():
+    def counted_loader(names=None):
         nonlocal scans
         scans += 1
-        return real_loader()
+        return real_loader(names)
 
     monkeypatch.setattr(server, "_load_finding_payloads", counted_loader)
     second = server.submit_finding(
@@ -330,10 +330,10 @@ def test_history_ahead_of_projection_forces_full_scan(
     real_loader = server._load_finding_payloads
     scans = 0
 
-    def counted_loader():
+    def counted_loader(names=None):
         nonlocal scans
         scans += 1
-        return real_loader()
+        return real_loader(names)
 
     monkeypatch.setattr(server, "_load_finding_payloads", counted_loader)
     third = server.submit_finding(
@@ -378,3 +378,119 @@ def test_corrupt_existing_inbox_is_rebuilt_from_canonical_history(
         "fixture finding",
         "second after corrupt inbox",
     }
+
+def test_hidden_json_record_is_in_watermark_and_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "8" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(
+        server, "_read_work_target", lambda lane: _target(worktree, lane)
+    )
+
+    hidden = state / "findings" / ".hidden.json"
+    hidden.write_text("{broken", encoding="utf-8")
+    hidden.chmod(0o600)
+
+    result = server.publish_worktree_inbox(lane_id)
+    assert result["state"] == "published"
+    assert result["source_complete"] is False
+    inbox = json.loads(target.read_text(encoding="utf-8"))
+    assert inbox["store_record_name_count"] == 1
+    assert inbox["quarantined_record_count"] == 1
+    assert inbox["quarantined_records"] == [
+        {"record": ".hidden.json", "error_type": "RuntimeError"}
+    ]
+    assert inbox["source_complete"] is False
+
+
+def test_append_during_increment_validation_forces_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    lane_id = "9" * 32
+    target = _install_pointer(worktree, state, lane_id)
+    monkeypatch.setattr(
+        server, "_read_work_target", lambda lane: _target(worktree, lane)
+    )
+
+    first = server.submit_finding(**_finding_args(lane_id))
+    assert first["delivery"]["source_scan_mode"] == "full-history-scan"
+    prior_names = {
+        path.name for path in (state / "findings").iterdir() if path.name.endswith(".json")
+    }
+
+    concurrent_id = "ga-20260919T134000Z-000000000009"
+    concurrent_core = {
+        "schema_version": 1,
+        "finding_contract": server.FINDING_CONTRACT,
+        "finding_id": concurrent_id,
+        "adler_identity": server.IDENTITY,
+        "kind": "observation",
+        "severity": "low",
+        "confidence": 1.0,
+        "subject": f"lane:{lane_id}",
+        "checkpoint": OID_A,
+        "binding_strength": "exact",
+        "summary": "concurrent append during incremental validation",
+        "evidence_refs": ["fixture:concurrent"],
+        "observed_at": "2026-09-19T13:40:00+00:00",
+        "effect_contract": "advisory_only_no_automatic_action",
+    }
+    concurrent_payload = dict(concurrent_core)
+    concurrent_payload["finding_sha256"] = server._sha256_json(concurrent_core)
+    concurrent_path = state / "findings" / f"{concurrent_id}.json"
+
+    real_read = server._read_json_file_no_symlink
+    injected = False
+
+    def injecting_read(path: Path):
+        nonlocal injected
+        payload = real_read(path)
+        if (
+            not injected
+            and path.parent == state / "findings"
+            and path.name not in prior_names
+            and path.name != concurrent_path.name
+        ):
+            concurrent_path.write_text(
+                json.dumps(
+                    concurrent_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            concurrent_path.chmod(0o600)
+            injected = True
+        return payload
+
+    monkeypatch.setattr(server, "_read_json_file_no_symlink", injecting_read)
+    real_loader = server._load_finding_payloads
+    scans = 0
+
+    def counted_loader(names=None):
+        nonlocal scans
+        scans += 1
+        return real_loader(names)
+
+    monkeypatch.setattr(server, "_load_finding_payloads", counted_loader)
+    second = server.submit_finding(
+        **_finding_args(lane_id, summary="second finding around concurrent append")
+    )
+    assert injected is True
+    assert second["delivery"]["state"] == "published"
+    assert second["delivery"]["source_scan_mode"] == "full-history-scan"
+    assert scans == 1
+
+    inbox = json.loads(target.read_text(encoding="utf-8"))
+    ids = [item["finding_id"] for item in inbox["findings"]]
+    assert concurrent_id in ids
+    assert len(ids) == 3
+    assert len(ids) == len(set(ids))
+    assert inbox["source_complete"] is True

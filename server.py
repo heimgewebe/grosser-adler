@@ -1487,12 +1487,21 @@ def _finding_quarantine_evidence(path: Path, exc: BaseException) -> dict[str, st
     return {"record": path.name, "error_type": type(exc).__name__}
 
 
-def _load_finding_payloads() -> tuple[list[tuple[Path, dict[str, Any]]], list[dict[str, str]]]:
+def _load_finding_payloads(
+    names: list[str] | None = None,
+) -> tuple[list[tuple[Path, dict[str, Any]]], list[dict[str, str]]]:
     """Read immutable history while keeping malformed records explicit and isolated."""
     _ensure_state()
+    if names is None:
+        names = sorted(
+            name
+            for name in os.listdir(FINDINGS_ROOT)
+            if isinstance(name, str) and name.endswith(".json")
+        )
     records: list[tuple[Path, dict[str, Any]]] = []
     errors: list[dict[str, str]] = []
-    for path in sorted(FINDINGS_ROOT.glob("*.json")):
+    for name in names:
+        path = FINDINGS_ROOT / name
         try:
             payload = _read_json_file_no_symlink(path)
             _validate_v1_finding_payload(payload, path)
@@ -1645,7 +1654,7 @@ def _scan_finding_store_index() -> dict[str, Any]:
         fcntl.flock(dir_fd, fcntl.LOCK_SH)
         locked = True
         before_names, before_digest = _finding_store_name_snapshot(dir_fd)
-        loaded, errors = _load_finding_payloads()
+        loaded, errors = _load_finding_payloads(before_names)
         after_names, after_digest = _finding_store_name_snapshot(dir_fd)
     finally:
         if locked:
@@ -1653,12 +1662,24 @@ def _scan_finding_store_index() -> dict[str, Any]:
         os.close(dir_fd)
 
     membership_stable = before_names == after_names and before_digest == after_digest
+    name_reconciliation_complete = (
+        membership_stable
+        and len(loaded) + len(errors) == len(after_names)
+    )
     if not membership_stable:
         errors = [
             *errors,
             {
                 "record": "<finding-store>",
                 "error_type": "ConcurrentMutation",
+            },
+        ]
+    elif not name_reconciliation_complete:
+        errors = [
+            *errors,
+            {
+                "record": "<finding-store>",
+                "error_type": "NameReconciliationIncomplete",
             },
         ]
     return {
@@ -1669,6 +1690,7 @@ def _scan_finding_store_index() -> dict[str, Any]:
         "store_record_name_count": len(after_names) if membership_stable else None,
         "store_names_sha256": after_digest if membership_stable else None,
         "membership_stable": membership_stable,
+        "name_reconciliation_complete": name_reconciliation_complete,
         "full_scan_observed_at": _utc_now(),
     }
 
@@ -1684,6 +1706,7 @@ def _try_increment_finding_store_index(
         not isinstance(existing, dict)
         or existing.get("root") != str(FINDINGS_ROOT)
         or existing.get("membership_stable") is not True
+        or existing.get("name_reconciliation_complete") is not True
         or existing.get("errors")
         or not isinstance(existing.get("store_names_sha256"), str)
         or type(existing.get("store_record_name_count")) is not int
@@ -1730,15 +1753,20 @@ def _try_increment_finding_store_index(
         if canonical != payload:
             return None
 
+        after_names, after_digest = _finding_store_name_snapshot(dir_fd)
+        if after_names != names or after_digest != names_digest:
+            return None
+
         records = [*existing["records"], (path, canonical)]
         advanced = {
             "root": str(FINDINGS_ROOT),
             "records": records,
             "errors": [],
-            "store_record_names": names,
-            "store_record_name_count": len(names),
-            "store_names_sha256": names_digest,
+            "store_record_names": after_names,
+            "store_record_name_count": len(after_names),
+            "store_names_sha256": after_digest,
             "membership_stable": True,
+            "name_reconciliation_complete": True,
             "full_scan_observed_at": existing.get("full_scan_observed_at"),
         }
         _FINDING_INDEX = advanced
@@ -1767,6 +1795,7 @@ def _projection_from_finding_index(
         "source_complete": bool(
             not incremental
             and index.get("membership_stable") is True
+            and index.get("name_reconciliation_complete") is True
             and not errors
         ),
         "source_error_count": len(errors),
@@ -2120,10 +2149,17 @@ def _publish_worktree_inbox(
     if hasattr(os, "O_NOFOLLOW"):
         inbox_flags |= os.O_NOFOLLOW
     inbox_dir_fd = os.open(INBOX_ROOT, inbox_flags)
+    store_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        store_flags |= os.O_NOFOLLOW
+    store_dir_fd = os.open(FINDINGS_ROOT, store_flags)
     locked = False
+    store_locked = False
     try:
         fcntl.flock(inbox_dir_fd, fcntl.LOCK_EX)
         locked = True
+        fcntl.flock(store_dir_fd, fcntl.LOCK_SH)
+        store_locked = True
         target = _read_work_target(lane_id)
         if Path(target["worktree"]) != worktree:
             raise RuntimeError("lane worktree changed during inbox publication")
@@ -2211,6 +2247,9 @@ def _publish_worktree_inbox(
         if _validate_worktree_inbox_pointer(worktree, lane_id) != inbox_path:
             raise RuntimeError("worktree inbox pointer changed after publication")
     finally:
+        if store_locked:
+            fcntl.flock(store_dir_fd, fcntl.LOCK_UN)
+        os.close(store_dir_fd)
         if locked:
             fcntl.flock(inbox_dir_fd, fcntl.LOCK_UN)
         os.close(inbox_dir_fd)
