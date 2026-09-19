@@ -1,9 +1,11 @@
+# Public example only. Keep live tunnel and organization identifiers in the private
+# tunnel-client profile; do not commit them to this repository.
 config_version: 1
 control_plane:
   base_url: "https://api.openai.com"
-  tunnel_id: "tunnel_6aa97f2f11a08191b43b826ddd03fd8e"
+  tunnel_id: "tunnel_REPLACE_ME"
   extra_headers:
-    OpenAI-Organization: "org-Sw2ulaVZWkWNnXBKQ8pJVQEZ"
+    OpenAI-Organization: "org_REPLACE_ME"
   api_key: "env:CONTROL_PLANE_API_KEY"
 health:
   listen_addr: "127.0.0.1:18086"
