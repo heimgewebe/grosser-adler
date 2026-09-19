@@ -9,16 +9,14 @@ permissions:
   contents: read
 
 jobs:
-  # The `captain-exact-base-main` ruleset requires the status-check context
-  # `pytest` exactly. The context is the job name, and a matrix would rename it
-  # to `pytest (3.10)`, so this job stays single-version and unrenamed; broader
-  # interpreter coverage lives in `pytest-3-11`.
+  # These stable job names are part of the repository's merge policy. The
+  # base-side .github/grabowski-required-checks.json is the canonical contract
+  # consumed by Grabowski's review gate; the GitHub ruleset mirrors the same
+  # contexts. Keep these names stable or update both policy surfaces together.
   #
-  # `ruff` and `pytest-3-11` are NOT required contexts in that ruleset yet, so
-  # on their own they do not block a merge; a red run does make the PR
-  # UNSTABLE rather than CLEAN, which the canonical Captain merge path refuses.
-  # Adding them to the ruleset is repository policy and is tracked separately
-  # (Bureau candidate event 16771); Captain never changes repository settings.
+  # The `pytest` job stays single-version and unrenamed because a matrix would
+  # change its status-check context to e.g. `pytest (3.10)`. Broader interpreter
+  # coverage remains the separate `pytest-3-11` job.
   pytest:
     runs-on: ubuntu-latest
     steps:
