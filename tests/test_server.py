@@ -545,7 +545,7 @@ def test_redaction_never_merges_rows_across_a_newline(
     assert server._redact("Authorization\t=\tBearer-xyz") == "<REDACTED>"
 
 
-def test_list_user_services_fails_closed_if_redaction_merges_rows(
+def test_list_user_services_preserves_rows_across_multiline_secret_redaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A multi-line private-key block legitimately collapses lines; the row-count
@@ -641,7 +641,7 @@ def test_service_logs_fails_closed_when_redaction_changes_the_row_count(
                 "stdout": stdout,
                 "stderr": "",
                 "stdout_truncated": False,
-                "stderr_truncated": False,
+                "stderr_truncated": False, "rows_intact": True,
             }
         return {
             "returncode": 0,
@@ -904,8 +904,8 @@ def test_list_user_services_fails_closed_on_unparseable_rows(monkeypatch: pytest
 
 def test_service_status_fails_closed_on_truncated_or_failed_show(monkeypatch: pytest.MonkeyPatch) -> None:
     observations = [
-        {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False},
-        {"returncode": 1, "stdout": "ActiveState=active\n", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False},
+        {"returncode": 0, "stdout": "ActiveState=active\nMainPID=100\n", "stderr": "", "stdout_truncated": True, "stderr_truncated": False, "rows_intact": True},
+        {"returncode": 1, "stdout": "ActiveState=active\n", "stderr": "failed", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True},
     ]
     for observation in observations:
         monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
@@ -916,8 +916,8 @@ def test_service_status_fails_closed_on_truncated_or_failed_show(monkeypatch: py
 
 def test_service_status_fails_closed_on_missing_or_malformed_properties(monkeypatch: pytest.MonkeyPatch) -> None:
     observations = [
-        {"returncode": 0, "stdout": "ActiveState=active\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False},
-        {"returncode": 0, "stdout": _complete_service_show_fixture() + "malformed-row\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False},
+        {"returncode": 0, "stdout": "ActiveState=active\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True},
+        {"returncode": 0, "stdout": _complete_service_show_fixture() + "malformed-row\n", "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True},
     ]
     for observation in observations:
         monkeypatch.setattr(server, "_run", lambda argv, **kwargs: observation)
@@ -941,7 +941,7 @@ def test_service_status_selects_system_scope_when_user_shadow_is_inactive(monkey
             )
         return {
             "returncode": 0, "stdout": stdout, "stderr": "",
-            "stdout_truncated": False, "stderr_truncated": False,
+            "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)
@@ -961,7 +961,7 @@ def test_service_status_fails_closed_when_same_name_is_active_in_both_scopes(mon
         "stdout": _complete_service_show_fixture(),
         "stderr": "",
         "stdout_truncated": False,
-        "stderr_truncated": False,
+        "stderr_truncated": False, "rows_intact": True,
     })
     result = server.service_status("nixer-mcp.service")
     assert result["observation_complete"] is False
@@ -1007,7 +1007,7 @@ def test_service_status_fails_closed_for_competing_running_or_transition_states(
             "stdout": stdout,
             "stderr": "",
             "stdout_truncated": False,
-            "stderr_truncated": False,
+            "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)
@@ -1029,7 +1029,7 @@ def test_service_logs_refuses_ambiguous_transition_scope(monkeypatch: pytest.Mon
             "stdout": _complete_service_show_fixture(main_pid=100, active_state=state),
             "stderr": "",
             "stdout_truncated": False,
-            "stderr_truncated": False,
+            "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)

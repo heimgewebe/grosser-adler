@@ -770,7 +770,11 @@ def _service_show_argv(unit: str, scope: Literal["user", "system"]) -> list[str]
 
 def _observe_service_scope(unit: str, scope: Literal["user", "system"]) -> dict[str, Any]:
     result = _run(_service_show_argv(unit, scope), preserved_identity=(unit,))
-    source_complete = result["returncode"] == 0 and not result["stdout_truncated"]
+    source_complete = (
+        result["returncode"] == 0
+        and not result["stdout_truncated"]
+        and result["rows_intact"]
+    )
     properties: dict[str, str] = {}
     parse_complete = False
     if source_complete:
