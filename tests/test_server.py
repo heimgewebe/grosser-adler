@@ -1174,6 +1174,8 @@ def _runtime_identity_fixture(
         "immutable_release_path": str(release),
         "executable": str(release_python),
         "entrypoint_path": str(entrypoint),
+        "entrypoint_contract": {"mode": "module", "module": "grabowski_operator"},
+        "module_paths": {"grabowski_operator": str(entrypoint)},
         "completion_status": "complete",
     }
     manifest_path = release / "deployment-manifest.json"
@@ -1191,6 +1193,9 @@ def _runtime_identity_fixture(
     (proc_pid / "cgroup").write_text(f"0::{control_group}\n", encoding="utf-8")
     (proc_pid / "maps").write_text(_proc_map_line(mapped), encoding="utf-8")
     (proc_pid / "exe").symlink_to(executable)
+    (proc_pid / "cmdline").write_bytes(
+        str(executable).encode("utf-8") + b"\x00-m\x00grabowski_operator\x00"
+    )
 
     monkeypatch.setattr(server, "PROC_ROOT", proc_root)
     monkeypatch.setattr(server, "GRABOWSKI_RELEASE_ROOT", releases)
@@ -1202,6 +1207,7 @@ def _runtime_identity_fixture(
         "repo_head": repo_head,
         "release": release,
         "release_python": release_python,
+        "entrypoint": entrypoint,
         "manifest_path": manifest_path,
         "mapped": mapped,
         "executable": executable,
@@ -1229,8 +1235,46 @@ def test_runtime_identity_binds_pid_cgroup_mapped_inode_and_manifest(
         "procfs_exe",
         "procfs_maps_immutable_release",
         "immutable_release_manifest",
+        "procfs_cmdline_manifest_entrypoint",
     ]
     assert result["missing_evidence"] == []
+
+
+def test_runtime_identity_rejects_same_release_with_different_module_entrypoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
+    (fixture["proc_pid"] / "cmdline").write_bytes(
+        str(fixture["executable"]).encode("utf-8") + b"\0-m\0other_operator\0"
+    )
+
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+    )
+
+    assert result["identity_complete"] is False
+    assert result["release_id"] is None
+    assert result["source_commit_or_repo_head"] is None
+    assert result["missing_evidence"] == ["process_entrypoint_binding"]
+
+
+def test_runtime_identity_rejects_missing_process_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
+    (fixture["proc_pid"] / "cmdline").unlink()
+
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+    )
+
+    assert result["identity_complete"] is False
+    assert result["release_id"] is None
+    assert result["missing_evidence"] == ["proc_cmdline"]
 
 
 def test_runtime_identity_rejects_non_executable_release_mapping(

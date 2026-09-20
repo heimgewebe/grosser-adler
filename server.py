@@ -80,6 +80,7 @@ _RELEASE_ID_RE = re.compile(
     r"^(?P<head>[0-9a-f]{12})-srcset[0-9a-f]{12}-lock[0-9a-f]{12}-contract[0-9a-f]{12}$"
 )
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_PYTHON_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 PROC_ROOT = Path("/proc")
 GRABOWSKI_RELEASE_ROOT = Path("/home/alex/.local/share/grabowski-mcp-releases")
 MAX_PROC_RUNTIME_BYTES = 2_000_000
@@ -591,6 +592,23 @@ def _proc_executable(pid: int, *, proc_root: Path | None = None) -> str | None:
     return _safe_identity_text(value)
 
 
+def _proc_launch_argv(
+    pid: int,
+    *,
+    proc_root: Path | None = None,
+) -> tuple[str, str, str] | None:
+    raw = _read_proc_text(pid, "cmdline", max_bytes=64_000, proc_root=proc_root)
+    if raw is None or not raw.endswith("\x00"):
+        return None
+    parts = raw[:-1].split("\x00")
+    if len(parts) < 3:
+        return None
+    first = parts[:3]
+    if any(_safe_identity_text(part) is None for part in first):
+        return None
+    return first[0], first[1], first[2]
+
+
 def _mapped_release_root(
     maps_text: str,
     *,
@@ -699,27 +717,34 @@ def _read_bound_runtime_manifest(path: Path) -> dict[str, Any] | None:
 def _release_manifest_identity(
     release: Path,
     observed_executable: str,
-) -> tuple[str | None, str | None, str | None]:
+) -> tuple[
+    str | None,
+    str | None,
+    tuple[str, str] | None,
+    str | None,
+]:
     try:
         release_meta = release.lstat()
     except OSError:
-        return None, None, "immutable_release_path"
+        return None, None, None, "immutable_release_path"
     if (
         not stat.S_ISDIR(release_meta.st_mode)
         or release_meta.st_uid != os.getuid()
         or release_meta.st_mode & 0o022
         or _RELEASE_ID_RE.fullmatch(release.name) is None
     ):
-        return None, None, "immutable_release_path"
+        return None, None, None, "immutable_release_path"
 
     manifest = _read_bound_runtime_manifest(release / "deployment-manifest.json")
     if manifest is None:
-        return None, None, "release_manifest"
+        return None, None, None, "release_manifest"
     release_id = manifest.get("release_id")
     repo_head = manifest.get("repo_head")
     immutable_path = manifest.get("immutable_release_path")
     release_python_raw = manifest.get("executable")
     entrypoint_raw = manifest.get("entrypoint_path")
+    entrypoint_contract = manifest.get("entrypoint_contract")
+    module_paths = manifest.get("module_paths")
     match = _RELEASE_ID_RE.fullmatch(release_id) if isinstance(release_id, str) else None
     if (
         match is None
@@ -731,8 +756,10 @@ def _release_manifest_identity(
         or manifest.get("completion_status") != "complete"
         or not isinstance(release_python_raw, str)
         or not isinstance(entrypoint_raw, str)
+        or not isinstance(entrypoint_contract, dict)
+        or not isinstance(module_paths, dict)
     ):
-        return None, None, "release_manifest_identity"
+        return None, None, None, "release_manifest_identity"
 
     release_python = Path(release_python_raw)
     entrypoint = Path(entrypoint_raw)
@@ -744,21 +771,38 @@ def _release_manifest_identity(
         or not release_python.is_relative_to(release)
         or not entrypoint.is_relative_to(release)
     ):
-        return None, None, "release_manifest_paths"
+        return None, None, None, "release_manifest_paths"
     try:
         python_real = release_python.resolve(strict=True)
         entrypoint_meta = entrypoint.lstat()
     except OSError:
-        return None, None, "release_manifest_paths"
+        return None, None, None, "release_manifest_paths"
     if (
         str(python_real) != observed_executable
         or not stat.S_ISREG(entrypoint_meta.st_mode)
         or entrypoint_meta.st_uid != os.getuid()
         or entrypoint_meta.st_mode & 0o022
     ):
-        return None, None, "release_manifest_paths"
-    return release_id, repo_head, None
+        return None, None, None, "release_manifest_paths"
 
+    launch_mode = entrypoint_contract.get("mode")
+    launch_module = entrypoint_contract.get("module")
+    if (
+        launch_mode != "module"
+        or not isinstance(launch_module, str)
+        or _PYTHON_MODULE_RE.fullmatch(launch_module) is None
+        or module_paths.get(launch_module) != str(entrypoint)
+    ):
+        return None, None, None, "release_manifest_entrypoint_contract"
+    return release_id, repo_head, ("module", launch_module), None
+
+
+def _launch_argv_matches(
+    argv: tuple[str, str, str],
+    launch_identity: tuple[str, str],
+) -> bool:
+    mode, value = launch_identity
+    return mode == "module" and argv[1:] == ("-m", value)
 
 def _runtime_identity_observation(
     pid: int,
@@ -809,21 +853,41 @@ def _runtime_identity_observation(
         )
     sources.append("procfs_maps_immutable_release")
 
-    release_id, repo_head, manifest_reason = _release_manifest_identity(
+    release_id, repo_head, launch_identity, manifest_reason = _release_manifest_identity(
         release,
         executable_before,
     )
-    if manifest_reason is not None:
+    if manifest_reason is not None or launch_identity is None:
         return _runtime_identity_unknown(
-            [manifest_reason],
+            [manifest_reason or "release_manifest_entrypoint_contract"],
             executable_path_or_identity=executable_before,
             identity_source=tuple(sources),
         )
     sources.append("immutable_release_manifest")
 
+    launch_argv_before = _proc_launch_argv(pid, proc_root=proc_root)
+    if launch_argv_before is None:
+        return _runtime_identity_unknown(
+            ["proc_cmdline"],
+            executable_path_or_identity=executable_before,
+            identity_source=tuple(sources),
+        )
+    if not _launch_argv_matches(launch_argv_before, launch_identity):
+        return _runtime_identity_unknown(
+            ["process_entrypoint_binding"],
+            executable_path_or_identity=executable_before,
+            identity_source=tuple(sources + ["procfs_cmdline"]),
+        )
+    sources.append("procfs_cmdline_manifest_entrypoint")
+
     after_cgroup = _proc_cgroup(pid, proc_root=proc_root)
     executable_after = _proc_executable(pid, proc_root=proc_root)
-    if after_cgroup != expected_cgroup or executable_after != executable_before:
+    launch_argv_after = _proc_launch_argv(pid, proc_root=proc_root)
+    if (
+        after_cgroup != expected_cgroup
+        or executable_after != executable_before
+        or launch_argv_after != launch_argv_before
+    ):
         return _runtime_identity_unknown(
             ["process_changed_during_identity_observation"],
             executable_path_or_identity=executable_before,
@@ -838,7 +902,6 @@ def _runtime_identity_observation(
         "identity_complete": True,
         "missing_evidence": [],
     }
-
 
 def _descendant_rows(rows: list[dict[str, Any]], root_pid: int) -> list[dict[str, Any]]:
     by_parent: dict[int, list[dict[str, Any]]] = {}
