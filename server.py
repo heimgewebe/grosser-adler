@@ -600,17 +600,14 @@ def _proc_launch_argv(
     pid: int,
     *,
     proc_root: Path | None = None,
-) -> tuple[str, str, str] | None:
+) -> tuple[str, ...] | None:
     raw = _read_proc_text(pid, "cmdline", max_bytes=64_000, proc_root=proc_root)
     if raw is None or not raw.endswith("\x00"):
         return None
     parts = raw[:-1].split("\x00")
-    if len(parts) < 3:
+    if len(parts) < 3 or any(_safe_identity_text(part) is None for part in parts):
         return None
-    first = parts[:3]
-    if any(_safe_identity_text(part) is None for part in first):
-        return None
-    return first[0], first[1], first[2]
+    return tuple(parts)
 
 
 def _mapped_release_root(
@@ -815,7 +812,7 @@ def _release_manifest_identity(
 
 
 def _launch_argv_matches(
-    argv: tuple[str, str, str],
+    argv: tuple[str, ...],
     launch_identity: tuple[str, str],
     *,
     unit: str,
@@ -826,9 +823,21 @@ def _launch_argv_matches(
         return False
     if unit == "grabowski-operator.service":
         expected_launcher = GRABOWSKI_STABLE_RUNTIME_ROOT / ".venv/bin/python"
+        expected_port = "18181"
     else:
         expected_launcher = release / ".venv/bin/python"
-    return argv == (str(expected_launcher), "-m", value)
+        expected_port = "18182"
+    return argv == (
+        str(expected_launcher),
+        "-m",
+        value,
+        "--transport",
+        "streamable-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        expected_port,
+    )
 
 def _runtime_identity_observation(
     pid: int,
@@ -920,10 +929,17 @@ def _runtime_identity_observation(
     after_cgroup = _proc_cgroup(pid, proc_root=proc_root)
     executable_after = _proc_executable(pid, proc_root=proc_root)
     launch_argv_after = _proc_launch_argv(pid, proc_root=proc_root)
+    maps_text_after = _read_proc_text(
+        pid,
+        "maps",
+        max_bytes=MAX_PROC_RUNTIME_BYTES,
+        proc_root=proc_root,
+    )
     if (
         after_cgroup != expected_cgroup
         or executable_after != executable_before
         or launch_argv_after != launch_argv_before
+        or maps_text_after != maps_text
     ):
         return _runtime_identity_unknown(
             ["process_changed_during_identity_observation"],
