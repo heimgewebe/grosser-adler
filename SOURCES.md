@@ -7,6 +7,7 @@
 | PR-HEAD / Base / CI / Reviews | GitHub | `github_pr` | primär für GitHub |
 | Servicezustand | user-/system-systemd | `service_status` | beobachtet beide Scopes; wählt genau einen aktiven/geladenen Scope, Doppelbelegung bleibt unbekannt |
 | Service-Prozessbaum | Prozesssicht + aufgelöster systemd MainPID/ControlGroup | `service_runtime` | same-UID, cgroup-gebundene Hostbeobachtung im selben Scope |
+| laufende Runtime-/Release-Identität | systemd MainPID/ControlGroup + `/proc/<pid>/cgroup` + `/proc/<pid>/exe` + `/proc/<pid>/cmdline` + prozessgebundene immutable Release-Mappings + installierte Release-Metadaten | `service_runtime.runtime_identity` | `release_id` darf bei eindeutiger Prozessbindung beobachtet werden; ein nur vom Deployment-Manifest behaupteter Commit bleibt `null`, deshalb `identity_complete=false` |
 | positive TCP/UDP-Listener-Evidenz | `ss` mit cgroup-Metadaten | `service_runtime` | nur positive cgroup-korrelierte Evidenz; kein Beweis für Abwesenheit |
 | Grabowski-Lane-Ziel | Grabowski Work-Lane-Receipt + registrierter Git-Worktree | `get_work_target(lane_id)` | Autorität nur für `lane_id → repo/worktree/branch/purpose`; keine Aussage über Korrektheit der Arbeit |
 | Bureau Task/Run | Bureau StateStore | kein V1-Adapter | unbekannt, bis ein realer Bedarf einen direkten Adapter rechtfertigt |
@@ -24,3 +25,5 @@
 7. Listener-Beobachtung belegt nur positiv zugeordnete TCP/UDP-Listener; ein leeres oder unvollständig attribuiertes Ergebnis ist keine Abwesenheitsbehauptung.
 8. Identity-Felder, die Secret-Redaction benötigen würden, werden fail-closed abgewiesen statt identitätskollabierend gespeichert.
 9. Gleichnamige User- und System-Units werden gemeinsam beobachtet. `active` und `reloading` gelten als laufend; konkurrierende `activating`-/`deactivating`-Zustände bleiben mehrdeutig. Genau ein laufender Scope gewinnt nur ohne konkurrierenden Übergang; sonst darf nur genau eine geladene Unit gewählt werden. Mehrdeutigkeit bleibt fail-closed.
+10. Operatoraussagen sind Claims, keine Primärevidenz. Runtime-Identität wird nicht aus Grabowski-Status oder Chatprosa übernommen; installierte Release-Metadaten dürfen einen prozessgebundenen `release_id` corroborieren, aber ein darin genannter `repo_head` wird ohne unabhängige Commit-Primärevidenz nicht als verifiziert ausgegeben.
+11. Unabhängige Beobachtung ist kein unabhängiges fachliches Urteil; same-turn Adler zählt nie als Independent Decision Review.

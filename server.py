@@ -68,7 +68,7 @@ SIDECAR_ANNOTATIONS = ToolAnnotations(
     openWorldHint=False,
 )
 
-INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and advisor. Reconstruct relevant state from primary evidence whenever possible. You do not own work state, decisions, execution, admission or lifecycle. Your only writes are immutable advisory findings and computed inbox files inside your own state root. Grabowski owns the worktree-local .adler/inbox.json symlink that points at the exact external inbox file. Findings are facts or advice, never commands. Never create work, acquire leases, edit worktree or product files, commit, push, merge, deploy, control services, signal processes or mutate credentials. Partial evidence is incomplete, never absence. Prefer exact checkpoints and explicit uncertainty; do not manufacture findings."""
+INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and advisor. Operator statements are claims, not primary evidence: reconstruct relevant state from the responsible primary sources whenever possible. Look for contradictions and missing evidence without optimizing to produce a contradiction. Independent observation is not independent decision review; a same-turn Adler observation is not cognitive independence. You do not own work state, decisions, execution, admission or lifecycle. Your only writes are immutable advisory findings and computed inbox files inside your own state root. Grabowski owns the worktree-local .adler/inbox.json symlink that points at the exact external inbox file. Findings are facts or advice, never commands. Never create work, acquire leases, edit worktree or product files, commit, push, merge, deploy, control services, signal processes or mutate credentials. Partial evidence is incomplete, never absence. Prefer exact checkpoints and explicit uncertainty; do not manufacture findings."""
 
 mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
@@ -76,6 +76,20 @@ _GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
 _GITHUB_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
+_RELEASE_ID_RE = re.compile(
+    r"^(?P<head>[0-9a-f]{12})-srcset[0-9a-f]{12}-lock[0-9a-f]{12}-contract[0-9a-f]{12}"
+    r"(?:-attempt[1-9][0-9]{0,2})?$"
+)
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_PYTHON_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_GRABOWSKI_RUNTIME_UNIT_RE = re.compile(
+    r"^(?:grabowski-operator|grabowski-green-operator-[0-9a-f]{12})\.service$"
+)
+PROC_ROOT = Path("/proc")
+GRABOWSKI_RELEASE_ROOT = Path("/home/alex/.local/share/grabowski-mcp-releases")
+GRABOWSKI_STABLE_RUNTIME_ROOT = Path("/home/alex/.local/share/grabowski-mcp")
+MAX_PROC_RUNTIME_BYTES = 2_000_000
+MAX_RUNTIME_MANIFEST_BYTES = 1_000_000
 _LANE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _LANE_SUBJECT_RE = re.compile(r"^lane:([0-9a-f]{32})$")
 _FINDING_ID_RE = re.compile(r"^ga-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
@@ -500,6 +514,481 @@ def _cgroup_within(process_cgroup: str, service_cgroup: str) -> bool:
     service = _normalize_cgroup(service_cgroup)
     return process == service or process.startswith(service.rstrip("/") + "/")
 
+
+def _runtime_identity_unknown(
+    missing_evidence: list[str],
+    *,
+    executable_path_or_identity: str | None = None,
+    identity_source: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    return {
+        "executable_path_or_identity": executable_path_or_identity,
+        "release_id": None,
+        "source_commit_or_repo_head": None,
+        "identity_source": list(dict.fromkeys(identity_source)),
+        "identity_complete": False,
+        "missing_evidence": sorted(set(missing_evidence)),
+    }
+
+
+def _safe_identity_text(value: str) -> str | None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    return value if _redact(value) == value else None
+
+
+def _read_proc_text(
+    pid: int,
+    name: str,
+    *,
+    max_bytes: int,
+    proc_root: Path | None = None,
+) -> str | None:
+    root = PROC_ROOT if proc_root is None else proc_root
+    path = root / str(pid) / name
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > max_bytes:
+            return None
+        return payload.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _proc_cgroup(pid: int, *, proc_root: Path | None = None) -> str | None:
+    raw = _read_proc_text(pid, "cgroup", max_bytes=64_000, proc_root=proc_root)
+    if raw is None:
+        return None
+    groups: set[str] = set()
+    for line in raw.splitlines():
+        if not line:
+            continue
+        parts = line.split(":", 2)
+        if len(parts) != 3 or not parts[2]:
+            return None
+        groups.add(_normalize_cgroup(parts[2]))
+    return next(iter(groups)) if len(groups) == 1 else None
+
+
+def _proc_executable(pid: int, *, proc_root: Path | None = None) -> str | None:
+    root = PROC_ROOT if proc_root is None else proc_root
+    try:
+        value = os.readlink(root / str(pid) / "exe")
+    except OSError:
+        return None
+    if not value.startswith("/") or value.endswith(" (deleted)"):
+        return None
+    return _safe_identity_text(value)
+
+
+def _proc_launch_argv(
+    pid: int,
+    *,
+    proc_root: Path | None = None,
+) -> tuple[str, ...] | None:
+    raw = _read_proc_text(pid, "cmdline", max_bytes=64_000, proc_root=proc_root)
+    if raw is None or not raw.endswith("\x00"):
+        return None
+    parts = raw[:-1].split("\x00")
+    if len(parts) < 3 or any(_safe_identity_text(part) is None for part in parts):
+        return None
+    return tuple(parts)
+
+
+def _mapped_release_root(
+    maps_text: str,
+    *,
+    release_root: Path | None = None,
+) -> tuple[Path | None, str | None]:
+    root = GRABOWSKI_RELEASE_ROOT if release_root is None else release_root
+    prefix = str(root) + "/"
+    candidate_roots: set[Path] = set()
+    candidate_mappings: list[tuple[str, str, str, Path, Path, bool]] = []
+    invalid_under_root = False
+
+    for raw in maps_text.splitlines():
+        parts = raw.split(None, 5)
+        if len(parts) != 6:
+            continue
+        permissions, device, inode_text, pathname = parts[1], parts[3], parts[4], parts[5]
+        if not pathname.startswith(prefix):
+            continue
+        deleted = pathname.endswith(" (deleted)")
+        candidate_pathname = pathname[:-10] if deleted else pathname
+        if not candidate_pathname.startswith(prefix):
+            invalid_under_root = True
+            continue
+        relative = candidate_pathname[len(prefix):]
+        release_name = relative.split("/", 1)[0]
+        if _RELEASE_ID_RE.fullmatch(release_name) is None:
+            invalid_under_root = True
+            continue
+        release = root / release_name
+        path = Path(candidate_pathname)
+        if ".." in path.parts or not path.is_relative_to(release):
+            invalid_under_root = True
+            continue
+        candidate_roots.add(release)
+        candidate_mappings.append(
+            (permissions, device, inode_text, path, release, deleted)
+        )
+
+    if invalid_under_root or len(candidate_roots) != 1:
+        if not candidate_roots and not invalid_under_root:
+            return None, "immutable_release_mapping"
+        return None, "immutable_release_mapping_invalid_or_ambiguous"
+
+    release = next(iter(candidate_roots))
+    executable_mappings = [
+        item for item in candidate_mappings if "x" in item[0]
+    ]
+    if not executable_mappings:
+        return None, "immutable_release_mapping_invalid_or_ambiguous"
+
+    for _permissions, device, inode_text, path, mapped_release, deleted in executable_mappings:
+        if mapped_release != release or deleted:
+            return None, "immutable_release_mapping_invalid_or_ambiguous"
+        try:
+            linked = path.lstat()
+            current = path.stat()
+            major_text, minor_text = device.split(":", 1)
+            mapped_inode = int(inode_text)
+            mapped_major = int(major_text, 16)
+            mapped_minor = int(minor_text, 16)
+        except (OSError, ValueError):
+            return None, "immutable_release_mapping_invalid_or_ambiguous"
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.getuid()
+            or linked.st_mode & 0o022
+            or current.st_ino != mapped_inode
+            or os.major(current.st_dev) != mapped_major
+            or os.minor(current.st_dev) != mapped_minor
+        ):
+            return None, "immutable_release_mapping_invalid_or_ambiguous"
+
+    return release, None
+
+
+def _runtime_maps_observation(
+    maps_text: str,
+    *,
+    release_root: Path | None = None,
+) -> tuple[str, ...]:
+    root = GRABOWSKI_RELEASE_ROOT if release_root is None else release_root
+    release_prefix = str(root) + "/"
+    relevant: list[str] = []
+    for raw in maps_text.splitlines():
+        parts = raw.split(None, 5)
+        if len(parts) < 5:
+            continue
+        permissions = parts[1]
+        pathname = parts[5] if len(parts) == 6 else ""
+        if "x" in permissions or pathname.startswith(release_prefix):
+            relevant.append(" ".join(parts))
+    return tuple(relevant)
+
+
+def _read_bound_runtime_manifest(path: Path) -> dict[str, Any] | None:
+    fd: int | None = None
+    try:
+        linked = path.lstat()
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.getuid()
+            or linked.st_nlink != 1
+            or linked.st_mode & 0o022
+            or linked.st_size > MAX_RUNTIME_MANIFEST_BYTES
+        ):
+            return None
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_nlink != 1
+            or opened.st_size > MAX_RUNTIME_MANIFEST_BYTES
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = MAX_RUNTIME_MANIFEST_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > MAX_RUNTIME_MANIFEST_BYTES:
+            return None
+        value = json.loads(payload.decode("utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _release_manifest_identity(
+    release: Path,
+    observed_executable: str,
+) -> tuple[
+    str | None,
+    str | None,
+    tuple[str, str] | None,
+    str | None,
+]:
+    try:
+        release_meta = release.lstat()
+    except OSError:
+        return None, None, None, "immutable_release_path"
+    if (
+        not stat.S_ISDIR(release_meta.st_mode)
+        or release_meta.st_uid != os.getuid()
+        or release_meta.st_mode & 0o022
+        or _RELEASE_ID_RE.fullmatch(release.name) is None
+    ):
+        return None, None, None, "immutable_release_path"
+
+    manifest = _read_bound_runtime_manifest(release / "deployment-manifest.json")
+    if manifest is None:
+        return None, None, None, "release_manifest"
+    release_id = manifest.get("release_id")
+    repo_head = manifest.get("repo_head")
+    immutable_path = manifest.get("immutable_release_path")
+    release_python_raw = manifest.get("executable")
+    entrypoint_raw = manifest.get("entrypoint_path")
+    entrypoint_contract = manifest.get("entrypoint_contract")
+    module_paths = manifest.get("module_paths")
+    match = _RELEASE_ID_RE.fullmatch(release_id) if isinstance(release_id, str) else None
+    if (
+        match is None
+        or release_id != release.name
+        or not isinstance(repo_head, str)
+        or _COMMIT_SHA_RE.fullmatch(repo_head) is None
+        or match.group("head") != repo_head[:12]
+        or immutable_path != str(release)
+        or manifest.get("completion_status") != "complete"
+        or not isinstance(release_python_raw, str)
+        or not isinstance(entrypoint_raw, str)
+        or not isinstance(entrypoint_contract, dict)
+        or not isinstance(module_paths, dict)
+    ):
+        return None, None, None, "release_manifest_identity"
+
+    release_python = Path(release_python_raw)
+    entrypoint = Path(entrypoint_raw)
+    if (
+        not release_python.is_absolute()
+        or not entrypoint.is_absolute()
+        or ".." in release_python.parts
+        or ".." in entrypoint.parts
+        or not release_python.is_relative_to(release)
+        or not entrypoint.is_relative_to(release)
+    ):
+        return None, None, None, "release_manifest_paths"
+    try:
+        python_real = release_python.resolve(strict=True)
+        entrypoint_meta = entrypoint.lstat()
+    except OSError:
+        return None, None, None, "release_manifest_paths"
+    if (
+        str(python_real) != observed_executable
+        or not stat.S_ISREG(entrypoint_meta.st_mode)
+        or entrypoint_meta.st_uid != os.getuid()
+        or entrypoint_meta.st_mode & 0o022
+    ):
+        return None, None, None, "release_manifest_paths"
+
+    launch_mode = entrypoint_contract.get("mode")
+    launch_module = entrypoint_contract.get("module")
+    if (
+        launch_mode != "module"
+        or not isinstance(launch_module, str)
+        or _PYTHON_MODULE_RE.fullmatch(launch_module) is None
+        or module_paths.get(launch_module) != str(entrypoint)
+    ):
+        return None, None, None, "release_manifest_entrypoint_contract"
+    return release_id, repo_head, ("module", launch_module), None
+
+
+def _launch_argv_matches(
+    argv: tuple[str, ...],
+    launch_identity: tuple[str, str],
+    *,
+    unit: str,
+    release: Path,
+) -> bool:
+    mode, value = launch_identity
+    if mode != "module":
+        return False
+    if unit == "grabowski-operator.service":
+        expected_launcher = GRABOWSKI_STABLE_RUNTIME_ROOT / ".venv/bin/python"
+        expected_port = "18181"
+    else:
+        expected_launcher = release / ".venv/bin/python"
+        expected_port = "18182"
+    return argv == (
+        str(expected_launcher),
+        "-m",
+        value,
+        "--transport",
+        "streamable-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        expected_port,
+    )
+
+def _runtime_identity_observation(
+    pid: int,
+    control_group: str,
+    *,
+    unit: str = "grabowski-operator.service",
+    proc_root: Path | None = None,
+    release_root: Path | None = None,
+) -> dict[str, Any]:
+    sources = ["systemd_main_pid_control_group"]
+    if _GRABOWSKI_RUNTIME_UNIT_RE.fullmatch(unit) is None:
+        return _runtime_identity_unknown(
+            ["grabowski_runtime_unit"],
+            identity_source=tuple(sources),
+        )
+    expected_cgroup = _normalize_cgroup(control_group)
+    before_cgroup = _proc_cgroup(pid, proc_root=proc_root)
+    if before_cgroup != expected_cgroup:
+        return _runtime_identity_unknown(
+            ["proc_cgroup"],
+            identity_source=tuple(sources),
+        )
+    sources.append("procfs_cgroup")
+
+    executable_before = _proc_executable(pid, proc_root=proc_root)
+    if executable_before is None:
+        return _runtime_identity_unknown(
+            ["proc_executable"],
+            identity_source=tuple(sources),
+        )
+    sources.append("procfs_exe")
+
+    maps_text = _read_proc_text(
+        pid,
+        "maps",
+        max_bytes=MAX_PROC_RUNTIME_BYTES,
+        proc_root=proc_root,
+    )
+    if maps_text is None:
+        return _runtime_identity_unknown(
+            ["proc_maps"],
+            executable_path_or_identity=executable_before,
+            identity_source=tuple(sources),
+        )
+    maps_observation = _runtime_maps_observation(
+        maps_text,
+        release_root=release_root,
+    )
+    release, release_reason = _mapped_release_root(
+        maps_text,
+        release_root=release_root,
+    )
+    if release is None:
+        return _runtime_identity_unknown(
+            [release_reason or "immutable_release_mapping"],
+            executable_path_or_identity=executable_before,
+            identity_source=tuple(sources + ["procfs_maps"]),
+        )
+    sources.append("procfs_maps_immutable_release")
+
+    release_id, repo_head, launch_identity, manifest_reason = _release_manifest_identity(
+        release,
+        executable_before,
+    )
+    if manifest_reason is not None or launch_identity is None:
+        return _runtime_identity_unknown(
+            [manifest_reason or "release_manifest_entrypoint_contract"],
+            executable_path_or_identity=executable_before,
+            identity_source=tuple(sources),
+        )
+    sources.append("immutable_release_manifest")
+
+    launch_argv_before = _proc_launch_argv(pid, proc_root=proc_root)
+    if launch_argv_before is None:
+        return _runtime_identity_unknown(
+            ["proc_cmdline"],
+            executable_path_or_identity=executable_before,
+            identity_source=tuple(sources),
+        )
+    if not _launch_argv_matches(
+        launch_argv_before,
+        launch_identity,
+        unit=unit,
+        release=release,
+    ):
+        return _runtime_identity_unknown(
+            ["process_entrypoint_binding"],
+            executable_path_or_identity=executable_before,
+            identity_source=tuple(sources + ["procfs_cmdline"]),
+        )
+    sources.append("procfs_cmdline_manifest_entrypoint")
+
+    after_cgroup = _proc_cgroup(pid, proc_root=proc_root)
+    executable_after = _proc_executable(pid, proc_root=proc_root)
+    launch_argv_after = _proc_launch_argv(pid, proc_root=proc_root)
+    maps_text_after = _read_proc_text(
+        pid,
+        "maps",
+        max_bytes=MAX_PROC_RUNTIME_BYTES,
+        proc_root=proc_root,
+    )
+    if (
+        after_cgroup != expected_cgroup
+        or executable_after != executable_before
+        or launch_argv_after != launch_argv_before
+        or maps_text_after is None
+        or _runtime_maps_observation(
+            maps_text_after,
+            release_root=release_root,
+        )
+        != maps_observation
+    ):
+        return _runtime_identity_unknown(
+            ["process_changed_during_identity_observation"],
+            executable_path_or_identity=executable_before,
+            identity_source=tuple(sources),
+        )
+
+    return {
+        "executable_path_or_identity": executable_before,
+        "release_id": release_id,
+        "source_commit_or_repo_head": None,
+        "identity_source": [
+            *sources,
+            "release_manifest_commit_attestation_not_primary_evidence",
+        ],
+        "identity_complete": False,
+        "missing_evidence": ["source_commit_primary_evidence"],
+    }
 
 def _descendant_rows(rows: list[dict[str, Any]], root_pid: int) -> list[dict[str, Any]]:
     by_parent: dict[int, list[dict[str, Any]]] = {}
@@ -961,6 +1450,24 @@ def service_runtime(unit: str) -> dict[str, Any]:
         if not process_observation["complete"]:
             missing.append("process_tree")
 
+    runtime_identity = _runtime_identity_unknown(
+        ["service_process_binding"],
+        identity_source=("systemd_main_pid_control_group",) if main_pid > 0 and control_group else (),
+    )
+    if (
+        status_complete
+        and active_state == "active"
+        and status.get("scope") in _SYSTEMD_SCOPES
+        and main_pid > 0
+        and bool(control_group)
+        and process_observation.get("complete") is True
+    ):
+        runtime_identity = _runtime_identity_observation(
+            main_pid,
+            control_group,
+            unit=unit,
+        )
+
     # Same cgroup comparison, same requirement.
     sockets = _run(
         ["/usr/bin/ss", "-H", "-lntue"],
@@ -1010,6 +1517,7 @@ def service_runtime(unit: str) -> dict[str, Any]:
         "main_pid": main_pid,
         "control_group": _normalize_cgroup(control_group) if control_group else None,
         "processes": process_observation.get("processes", []),
+        "runtime_identity": runtime_identity,
         "listeners": listeners,
         "listener_scope": "tcp_udp_positive_cgroup_evidence",
         "listener_observation_complete": listener_observation_complete,
