@@ -683,6 +683,27 @@ def _mapped_release_root(
             return None, "immutable_release_mapping_invalid_or_ambiguous"
 
     return release, None
+
+
+def _runtime_maps_observation(
+    maps_text: str,
+    *,
+    release_root: Path | None = None,
+) -> tuple[str, ...]:
+    root = GRABOWSKI_RELEASE_ROOT if release_root is None else release_root
+    release_prefix = str(root) + "/"
+    relevant: list[str] = []
+    for raw in maps_text.splitlines():
+        parts = raw.split(None, 5)
+        if len(parts) < 5:
+            continue
+        permissions = parts[1]
+        pathname = parts[5] if len(parts) == 6 else ""
+        if "x" in permissions or pathname.startswith(release_prefix):
+            relevant.append(" ".join(parts))
+    return tuple(relevant)
+
+
 def _read_bound_runtime_manifest(path: Path) -> dict[str, Any] | None:
     fd: int | None = None
     try:
@@ -882,6 +903,10 @@ def _runtime_identity_observation(
             executable_path_or_identity=executable_before,
             identity_source=tuple(sources),
         )
+    maps_observation = _runtime_maps_observation(
+        maps_text,
+        release_root=release_root,
+    )
     release, release_reason = _mapped_release_root(
         maps_text,
         release_root=release_root,
@@ -939,7 +964,12 @@ def _runtime_identity_observation(
         after_cgroup != expected_cgroup
         or executable_after != executable_before
         or launch_argv_after != launch_argv_before
-        or maps_text_after != maps_text
+        or maps_text_after is None
+        or _runtime_maps_observation(
+            maps_text_after,
+            release_root=release_root,
+        )
+        != maps_observation
     ):
         return _runtime_identity_unknown(
             ["process_changed_during_identity_observation"],

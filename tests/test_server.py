@@ -1640,7 +1640,7 @@ def test_runtime_identity_fails_closed_if_process_changes_between_reads(
     assert result["missing_evidence"] == ["process_changed_during_identity_observation"]
 
 
-def test_runtime_identity_fails_closed_if_maps_change_between_reads(
+def test_runtime_identity_ignores_non_executable_anonymous_maps_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1665,7 +1665,46 @@ def test_runtime_identity_fails_closed_if_maps_change_between_reads(
         if name == "maps":
             map_reads += 1
             if map_reads == 2 and value is not None:
-                return value + "70000000-70001000 r--p 00000000 00:00 0 [maps-drift]\n"
+                return value + "70000000-70001000 rw-p 00000000 00:00 0 [heap-drift]\n"
+        return value
+
+    monkeypatch.setattr(server, "_read_proc_text", changing_proc_text)
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+    )
+
+    assert result["release_id"] == fixture["release_id"]
+    assert result["identity_complete"] is False
+    assert result["missing_evidence"] == ["source_commit_primary_evidence"]
+
+
+def test_runtime_identity_fails_closed_if_executable_maps_change_between_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
+    original = server._read_proc_text
+    map_reads = 0
+
+    def changing_proc_text(
+        pid: int,
+        name: str,
+        *,
+        max_bytes: int,
+        proc_root: Path | None = None,
+    ) -> str | None:
+        nonlocal map_reads
+        value = original(
+            pid,
+            name,
+            max_bytes=max_bytes,
+            proc_root=proc_root,
+        )
+        if name == "maps":
+            map_reads += 1
+            if map_reads == 2 and value is not None:
+                return value + "70000000-70001000 r-xp 00000000 08:01 4242 /tmp/injected.so\n"
         return value
 
     monkeypatch.setattr(server, "_read_proc_text", changing_proc_text)
