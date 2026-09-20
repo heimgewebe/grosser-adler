@@ -1123,6 +1123,8 @@ def _proc_map_line(path: Path, *, permissions: str = "r-xp") -> str:
 def _runtime_identity_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    release_attempt: int | None = None,
 ) -> dict[str, object]:
     release_id = (
         ("a" * 12)
@@ -1133,6 +1135,8 @@ def _runtime_identity_fixture(
         + "-contract"
         + ("d" * 12)
     )
+    if release_attempt is not None:
+        release_id += f"-attempt{release_attempt}"
     repo_head = "a" * 40
     releases = tmp_path / "releases"
     release = releases / release_id
@@ -1249,6 +1253,27 @@ def test_runtime_identity_reports_process_bound_release_but_not_manifest_only_co
         "procfs_cmdline_manifest_entrypoint",
         "release_manifest_commit_attestation_not_primary_evidence",
     ]
+    assert result["missing_evidence"] == ["source_commit_primary_evidence"]
+
+
+def test_runtime_identity_accepts_retry_release_identifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _runtime_identity_fixture(
+        tmp_path,
+        monkeypatch,
+        release_attempt=1,
+    )
+
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+    )
+
+    assert result["identity_complete"] is False
+    assert result["release_id"] == fixture["release_id"]
+    assert result["source_commit_or_repo_head"] is None
     assert result["missing_evidence"] == ["source_commit_primary_evidence"]
 
 
@@ -1997,8 +2022,7 @@ def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkey
             return {
                 "returncode": 0,
                 "stdout": (
-                    f"tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/cg <->\n"
-                    "tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:*\n"
+                    f"tcp LISTEN 0 128 127.0.0.1:18187 0.0.0.0:* uid:{own_uid} ino:42 cgroup:/cg <->\n"                    "tcp LISTEN 0 128 127.0.0.1:9999 0.0.0.0:*\n"
                 ),
                 "stderr": "", "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
