@@ -2008,8 +2008,17 @@ def test_service_runtime_zero_listener_match_does_not_establish_absence(monkeypa
     assert "exhaustive_socket_inventory" in runtime["does_not_establish"]
 
 
-def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_service_runtime_marks_mixed_attribution_socket_source_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     own_uid = server.os.getuid()
+    proc_root = tmp_path / "proc-empty"
+    release_root = tmp_path / "releases-empty"
+    proc_root.mkdir()
+    release_root.mkdir()
+    monkeypatch.setattr(server, "PROC_ROOT", proc_root)
+    monkeypatch.setattr(server, "GRABOWSKI_RELEASE_ROOT", release_root)
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl":
             stdout = (
