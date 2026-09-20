@@ -1112,11 +1112,11 @@ def test_service_logs_fails_closed_on_successful_journal_access_diagnostic(
     assert result["observation_complete"] is False
 
 
-def _proc_map_line(path: Path) -> str:
+def _proc_map_line(path: Path, *, permissions: str = "r-xp") -> str:
     metadata = path.stat()
     device = f"{os.major(metadata.st_dev):x}:{os.minor(metadata.st_dev):x}"
     return (
-        f"7f000000-7f001000 r--p 00000000 {device} {metadata.st_ino} {path}\n"
+        f"7f000000-7f001000 {permissions} 00000000 {device} {metadata.st_ino} {path}\n"
     )
 
 
@@ -1231,6 +1231,27 @@ def test_runtime_identity_binds_pid_cgroup_mapped_inode_and_manifest(
         "immutable_release_manifest",
     ]
     assert result["missing_evidence"] == []
+
+
+def test_runtime_identity_rejects_non_executable_release_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
+    (fixture["proc_pid"] / "maps").write_text(
+        _proc_map_line(fixture["mapped"], permissions="r--p"),
+        encoding="utf-8",
+    )
+
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+    )
+    assert result["identity_complete"] is False
+    assert result["release_id"] is None
+    assert result["missing_evidence"] == [
+        "immutable_release_mapping_invalid_or_ambiguous"
+    ]
 
 
 def test_runtime_identity_rejects_cgroup_mismatch(

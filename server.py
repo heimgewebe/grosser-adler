@@ -605,10 +605,12 @@ def _mapped_release_root(
         parts = raw.split(None, 5)
         if len(parts) != 6:
             continue
-        device, inode_text, pathname = parts[3], parts[4], parts[5]
+        permissions, device, inode_text, pathname = parts[1], parts[3], parts[4], parts[5]
         if not pathname.startswith(prefix):
             continue
         observed_under_root = True
+        if "x" not in permissions:
+            continue
         if pathname.endswith(" (deleted)"):
             continue
         path = Path(pathname)
