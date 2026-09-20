@@ -81,8 +81,12 @@ _RELEASE_ID_RE = re.compile(
 )
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _PYTHON_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_GRABOWSKI_RUNTIME_UNIT_RE = re.compile(
+    r"^(?:grabowski-operator|grabowski-green-operator-[0-9a-f]{12})\.service$"
+)
 PROC_ROOT = Path("/proc")
 GRABOWSKI_RELEASE_ROOT = Path("/home/alex/.local/share/grabowski-mcp-releases")
+GRABOWSKI_STABLE_RUNTIME_ROOT = Path("/home/alex/.local/share/grabowski-mcp")
 MAX_PROC_RUNTIME_BYTES = 2_000_000
 MAX_RUNTIME_MANIFEST_BYTES = 1_000_000
 _LANE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -616,8 +620,9 @@ def _mapped_release_root(
 ) -> tuple[Path | None, str | None]:
     root = GRABOWSKI_RELEASE_ROOT if release_root is None else release_root
     prefix = str(root) + "/"
-    observed_under_root = False
-    valid_roots: set[Path] = set()
+    candidate_roots: set[Path] = set()
+    candidate_mappings: list[tuple[str, str, str, Path, Path, bool]] = []
+    invalid_under_root = False
 
     for raw in maps_text.splitlines():
         parts = raw.split(None, 5)
@@ -626,22 +631,41 @@ def _mapped_release_root(
         permissions, device, inode_text, pathname = parts[1], parts[3], parts[4], parts[5]
         if not pathname.startswith(prefix):
             continue
-        observed_under_root = True
-        if "x" not in permissions:
+        deleted = pathname.endswith(" (deleted)")
+        candidate_pathname = pathname[:-10] if deleted else pathname
+        if not candidate_pathname.startswith(prefix):
+            invalid_under_root = True
             continue
-        if pathname.endswith(" (deleted)"):
-            continue
-        path = Path(pathname)
-        if ".." in path.parts:
-            continue
-        relative = pathname[len(prefix):]
+        relative = candidate_pathname[len(prefix):]
         release_name = relative.split("/", 1)[0]
-        match = _RELEASE_ID_RE.fullmatch(release_name)
-        if match is None:
+        if _RELEASE_ID_RE.fullmatch(release_name) is None:
+            invalid_under_root = True
             continue
         release = root / release_name
-        if not path.is_relative_to(release):
+        path = Path(candidate_pathname)
+        if ".." in path.parts or not path.is_relative_to(release):
+            invalid_under_root = True
             continue
+        candidate_roots.add(release)
+        candidate_mappings.append(
+            (permissions, device, inode_text, path, release, deleted)
+        )
+
+    if invalid_under_root or len(candidate_roots) != 1:
+        if not candidate_roots and not invalid_under_root:
+            return None, "immutable_release_mapping"
+        return None, "immutable_release_mapping_invalid_or_ambiguous"
+
+    release = next(iter(candidate_roots))
+    executable_mappings = [
+        item for item in candidate_mappings if "x" in item[0]
+    ]
+    if not executable_mappings:
+        return None, "immutable_release_mapping_invalid_or_ambiguous"
+
+    for _permissions, device, inode_text, path, mapped_release, deleted in executable_mappings:
+        if mapped_release != release or deleted:
+            return None, "immutable_release_mapping_invalid_or_ambiguous"
         try:
             linked = path.lstat()
             current = path.stat()
@@ -650,7 +674,7 @@ def _mapped_release_root(
             mapped_major = int(major_text, 16)
             mapped_minor = int(minor_text, 16)
         except (OSError, ValueError):
-            continue
+            return None, "immutable_release_mapping_invalid_or_ambiguous"
         if (
             not stat.S_ISREG(linked.st_mode)
             or linked.st_uid != os.getuid()
@@ -659,16 +683,9 @@ def _mapped_release_root(
             or os.major(current.st_dev) != mapped_major
             or os.minor(current.st_dev) != mapped_minor
         ):
-            continue
-        valid_roots.add(release)
+            return None, "immutable_release_mapping_invalid_or_ambiguous"
 
-    if len(valid_roots) == 1:
-        return next(iter(valid_roots)), None
-    if not observed_under_root:
-        return None, "immutable_release_mapping"
-    return None, "immutable_release_mapping_invalid_or_ambiguous"
-
-
+    return release, None
 def _read_bound_runtime_manifest(path: Path) -> dict[str, Any] | None:
     fd: int | None = None
     try:
@@ -800,18 +817,33 @@ def _release_manifest_identity(
 def _launch_argv_matches(
     argv: tuple[str, str, str],
     launch_identity: tuple[str, str],
+    *,
+    unit: str,
+    release: Path,
 ) -> bool:
     mode, value = launch_identity
-    return mode == "module" and argv[1:] == ("-m", value)
+    if mode != "module":
+        return False
+    if unit == "grabowski-operator.service":
+        expected_launcher = GRABOWSKI_STABLE_RUNTIME_ROOT / ".venv/bin/python"
+    else:
+        expected_launcher = release / ".venv/bin/python"
+    return argv == (str(expected_launcher), "-m", value)
 
 def _runtime_identity_observation(
     pid: int,
     control_group: str,
     *,
+    unit: str = "grabowski-operator.service",
     proc_root: Path | None = None,
     release_root: Path | None = None,
 ) -> dict[str, Any]:
     sources = ["systemd_main_pid_control_group"]
+    if _GRABOWSKI_RUNTIME_UNIT_RE.fullmatch(unit) is None:
+        return _runtime_identity_unknown(
+            ["grabowski_runtime_unit"],
+            identity_source=tuple(sources),
+        )
     expected_cgroup = _normalize_cgroup(control_group)
     before_cgroup = _proc_cgroup(pid, proc_root=proc_root)
     if before_cgroup != expected_cgroup:
@@ -872,7 +904,12 @@ def _runtime_identity_observation(
             executable_path_or_identity=executable_before,
             identity_source=tuple(sources),
         )
-    if not _launch_argv_matches(launch_argv_before, launch_identity):
+    if not _launch_argv_matches(
+        launch_argv_before,
+        launch_identity,
+        unit=unit,
+        release=release,
+    ):
         return _runtime_identity_unknown(
             ["process_entrypoint_binding"],
             executable_path_or_identity=executable_before,
@@ -897,10 +934,13 @@ def _runtime_identity_observation(
     return {
         "executable_path_or_identity": executable_before,
         "release_id": release_id,
-        "source_commit_or_repo_head": repo_head,
-        "identity_source": sources,
-        "identity_complete": True,
-        "missing_evidence": [],
+        "source_commit_or_repo_head": None,
+        "identity_source": [
+            *sources,
+            "release_manifest_commit_attestation_not_primary_evidence",
+        ],
+        "identity_complete": False,
+        "missing_evidence": ["source_commit_primary_evidence"],
     }
 
 def _descendant_rows(rows: list[dict[str, Any]], root_pid: int) -> list[dict[str, Any]]:
@@ -1375,7 +1415,11 @@ def service_runtime(unit: str) -> dict[str, Any]:
         and bool(control_group)
         and process_observation.get("complete") is True
     ):
-        runtime_identity = _runtime_identity_observation(main_pid, control_group)
+        runtime_identity = _runtime_identity_observation(
+            main_pid,
+            control_group,
+            unit=unit,
+        )
 
     # Same cgroup comparison, same requirement.
     sockets = _run(

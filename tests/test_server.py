@@ -1156,6 +1156,11 @@ def _runtime_identity_fixture(
     release_python.parent.mkdir(parents=True)
     release_python.symlink_to(executable)
 
+    stable_runtime = tmp_path / "grabowski-mcp"
+    stable_python = stable_runtime / ".venv" / "bin" / "python"
+    stable_python.parent.mkdir(parents=True)
+    stable_python.symlink_to(executable)
+
     entrypoint = (
         release
         / ".venv"
@@ -1194,11 +1199,12 @@ def _runtime_identity_fixture(
     (proc_pid / "maps").write_text(_proc_map_line(mapped), encoding="utf-8")
     (proc_pid / "exe").symlink_to(executable)
     (proc_pid / "cmdline").write_bytes(
-        str(executable).encode("utf-8") + b"\x00-m\x00grabowski_operator\x00"
+        str(stable_python).encode("utf-8") + b"\x00-m\x00grabowski_operator\x00"
     )
 
     monkeypatch.setattr(server, "PROC_ROOT", proc_root)
     monkeypatch.setattr(server, "GRABOWSKI_RELEASE_ROOT", releases)
+    monkeypatch.setattr(server, "GRABOWSKI_STABLE_RUNTIME_ROOT", stable_runtime)
     return {
         "pid": pid,
         "proc_pid": proc_pid,
@@ -1207,6 +1213,7 @@ def _runtime_identity_fixture(
         "repo_head": repo_head,
         "release": release,
         "release_python": release_python,
+        "stable_python": stable_python,
         "entrypoint": entrypoint,
         "manifest_path": manifest_path,
         "mapped": mapped,
@@ -1215,7 +1222,7 @@ def _runtime_identity_fixture(
     }
 
 
-def test_runtime_identity_binds_pid_cgroup_mapped_inode_and_manifest(
+def test_runtime_identity_reports_process_bound_release_but_not_manifest_only_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1225,9 +1232,9 @@ def test_runtime_identity_binds_pid_cgroup_mapped_inode_and_manifest(
         fixture["control_group"],
     )
 
-    assert result["identity_complete"] is True
+    assert result["identity_complete"] is False
     assert result["release_id"] == fixture["release_id"]
-    assert result["source_commit_or_repo_head"] == fixture["repo_head"]
+    assert result["source_commit_or_repo_head"] is None
     assert result["executable_path_or_identity"] == str(fixture["executable"])
     assert result["identity_source"] == [
         "systemd_main_pid_control_group",
@@ -1236,8 +1243,9 @@ def test_runtime_identity_binds_pid_cgroup_mapped_inode_and_manifest(
         "procfs_maps_immutable_release",
         "immutable_release_manifest",
         "procfs_cmdline_manifest_entrypoint",
+        "release_manifest_commit_attestation_not_primary_evidence",
     ]
-    assert result["missing_evidence"] == []
+    assert result["missing_evidence"] == ["source_commit_primary_evidence"]
 
 
 def test_runtime_identity_rejects_same_release_with_different_module_entrypoint(
@@ -1246,7 +1254,7 @@ def test_runtime_identity_rejects_same_release_with_different_module_entrypoint(
 ) -> None:
     fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
     (fixture["proc_pid"] / "cmdline").write_bytes(
-        str(fixture["executable"]).encode("utf-8") + b"\0-m\0other_operator\0"
+        str(fixture["stable_python"]).encode("utf-8") + b"\0-m\0other_operator\0"
     )
 
     result = server._runtime_identity_observation(
@@ -1275,6 +1283,67 @@ def test_runtime_identity_rejects_missing_process_invocation(
     assert result["identity_complete"] is False
     assert result["release_id"] is None
     assert result["missing_evidence"] == ["proc_cmdline"]
+
+
+def test_runtime_identity_rejects_unrelated_service_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
+
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+        unit="nixer-mcp.service",
+    )
+
+    assert result["identity_complete"] is False
+    assert result["release_id"] is None
+    assert result["source_commit_or_repo_head"] is None
+    assert result["missing_evidence"] == ["grabowski_runtime_unit"]
+
+
+def test_runtime_identity_rejects_wrong_launcher_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
+    wrong_launcher = tmp_path / "mutable-checkout-python"
+    (fixture["proc_pid"] / "cmdline").write_bytes(
+        str(wrong_launcher).encode("utf-8") + b"\0-m\0grabowski_operator\0"
+    )
+
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+    )
+
+    assert result["identity_complete"] is False
+    assert result["release_id"] is None
+    assert result["source_commit_or_repo_head"] is None
+    assert result["missing_evidence"] == ["process_entrypoint_binding"]
+
+
+def test_runtime_identity_accepts_green_release_launcher_as_partial_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
+    (fixture["proc_pid"] / "cmdline").write_bytes(
+        str(fixture["release_python"]).encode("utf-8")
+        + b"\0-m\0grabowski_operator\0"
+    )
+
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+        unit="grabowski-green-operator-deadbeefcafe.service",
+    )
+
+    assert result["identity_complete"] is False
+    assert result["release_id"] == fixture["release_id"]
+    assert result["source_commit_or_repo_head"] is None
+    assert result["missing_evidence"] == ["source_commit_primary_evidence"]
 
 
 def test_runtime_identity_rejects_non_executable_release_mapping(
@@ -1369,6 +1438,60 @@ def test_runtime_identity_rejects_ambiguous_release_mappings(
         fixture["control_group"],
     )
     assert result["identity_complete"] is False
+    assert result["missing_evidence"] == [
+        "immutable_release_mapping_invalid_or_ambiguous"
+    ]
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["group_writable", "deleted", "non_executable", "replaced_inode"],
+)
+def test_runtime_identity_rejects_second_release_even_when_its_mapping_is_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+) -> None:
+    fixture = _runtime_identity_fixture(tmp_path, monkeypatch)
+    second_id = (
+        ("e" * 12)
+        + "-srcset"
+        + ("f" * 12)
+        + "-lock"
+        + ("1" * 12)
+        + "-contract"
+        + ("2" * 12)
+    )
+    second = fixture["releases"] / second_id / ".venv/lib/python3.10/site-packages/core.so"
+    second.parent.mkdir(parents=True)
+    second.write_bytes(b"second-release")
+    second.chmod(0o644)
+
+    permissions = "r-xp"
+    if variant == "group_writable":
+        second.chmod(0o664)
+    elif variant == "non_executable":
+        permissions = "rw-p"
+
+    second_line = _proc_map_line(second, permissions=permissions)
+    if variant == "deleted":
+        second_line = second_line.rstrip("\n") + " (deleted)\n"
+    elif variant == "replaced_inode":
+        second.unlink()
+        second.write_bytes(b"replacement-inode")
+        second.chmod(0o644)
+
+    maps = _proc_map_line(fixture["mapped"]) + second_line
+    (fixture["proc_pid"] / "maps").write_text(maps, encoding="utf-8")
+
+    result = server._runtime_identity_observation(
+        fixture["pid"],
+        fixture["control_group"],
+    )
+
+    assert result["identity_complete"] is False
+    assert result["release_id"] is None
+    assert result["source_commit_or_repo_head"] is None
     assert result["missing_evidence"] == [
         "immutable_release_mapping_invalid_or_ambiguous"
     ]
@@ -1525,9 +1648,10 @@ def test_service_runtime_reports_bound_release_identity_and_listener(
     assert runtime["service_scope"] == "system"
     assert runtime["main_pid"] == pid
     assert runtime["listener_observation_complete"] is True
-    assert identity["identity_complete"] is True
+    assert identity["identity_complete"] is False
     assert identity["release_id"] == fixture["release_id"]
-    assert identity["source_commit_or_repo_head"] == fixture["repo_head"]
+    assert identity["source_commit_or_repo_head"] is None
+    assert identity["missing_evidence"] == ["source_commit_primary_evidence"]
 
 
 def test_service_runtime_identity_stays_unknown_on_wrong_main_pid(
@@ -1637,8 +1761,13 @@ def test_service_runtime_identity_stays_unknown_on_scope_ambiguity_or_absence(
     assert absent["runtime_identity"]["identity_complete"] is False
     assert absent["runtime_identity"]["release_id"] is None
 
-def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_service_runtime_correlates_cgroup_children_and_listener(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     own_uid = server.os.getuid()
+    monkeypatch.setattr(server, "PROC_ROOT", tmp_path / "proc-empty")
+    monkeypatch.setattr(server, "GRABOWSKI_RELEASE_ROOT", tmp_path / "releases-empty")
     def fake_run(argv, **kwargs):
         if argv[0] == "/usr/bin/systemctl" and "show" in argv:
             stdout = _complete_service_show_fixture() if "--user" in argv else _missing_system_service_show_fixture()
@@ -1675,6 +1804,7 @@ def test_service_runtime_correlates_cgroup_children_and_listener(monkeypatch: py
     assert runtime["listener_observation_complete"] is True
     assert runtime["runtime_identity"]["identity_complete"] is False
     assert runtime["runtime_identity"]["release_id"] is None
+    assert runtime["runtime_identity"]["missing_evidence"] == ["grabowski_runtime_unit"]
     assert runtime["complete"] is True
 
 
