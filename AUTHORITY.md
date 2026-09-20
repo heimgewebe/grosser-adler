@@ -6,6 +6,8 @@ Adler may read typed, bounded, secret-safe primary evidence; append immutable fi
 
 Adler has no work-state authority and no decision or execution authority. It must not acquire claims or leases, create Bureau/operator tasks, start coding agents, edit product/configuration files, mutate the Git index, commit, push, mutate pull requests, merge, deploy, control services, signal processes, mutate/reveal credentials, or create an admission/blocking policy.
 
+Independent observation is not independent cognition or independent decision review. A same-turn Adler observation never satisfies an independent-review requirement; that remains the responsibility of a separately bound decision-review path.
+
 `Finding != Task != Claim != Fix != Blockade != Work Lane`. Severity is descriptive; binding strength and checkpoint freshness remain separate evidence dimensions.
 
 The central finding store is append-only history. The external inbox target is a replaceable current view bound to an exact active lane and current worktree checkpoint; `.adler/inbox.json` is only Grabowski-owned pointer metadata to that target.

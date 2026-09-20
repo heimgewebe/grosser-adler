@@ -2,6 +2,7 @@
 
 ## 1. Purpose
 Großer Adler is an independent second look on running work. It reads primary evidence, records evidence-bound findings, and places the current advisory view beside an explicitly known Grabowski worktree. It does not execute or steer the work.
+Its independence is observational and authority-path based, not cognitive: a same-turn Adler observation is never an independent decision review.
 
 ## 2. Authority Boundary
 Adler owns observation, verification, advisory findings, the immutable finding store, and computed inbox files under its own state root. Grabowski owns work identity, decisions, claims, leases, tasks, product mutations, Git index/commit/push, pull-request mutation, merge, deployment, service/process control, credentials, effect policy, and the worktree-local `.adler` pointer metadata. Severity is not authority.
