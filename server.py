@@ -1551,8 +1551,10 @@ def service_logs(unit: str, lines: int = 120) -> dict[str, Any]:
     argv = ["/usr/bin/journalctl"]
     if scope == "user":
         argv.append("--user")
-    else:
-        argv.append("--system")
+    # Do not force ``--system`` for a resolved system unit. A system service
+    # running as an unprivileged user can have stdout/stderr records stored in
+    # that user's journal. ``-u`` remains the system-unit selector; journalctl
+    # uses the distinct ``--user-unit`` selector for user units.
     argv.extend(["-u", safe_unit, "--no-pager", "-n", str(lines), "-o", "short-iso"])
     result = _run(argv, timeout=20, preserved_identity=(safe_unit,))
     diagnostics_present = bool(result["stderr"].strip())
