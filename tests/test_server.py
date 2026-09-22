@@ -1060,9 +1060,10 @@ def test_service_logs_uses_resolved_system_scope(monkeypatch: pytest.MonkeyPatch
             }
         if argv[0] == "/usr/bin/journalctl":
             assert "--user" not in argv
-            assert "--system" in argv
+            assert "--system" not in argv
+            assert argv[1:3] == ["-u", "grabowski-operator.service"]
             return {
-                "returncode": 0, "stdout": "system-log\n", "stderr": "",
+                "returncode": 0, "stdout": "application-log\n", "stderr": "",
                 "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
             }
         raise AssertionError(argv)
@@ -1072,7 +1073,7 @@ def test_service_logs_uses_resolved_system_scope(monkeypatch: pytest.MonkeyPatch
     assert result["scope"] == "system"
     assert result["observation_complete"] is True
     assert result["journal_diagnostics_present"] is False
-    assert result["logs"]["stdout"] == "system-log\n"
+    assert result["logs"]["stdout"] == "application-log\n"
     assert len([argv for argv in calls if argv[0] == "/usr/bin/systemctl"]) == 2
 
 
