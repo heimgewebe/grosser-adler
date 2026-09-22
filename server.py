@@ -41,6 +41,7 @@ MAX_EVIDENCE_REF_CHARS = 1_000
 MAX_AFFECTED_EFFECTS = 16
 MAX_AFFECTED_EFFECT_CHARS = 120
 MAX_QUARANTINE_RECORDS = 20
+MAX_FINDING_RETRIEVAL_SOURCE_RECORDS = 2048
 LEGACY_CONNECTOR_CONTRACT = "adler-legacy-connector-submit-v1"
 
 _FINDING_INDEX_LOCK = threading.RLock()
@@ -2790,35 +2791,301 @@ def publish_worktree_inbox(lane_id: str) -> dict[str, Any]:
     return _publish_worktree_inbox(_validate_lane_id(lane_id))
 
 
+_FINDING_CURSOR_RE = re.compile(
+    r"^af1\.([0-9a-f]{64})\.([0-9]{1,4})\.([0-9a-f]{64})$"
+)
+_V1_FINDING_KINDS = {
+    "observation",
+    "risk",
+    "contradiction",
+    "missing_evidence",
+    "advice",
+}
+
+
+def _bounded_finding_record_names() -> list[str]:
+    names: list[str] = []
+    with os.scandir(FINDINGS_ROOT) as entries:
+        for entry in entries:
+            name = entry.name
+            if not isinstance(name, str) or not name.endswith(".json"):
+                continue
+            names.append(name)
+            if len(names) > MAX_FINDING_RETRIEVAL_SOURCE_RECORDS:
+                raise RuntimeError(
+                    "finding retrieval source record bound exceeded; "
+                    f"maximum is {MAX_FINDING_RETRIEVAL_SOURCE_RECORDS}"
+                )
+    names.sort()
+    return names
+
+
+def _load_bounded_finding_history() -> dict[str, Any]:
+    _ensure_state()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    dir_fd = os.open(FINDINGS_ROOT, flags)
+    locked = False
+    try:
+        fcntl.flock(dir_fd, fcntl.LOCK_SH)
+        locked = True
+        before_names = _bounded_finding_record_names()
+        records, errors = _load_finding_payloads(before_names)
+        after_names = _bounded_finding_record_names()
+    finally:
+        if locked:
+            fcntl.flock(dir_fd, fcntl.LOCK_UN)
+        os.close(dir_fd)
+
+    membership_stable = before_names == after_names
+    name_reconciliation_complete = (
+        membership_stable
+        and len(records) + len(errors) == len(before_names)
+    )
+    if not membership_stable:
+        errors = [
+            *errors,
+            {"record": "<finding-store>", "error_type": "ConcurrentMutation"},
+        ]
+    elif not name_reconciliation_complete:
+        errors = [
+            *errors,
+            {
+                "record": "<finding-store>",
+                "error_type": "NameReconciliationIncomplete",
+            },
+        ]
+    snapshot_sha256 = _sha256_json(
+        {
+            "record_names": before_names,
+            "records": [
+                [path.name, _sha256_json(payload)]
+                for path, payload in records
+            ],
+            "errors": errors,
+        }
+    )
+    return {
+        "records": records,
+        "errors": errors,
+        "record_names": before_names,
+        "membership_stable": membership_stable,
+        "name_reconciliation_complete": name_reconciliation_complete,
+        "store_names_sha256": _sha256_json(before_names),
+        "history_snapshot_sha256": snapshot_sha256,
+    }
+
+
+def _finding_filter_text(value: str | None, field: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 500
+    ):
+        raise ValueError(f"{field} must be an exact 1..500 character string")
+    return value
+
+
+def _finding_filters_sha256(
+    *,
+    exact_subject: str | None,
+    checkpoint: str | None,
+    kind: str | None,
+    severity: str | None,
+    recheck_of: str | None,
+) -> str:
+    return _sha256_json(
+        {
+            "exact_subject": exact_subject,
+            "checkpoint": checkpoint,
+            "kind": kind,
+            "severity": severity,
+            "recheck_of": recheck_of,
+        }
+    )
+
+
+def _encode_finding_cursor(
+    *,
+    history_snapshot_sha256: str,
+    offset: int,
+    filters_sha256: str,
+) -> str:
+    return (
+        f"af1.{history_snapshot_sha256}.{offset}.{filters_sha256}"
+    )
+
+
+def _decode_finding_cursor(cursor: str) -> tuple[str, int, str]:
+    if not isinstance(cursor, str):
+        raise ValueError("invalid finding cursor")
+    match = _FINDING_CURSOR_RE.fullmatch(cursor)
+    if match is None:
+        raise ValueError("invalid finding cursor")
+    snapshot_sha256, offset_raw, filters_sha256 = match.groups()
+    offset = int(offset_raw)
+    if offset > MAX_FINDING_RETRIEVAL_SOURCE_RECORDS:
+        raise ValueError("invalid finding cursor offset")
+    return snapshot_sha256, offset, filters_sha256
+
+
+def _finding_matches_filters(
+    payload: dict[str, Any],
+    *,
+    exact_subject: str | None,
+    checkpoint: str | None,
+    kind: str | None,
+    severity: str | None,
+    recheck_of: str | None,
+) -> bool:
+    if exact_subject is not None and payload.get("subject") != exact_subject:
+        return False
+    if checkpoint is not None and payload.get("checkpoint") != checkpoint:
+        return False
+    payload_kind = (
+        payload.get("kind")
+        if payload.get("finding_contract") == FINDING_CONTRACT
+        else payload.get("status")
+    )
+    if kind is not None and payload_kind != kind:
+        return False
+    if severity is not None and payload.get("severity") != severity:
+        return False
+    if recheck_of is not None and payload.get("recheck_of") != recheck_of:
+        return False
+    return True
+
+
 @mcp.tool(name="list_findings", annotations=READ_ANNOTATIONS)
-def list_findings(limit: int = 20) -> dict[str, Any]:
-    """List recent valid findings and expose bounded health for immutable history."""
+def list_findings(
+    limit: int = 20,
+    cursor: str | None = None,
+    exact_subject: str | None = None,
+    checkpoint: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    recheck_of: str | None = None,
+) -> dict[str, Any]:
+    """Page immutable finding history with exact filters and no current-truth projection."""
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
-    records, errors = _load_finding_payloads()
-    selected = records[-limit:]
+    exact_subject = _finding_filter_text(exact_subject, "exact_subject")
+    checkpoint = _finding_filter_text(checkpoint, "checkpoint")
+    if kind is not None and kind not in (_V1_FINDING_KINDS | _LEGACY_STATUSES):
+        raise ValueError("kind is not a supported finding contract value")
+    if severity is not None and severity not in _SEVERITY_ORDER:
+        raise ValueError("severity is not a supported finding contract value")
+    if recheck_of is not None and (
+        not isinstance(recheck_of, str)
+        or _FINDING_ID_RE.fullmatch(recheck_of) is None
+    ):
+        raise ValueError("recheck_of must be an exact finding id")
+
+    filters_sha256 = _finding_filters_sha256(
+        exact_subject=exact_subject,
+        checkpoint=checkpoint,
+        kind=kind,
+        severity=severity,
+        recheck_of=recheck_of,
+    )
+    cursor_snapshot = None
+    offset = 0
+    if cursor is not None:
+        cursor_snapshot, offset, cursor_filters = _decode_finding_cursor(cursor)
+        if cursor_filters != filters_sha256:
+            raise ValueError("finding cursor filters do not match")
+
+    history = _load_bounded_finding_history()
+    history_snapshot_sha256 = history["history_snapshot_sha256"]
+    if cursor_snapshot is not None and cursor_snapshot != history_snapshot_sha256:
+        raise ValueError("finding cursor store membership changed; restart retrieval")
+
+    ordered = sorted(
+        (
+            (path, payload)
+            for path, payload in history["records"]
+            if _finding_matches_filters(
+                payload,
+                exact_subject=exact_subject,
+                checkpoint=checkpoint,
+                kind=kind,
+                severity=severity,
+                recheck_of=recheck_of,
+            )
+        ),
+        key=lambda pair: str(pair[1].get("finding_id", "")),
+        reverse=True,
+    )
+    if offset > len(ordered):
+        raise ValueError("finding cursor offset is outside the filtered snapshot")
+
+    selected = ordered[offset : offset + limit]
     items = [
         _finding_record_view(payload, path)
-        for path, payload in reversed(selected)
+        for path, payload in selected
     ]
+    next_offset = offset + len(items)
+    has_more = next_offset < len(ordered)
+    next_cursor = None
+    if has_more:
+        next_cursor = _encode_finding_cursor(
+            history_snapshot_sha256=history_snapshot_sha256,
+            offset=next_offset,
+            filters_sha256=filters_sha256,
+        )
+
+    errors = history["errors"]
+    source_complete = bool(
+        history["membership_stable"]
+        and history["name_reconciliation_complete"]
+        and not errors
+    )
     quarantined = errors[:MAX_QUARANTINE_RECORDS]
     store_health = {
-        "source_complete": not errors,
-        "valid_record_count": len(records),
+        "source_complete": source_complete,
+        "valid_record_count": len(history["records"]),
+        "store_record_name_count": len(history["record_names"]),
         "quarantined_record_count": len(errors),
         "quarantined_records": quarantined,
         "quarantine_details_truncated": len(errors) > len(quarantined),
         "history_mutation_model": "immutable_append_only",
         "current_view_model": "bounded_reconstructible_projection",
+        "retrieval_model": "bounded_snapshot_history",
+        "retrieval_source_record_limit": MAX_FINDING_RETRIEVAL_SOURCE_RECORDS,
+        "membership_stable": history["membership_stable"],
+        "name_reconciliation_complete": history["name_reconciliation_complete"],
+        "store_names_sha256": history["store_names_sha256"],
         "observed_at": _utc_now(),
     }
     return {
         "count": len(items),
         "findings": items,
-        "source_complete": not errors,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "order": "finding_id_desc",
+            "history_snapshot_sha256": history_snapshot_sha256,
+            "matching_snapshot_record_count": len(ordered),
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "retrieval_complete": not has_more,
+        },
+        "source_complete": source_complete,
         "source_error_count": len(errors),
         "quarantined_record_count": len(errors),
         "store_health": store_health,
+        "historical_retrieval_only": True,
+        "does_not_establish": [
+            "current_truth",
+            "latest_state_of_subject",
+            "semantic_subject_equivalence",
+            "task_or_work_authority",
+            "decision_authority",
+        ],
         "observed_at": _utc_now(),
     }
 
