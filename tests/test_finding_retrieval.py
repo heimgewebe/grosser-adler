@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -313,6 +314,32 @@ def test_quarantine_remains_visible_and_valid_history_remains_retrievable(
     assert page["quarantined_record_count"] == 1
     assert page["store_health"]["valid_record_count"] == 1
     assert page["store_health"]["quarantined_record_count"] == 1
+
+
+def test_non_utf8_record_name_is_quarantined_without_breaking_snapshot_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    valid = _ids(1)[0]
+    _persist(valid)
+
+    invalid_path = (
+        os.fsencode(server.FINDINGS_ROOT)
+        + b"/invalid-\xff.json"
+    )
+    with open(invalid_path, "wb") as handle:
+        handle.write(b"{}\n")
+
+    page = server.list_findings(limit=10)
+
+    assert [item["finding_id"] for item in page["findings"]] == [valid]
+    assert page["source_complete"] is False
+    assert page["source_error_count"] == 1
+    assert page["quarantined_record_count"] == 1
+    record = page["store_health"]["quarantined_records"][0]["record"]
+    assert record.startswith("<filesystem-bytes-hex:")
+    assert record.endswith(">")
+    json.dumps(page, ensure_ascii=False).encode("utf-8")
 
 
 def test_retrieval_source_bound_fails_before_record_loading(

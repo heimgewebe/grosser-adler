@@ -2008,8 +2008,33 @@ def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
         raise RuntimeError("V1 finding digest mismatch")
 
 
+def _finding_record_name_hash_identity(name: str) -> str | dict[str, str]:
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return {"filesystem_bytes_hex": os.fsencode(name).hex()}
+    return name
+
+
+def _finding_store_names_sha256(names: list[str]) -> str:
+    return _sha256_json([
+        _finding_record_name_hash_identity(name)
+        for name in names
+    ])
+
+
+def _finding_record_name_for_evidence(name: str) -> str:
+    identity = _finding_record_name_hash_identity(name)
+    if isinstance(identity, str):
+        return identity
+    return f"<filesystem-bytes-hex:{identity['filesystem_bytes_hex']}>"
+
+
 def _finding_quarantine_evidence(path: Path, exc: BaseException) -> dict[str, str]:
-    return {"record": path.name, "error_type": type(exc).__name__}
+    return {
+        "record": _finding_record_name_for_evidence(path.name),
+        "error_type": type(exc).__name__,
+    }
 
 
 def _load_finding_payloads(
@@ -2176,7 +2201,7 @@ def _finding_store_name_snapshot(dir_fd: int) -> tuple[list[str], str]:
         for name in os.listdir(dir_fd)
         if isinstance(name, str) and name.endswith(".json")
     )
-    return names, _sha256_json(names)
+    return names, _finding_store_names_sha256(names)
 
 
 def _scan_finding_store_index() -> dict[str, Any]:
@@ -2279,7 +2304,7 @@ def _try_increment_finding_store_index(
         ):
             return None
         prior_names = [name for name in names if name != path.name]
-        if _sha256_json(prior_names) != existing["store_names_sha256"]:
+        if _finding_store_names_sha256(prior_names) != existing["store_names_sha256"]:
             return None
 
         try:
@@ -2886,7 +2911,10 @@ def _load_bounded_finding_history() -> dict[str, Any]:
         ]
     snapshot_sha256 = _sha256_json(
         {
-            "record_names": before_names,
+            "record_names": [
+                _finding_record_name_hash_identity(name)
+                for name in before_names
+            ],
             "records": [
                 [
                     path.name,
@@ -2905,7 +2933,7 @@ def _load_bounded_finding_history() -> dict[str, Any]:
         "record_sha256s": record_sha256s,
         "membership_stable": membership_stable,
         "name_reconciliation_complete": name_reconciliation_complete,
-        "store_names_sha256": _sha256_json(before_names),
+        "store_names_sha256": _finding_store_names_sha256(before_names),
         "history_snapshot_sha256": snapshot_sha256,
     }
 
