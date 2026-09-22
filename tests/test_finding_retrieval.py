@@ -316,6 +316,64 @@ def test_quarantine_remains_visible_and_valid_history_remains_retrievable(
     assert page["store_health"]["quarantined_record_count"] == 1
 
 
+def test_surrogate_bearing_legacy_record_is_quarantined_at_transport_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    valid = _ids(1)[0]
+    _persist(valid)
+
+    surrogate_id = _ids(2)[1]
+    payload = {
+        "schema_version": 1,
+        "finding_id": surrogate_id,
+        "adler_identity": server.IDENTITY,
+        "compatibility_contract": server.LEGACY_CONNECTOR_CONTRACT,
+        "subject_kind": "repo",
+        "subject": "repo:\ud800",
+        "checkpoint": "checkpoint:\udcff",
+        "severity": "low",
+        "status": "finding",
+        "summary": "legacy surrogate fixture",
+        "evidence_refs": ["fixture:test_finding_retrieval.py"],
+        "observed_at": "2026-09-19T13:00:00+00:00",
+        "effect_contract": "advisory_only_no_automatic_action",
+    }
+    path = server.FINDINGS_ROOT / f"{surrogate_id}.json"
+    path.write_bytes(
+        (
+            json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2)
+            + "\n"
+        ).encode("ascii")
+    )
+
+    page = server.list_findings(limit=10)
+
+    assert [item["finding_id"] for item in page["findings"]] == [valid]
+    assert page["source_complete"] is False
+    assert page["source_error_count"] == 1
+    assert page["quarantined_record_count"] == 1
+    assert page["store_health"]["quarantined_records"] == [
+        {"record": path.name, "error_type": "RuntimeError"}
+    ]
+    json.dumps(page, ensure_ascii=False).encode("utf-8")
+
+    with pytest.raises(ValueError):
+        server.list_findings(limit=10, exact_subject="repo:\ud800")
+    with pytest.raises(ValueError):
+        server.list_findings(limit=10, checkpoint="checkpoint:\udcff")
+    with pytest.raises(RuntimeError, match="non-transportable Unicode surrogate"):
+        server.submit_finding_legacy(
+            subject_kind="repo",
+            subject="repo:\ud800",
+            severity="low",
+            summary="rejected surrogate write",
+            evidence_refs=["fixture:test_finding_retrieval.py"],
+            checkpoint=None,
+            status="finding",
+        )
+
+
 def test_non_utf8_record_name_is_quarantined_without_breaking_snapshot_hashing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

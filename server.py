@@ -1590,6 +1590,20 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _contains_unicode_surrogate(value: Any) -> bool:
+    if isinstance(value, str):
+        return any(0xD800 <= ord(char) <= 0xDFFF for char in value)
+    if isinstance(value, list):
+        return any(_contains_unicode_surrogate(item) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _contains_unicode_surrogate(key)
+            or _contains_unicode_surrogate(item)
+            for key, item in value.items()
+        )
+    return False
+
+
 def _read_json_file_no_symlink_with_sha256(
     path: Path,
 ) -> tuple[dict[str, Any], str]:
@@ -1788,6 +1802,8 @@ def _finding_record_view(
 
 
 def _validate_legacy_finding_payload(payload: dict[str, Any], path: Path) -> None:
+    if _contains_unicode_surrogate(payload):
+        raise RuntimeError("legacy finding contains non-transportable Unicode surrogate")
     if any(key in payload for key in _V1_ONLY_MARKERS):
         raise RuntimeError("finding contract is invalid or ambiguous")
 
@@ -2919,11 +2935,10 @@ def _load_bounded_finding_history() -> dict[str, Any]:
             ],
             "records": [
                 [
-                    path.name,
-                    _sha256_json(payload),
+                    _finding_record_name_hash_identity(path.name),
                     record_sha256s[path.name],
                 ]
-                for path, payload in records
+                for path, _payload in records
             ],
             "errors": errors,
         }
@@ -2947,6 +2962,7 @@ def _finding_filter_text(value: str | None, field: str) -> str | None:
         not isinstance(value, str)
         or not value.strip()
         or len(value) > 500
+        or _contains_unicode_surrogate(value)
     ):
         raise ValueError(f"{field} must be an exact non-blank 1..500 character string")
     return value
@@ -2955,8 +2971,12 @@ def _finding_filter_text(value: str | None, field: str) -> str | None:
 def _finding_checkpoint_filter(value: str | None) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or len(value) > 500:
-        raise ValueError("checkpoint must be an exact 0..500 character string")
+    if (
+        not isinstance(value, str)
+        or len(value) > 500
+        or _contains_unicode_surrogate(value)
+    ):
+        raise ValueError("checkpoint must be an exact transportable 0..500 character string")
     return value
 
 
@@ -3205,7 +3225,9 @@ def _persist_finding(payload: dict[str, Any]) -> tuple[str, str]:
     else:
         _validate_legacy_finding_payload(payload, target_path)
         finding_sha256 = _sha256_json(payload)
-    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
     tmp_name = f".finding-{payload['finding_id']}-{uuid.uuid4().hex}.tmp"
     dir_fd = os.open(FINDINGS_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     locked = False
