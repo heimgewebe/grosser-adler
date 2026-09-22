@@ -131,6 +131,59 @@ def test_exact_subject_checkpoint_kind_and_severity_filters_are_literal(
     assert [item["finding_id"] for item in page["findings"]] == [_ids(1)[0]]
 
 
+def test_checkpoint_filter_covers_full_legacy_domain_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    checkpoints = {
+        "null": None,
+        "empty": "",
+        "whitespace": " abc ",
+        "normal": OID_A,
+    }
+    finding_ids: dict[str, str] = {}
+    for label, checkpoint in checkpoints.items():
+        result = server.submit_finding_legacy(
+            subject_kind="repo",
+            subject="repo:legacy-checkpoint",
+            severity="low",
+            summary=f"legacy checkpoint {label}",
+            evidence_refs=["fixture:test_finding_retrieval.py"],
+            checkpoint=checkpoint,
+            status="finding",
+        )
+        finding_ids[label] = result["finding_id"]
+
+    assert [
+        item["finding_id"]
+        for item in server.list_findings(limit=10, checkpoint="")["findings"]
+    ] == [finding_ids["empty"]]
+    assert [
+        item["finding_id"]
+        for item in server.list_findings(limit=10, checkpoint=" abc ")["findings"]
+    ] == [finding_ids["whitespace"]]
+    assert [
+        item["finding_id"]
+        for item in server.list_findings(limit=10, checkpoint=OID_A)["findings"]
+    ] == [finding_ids["normal"]]
+    assert [
+        item["finding_id"]
+        for item in server.list_findings(limit=10, checkpoint_is_null=True)["findings"]
+    ] == [finding_ids["null"]]
+
+    unfiltered = server.list_findings(limit=10)
+    assert {item["finding_id"] for item in unfiltered["findings"]} == set(
+        finding_ids.values()
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        server.list_findings(
+            limit=10,
+            checkpoint="",
+            checkpoint_is_null=True,
+        )
+
+
 def test_recheck_filter_preserves_history_without_current_truth_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2890,10 +2890,19 @@ def _finding_filter_text(value: str | None, field: str) -> str | None:
     return value
 
 
+def _finding_checkpoint_filter(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 500:
+        raise ValueError("checkpoint must be an exact 0..500 character string")
+    return value
+
+
 def _finding_filters_sha256(
     *,
     exact_subject: str | None,
     checkpoint: str | None,
+    checkpoint_is_null: bool,
     kind: str | None,
     severity: str | None,
     recheck_of: str | None,
@@ -2902,6 +2911,7 @@ def _finding_filters_sha256(
         {
             "exact_subject": exact_subject,
             "checkpoint": checkpoint,
+            "checkpoint_is_null": checkpoint_is_null,
             "kind": kind,
             "severity": severity,
             "recheck_of": recheck_of,
@@ -2938,13 +2948,17 @@ def _finding_matches_filters(
     *,
     exact_subject: str | None,
     checkpoint: str | None,
+    checkpoint_is_null: bool,
     kind: str | None,
     severity: str | None,
     recheck_of: str | None,
 ) -> bool:
     if exact_subject is not None and payload.get("subject") != exact_subject:
         return False
-    if checkpoint is not None and payload.get("checkpoint") != checkpoint:
+    if checkpoint_is_null:
+        if payload.get("checkpoint") is not None:
+            return False
+    elif checkpoint is not None and payload.get("checkpoint") != checkpoint:
         return False
     payload_kind = (
         payload.get("kind")
@@ -2966,6 +2980,7 @@ def list_findings(
     cursor: str | None = None,
     exact_subject: str | None = None,
     checkpoint: str | None = None,
+    checkpoint_is_null: bool = False,
     kind: str | None = None,
     severity: str | None = None,
     recheck_of: str | None = None,
@@ -2974,7 +2989,11 @@ def list_findings(
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
     exact_subject = _finding_filter_text(exact_subject, "exact_subject")
-    checkpoint = _finding_filter_text(checkpoint, "checkpoint")
+    checkpoint = _finding_checkpoint_filter(checkpoint)
+    if not isinstance(checkpoint_is_null, bool):
+        raise ValueError("checkpoint_is_null must be a boolean")
+    if checkpoint_is_null and checkpoint is not None:
+        raise ValueError("checkpoint and checkpoint_is_null are mutually exclusive")
     if kind is not None and kind not in (_V1_FINDING_KINDS | _LEGACY_STATUSES):
         raise ValueError("kind is not a supported finding contract value")
     if severity is not None and severity not in _SEVERITY_ORDER:
@@ -2988,6 +3007,7 @@ def list_findings(
     filters_sha256 = _finding_filters_sha256(
         exact_subject=exact_subject,
         checkpoint=checkpoint,
+        checkpoint_is_null=checkpoint_is_null,
         kind=kind,
         severity=severity,
         recheck_of=recheck_of,
@@ -3012,6 +3032,7 @@ def list_findings(
                 payload,
                 exact_subject=exact_subject,
                 checkpoint=checkpoint,
+                checkpoint_is_null=checkpoint_is_null,
                 kind=kind,
                 severity=severity,
                 recheck_of=recheck_of,
