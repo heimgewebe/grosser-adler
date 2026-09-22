@@ -2882,11 +2882,10 @@ def _finding_filter_text(value: str | None, field: str) -> str | None:
         return None
     if (
         not isinstance(value, str)
-        or not value
-        or value != value.strip()
+        or not value.strip()
         or len(value) > 500
     ):
-        raise ValueError(f"{field} must be an exact 1..500 character string")
+        raise ValueError(f"{field} must be an exact non-blank 1..500 character string")
     return value
 
 

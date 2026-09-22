@@ -131,6 +131,39 @@ def test_exact_subject_checkpoint_kind_and_severity_filters_are_literal(
     assert [item["finding_id"] for item in page["findings"]] == [_ids(1)[0]]
 
 
+def test_exact_subject_filter_covers_full_legacy_domain_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    legacy_id = _ids(1)[0]
+    normalized_id = _ids(2)[1]
+    server._persist_finding(
+        {
+            "schema_version": 1,
+            "finding_id": legacy_id,
+            "adler_identity": server.IDENTITY,
+            "compatibility_contract": server.LEGACY_CONNECTOR_CONTRACT,
+            "subject_kind": "repo",
+            "subject": " repo:alpha ",
+            "checkpoint": OID_A,
+            "severity": "low",
+            "status": "finding",
+            "summary": "legacy whitespace subject",
+            "evidence_refs": ["fixture:test_finding_retrieval.py"],
+            "observed_at": "2026-09-19T13:00:00+00:00",
+            "effect_contract": "advisory_only_no_automatic_action",
+        }
+    )
+    _persist(normalized_id, subject="repo:alpha")
+
+    page = server.list_findings(limit=10, exact_subject=" repo:alpha ")
+    assert [item["finding_id"] for item in page["findings"]] == [legacy_id]
+    assert page["findings"][0]["subject"] == " repo:alpha "
+
+    with pytest.raises(ValueError):
+        server.list_findings(limit=10, exact_subject="   ")
+
+
 def test_checkpoint_filter_covers_full_legacy_domain_literal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
