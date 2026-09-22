@@ -229,7 +229,280 @@ def test_github_pr_requests_base_oid(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls[2][2] == "repos/heimgewebe/grosser-adler/pulls/2/comments"
     assert calls[2][-1] == "--paginate"
     assert result["review_comments"]["returncode"] == 0
-    assert "inline review comments" in (server.github_pr.__doc__ or "")
+    assert "source-local deterministic projection" in (server.github_pr.__doc__ or "")
+
+
+def _github_receipt(
+    payload,
+    *,
+    returncode: int = 0,
+    stdout_truncated: bool = False,
+) -> dict:
+    stdout = payload if isinstance(payload, str) else json.dumps(payload)
+    return {
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": "" if returncode == 0 else "failed",
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": False,
+        "rows_intact": True,
+    }
+
+
+def _github_pr_with_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: dict,
+    reviews: dict,
+    comments: dict,
+) -> dict:
+    receipts = [metadata, reviews, comments]
+
+    def fake_run(argv, **kwargs):
+        return receipts.pop(0)
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    return server.github_pr("heimgewebe/grosser-adler", 17)
+
+
+def test_github_pr_projects_complete_source_local_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_payload = {
+        "number": 17,
+        "headRefOid": OID_A,
+        "baseRefOid": OID_B,
+        "statusCheckRollup": [{"name": "test", "conclusion": "SUCCESS"}],
+    }
+    reviews_payload = [
+        {"id": 1, "state": "APPROVED", "commit_id": OID_A},
+        {"id": 2, "state": "COMMENTED", "commit_id": OID_B},
+    ]
+    comments_payload = [
+        {"id": 10, "pull_request_review_id": 2, "path": "server.py", "line": 1200}
+    ]
+    metadata = _github_receipt(metadata_payload)
+    reviews = _github_receipt(reviews_payload)
+    comments = _github_receipt(comments_payload)
+
+    result = _github_pr_with_receipts(monkeypatch, metadata, reviews, comments)
+    structured = result["structured"]
+
+    assert result["metadata"] == metadata
+    assert result["reviews"] == reviews
+    assert result["review_comments"] == comments
+    assert structured["facts"] == metadata_payload
+    assert structured["checks"] == metadata_payload["statusCheckRollup"]
+    assert structured["reviews"] == reviews_payload
+    assert structured["inline_comments"] == comments_payload
+    assert structured["review_head_bindings"] == [
+        {
+            "review_id": 1,
+            "review_commit_id": OID_A,
+            "pr_head_oid": OID_A,
+            "current_head_binding": True,
+        },
+        {
+            "review_id": 2,
+            "review_commit_id": OID_B,
+            "pr_head_oid": OID_A,
+            "current_head_binding": False,
+        },
+    ]
+    assert structured["source_complete"] is True
+    assert structured["observation_complete"] is True
+    assert structured["missing_evidence"] == []
+    assert structured["observed_at"] == result["observed_at"]
+    assert "merge_authorization" in structured["does_not_establish"]
+
+
+def test_github_pr_flattens_complete_paginated_review_arrays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _github_receipt({"headRefOid": OID_A, "statusCheckRollup": []})
+    page_one = [{"id": 1, "commit_id": OID_A}]
+    page_two = [{"id": 2, "commit_id": OID_B}]
+    reviews = _github_receipt(json.dumps(page_one) + "\n" + json.dumps(page_two))
+    comments = _github_receipt([])
+
+    structured = _github_pr_with_receipts(monkeypatch, metadata, reviews, comments)["structured"]
+
+    assert structured["reviews"] == page_one + page_two
+    assert [item["current_head_binding"] for item in structured["review_head_bindings"]] == [
+        True,
+        False,
+    ]
+    assert structured["observation_complete"] is True
+
+
+def test_github_pr_missing_review_commit_keeps_binding_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _github_receipt({"headRefOid": OID_A, "statusCheckRollup": []})
+    reviews = _github_receipt([{"id": 1, "commit_id": None}])
+    comments = _github_receipt([])
+
+    structured = _github_pr_with_receipts(monkeypatch, metadata, reviews, comments)["structured"]
+
+    assert structured["reviews"] == [{"id": 1, "commit_id": None}]
+    assert structured["review_head_bindings"][0]["current_head_binding"] == "unknown"
+    assert structured["source_complete"] is True
+    assert structured["observation_complete"] is False
+    assert "reviews[0].commit_id" in structured["missing_evidence"]
+
+
+@pytest.mark.parametrize(
+    ("source_index", "receipt", "expected_missing", "structured_field"),
+    [
+        (0, _github_receipt("{"), "metadata:invalid_json", "facts"),
+        (
+            1,
+            _github_receipt([], stdout_truncated=True),
+            "reviews:stdout_truncated",
+            "reviews",
+        ),
+        (
+            2,
+            _github_receipt([], returncode=1),
+            "inline_comments:command_failed",
+            "inline_comments",
+        ),
+    ],
+)
+def test_github_pr_fails_closed_for_incomplete_subsources(
+    monkeypatch: pytest.MonkeyPatch,
+    source_index: int,
+    receipt: dict,
+    expected_missing: str,
+    structured_field: str,
+) -> None:
+    receipts = [
+        _github_receipt({"headRefOid": OID_A, "statusCheckRollup": []}),
+        _github_receipt([]),
+        _github_receipt([]),
+    ]
+    receipts[source_index] = receipt
+
+    structured = _github_pr_with_receipts(monkeypatch, *receipts)["structured"]
+
+    assert structured[structured_field] is None
+    assert structured["source_complete"] is False
+    assert structured["observation_complete"] is False
+    assert expected_missing in structured["missing_evidence"]
+
+
+def test_github_pr_distinguishes_empty_complete_from_empty_incomplete_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _github_receipt({"headRefOid": OID_A, "statusCheckRollup": []})
+    complete = _github_pr_with_receipts(
+        monkeypatch, metadata, _github_receipt([]), _github_receipt([])
+    )["structured"]
+    assert complete["reviews"] == []
+    assert complete["review_head_bindings"] == []
+    assert complete["observation_complete"] is True
+
+    incomplete = _github_pr_with_receipts(
+        monkeypatch,
+        metadata,
+        _github_receipt([], stdout_truncated=True),
+        _github_receipt([]),
+    )["structured"]
+    assert incomplete["reviews"] is None
+    assert incomplete["review_head_bindings"] is None
+    assert incomplete["observation_complete"] is False
+
+
+def test_github_pr_missing_head_keeps_binding_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _github_receipt({"statusCheckRollup": []})
+    reviews = _github_receipt([{"id": 1, "commit_id": OID_A}])
+    comments = _github_receipt([])
+
+    structured = _github_pr_with_receipts(monkeypatch, metadata, reviews, comments)["structured"]
+
+    assert structured["review_head_bindings"][0]["current_head_binding"] == "unknown"
+    assert "metadata.headRefOid" in structured["missing_evidence"]
+    assert structured["observation_complete"] is False
+
+
+def test_github_pr_projection_preserves_redaction_without_reinventing_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "ghp_" + ("A" * 24)
+    metadata = _github_receipt({"headRefOid": OID_A, "statusCheckRollup": []})
+    reviews = _github_receipt([])
+    redacted_comments = server._redact(json.dumps([{"id": 1, "body": secret}]))
+    comments = _github_receipt(redacted_comments)
+
+    result = _github_pr_with_receipts(monkeypatch, metadata, reviews, comments)
+    serialized = json.dumps(result)
+
+    assert secret not in serialized
+    assert result["structured"]["inline_comments"] == [{"id": 1, "body": "<REDACTED>"}]
+    assert result["structured"]["observation_complete"] is True
+
+
+def test_github_pr_round_trips_structured_projection_over_real_mcp_stdio() -> None:
+    import asyncio
+    import sys
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    metadata = _github_receipt({
+        "number": 17,
+        "headRefOid": OID_A,
+        "baseRefOid": OID_B,
+        "statusCheckRollup": [{"name": "pytest", "conclusion": "SUCCESS"}],
+    })
+    reviews = _github_receipt([{"id": 1, "state": "COMMENTED", "commit_id": OID_A}])
+    comments = _github_receipt([
+        {"id": 10, "pull_request_review_id": 1, "path": "server.py", "line": 1200}
+    ])
+    server_code = (
+        "import server\n"
+        f"receipts = iter({[metadata, reviews, comments]!r})\n"
+        "def fake_run(argv, **kwargs):\n"
+        "    return next(receipts)\n"
+        "server._run = fake_run\n"
+        "server.mcp.run(transport='stdio')\n"
+    )
+
+    async def round_trip() -> dict:
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-c", server_code],
+            cwd=str(Path(__file__).parents[1]),
+        )
+        async with stdio_client(params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "github_pr", {"repo": "heimgewebe/grosser-adler", "pr": 17}
+                )
+        structured_content = getattr(result, "structuredContent", None)
+        if structured_content is None:
+            structured_content = getattr(result, "structured_content", None)
+        if isinstance(structured_content, dict):
+            candidate = structured_content.get("result", structured_content)
+            if isinstance(candidate, dict) and "repo" in candidate:
+                return candidate
+        texts = [item.text for item in result.content if hasattr(item, "text")]
+        assert texts
+        payload = json.loads("".join(texts))
+        assert isinstance(payload, dict)
+        return payload
+
+    payload = asyncio.run(round_trip())
+
+    assert payload["metadata"] == metadata
+    assert payload["reviews"] == reviews
+    assert payload["review_comments"] == comments
+    assert payload["structured"]["checks"][0]["name"] == "pytest"
+    assert payload["structured"]["review_head_bindings"][0]["current_head_binding"] is True
+    assert payload["structured"]["missing_evidence"] == []
+    assert payload["structured"]["observation_complete"] is True
 
 
 def test_deploy_templates_keep_credentials_separate() -> None:

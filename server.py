@@ -1154,9 +1154,154 @@ def git_show(repo: str, revision: str = "HEAD") -> dict[str, Any]:
     return {"repo": str(root), "revision": rev, "show": result, "observed_at": _utc_now()}
 
 
+def _decode_json_documents(text: str) -> list[Any]:
+    """Decode one or more adjacent JSON documents without accepting trailing junk."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("empty JSON evidence")
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    cursor = 0
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
+            break
+        value, cursor = decoder.raw_decode(text, cursor)
+        values.append(value)
+    if not values:
+        raise ValueError("empty JSON evidence")
+    return values
+
+
+def _project_github_json(
+    receipt: dict[str, Any], *, source: str, paginated_array: bool
+) -> tuple[Any | None, dict[str, bool], list[str]]:
+    """Project one bounded gh receipt only when its complete JSON shape is known."""
+    missing: list[str] = []
+    transport_complete = (
+        receipt.get("returncode") == 0
+        and not bool(receipt.get("stdout_truncated", False))
+        and isinstance(receipt.get("stdout"), str)
+    )
+    if receipt.get("returncode") != 0:
+        missing.append(f"{source}:command_failed")
+    if bool(receipt.get("stdout_truncated", False)):
+        missing.append(f"{source}:stdout_truncated")
+    if not isinstance(receipt.get("stdout"), str):
+        missing.append(f"{source}:stdout_unavailable")
+
+    payload: Any | None = None
+    parse_complete = False
+    if transport_complete:
+        try:
+            documents = _decode_json_documents(receipt["stdout"])
+            if paginated_array:
+                if not all(isinstance(document, list) for document in documents):
+                    raise ValueError("paginated GitHub source must contain JSON arrays")
+                rows = [row for document in documents for row in document]
+                if not all(isinstance(row, dict) for row in rows):
+                    raise ValueError("GitHub array rows must be objects")
+                payload = rows
+            else:
+                if len(documents) != 1 or not isinstance(documents[0], dict):
+                    raise ValueError("GitHub metadata must be one JSON object")
+                payload = documents[0]
+            parse_complete = True
+        except (json.JSONDecodeError, ValueError, TypeError):
+            missing.append(f"{source}:invalid_json")
+
+    source_complete = transport_complete and parse_complete
+    return payload if source_complete else None, {
+        "transport_complete": transport_complete,
+        "parse_complete": parse_complete,
+        "source_complete": source_complete,
+    }, missing
+
+
+def _structured_github_pr(
+    metadata: dict[str, Any],
+    reviews: dict[str, Any],
+    review_comments: dict[str, Any],
+    *,
+    observed_at: str,
+) -> dict[str, Any]:
+    facts, metadata_state, missing = _project_github_json(
+        metadata, source="metadata", paginated_array=False
+    )
+    review_rows, reviews_state, review_missing = _project_github_json(
+        reviews, source="reviews", paginated_array=True
+    )
+    inline_comments, comments_state, comments_missing = _project_github_json(
+        review_comments, source="inline_comments", paginated_array=True
+    )
+    missing.extend(review_missing)
+    missing.extend(comments_missing)
+
+    checks: list[Any] | None = None
+    head_oid: str | None = None
+    if facts is not None:
+        raw_checks = facts.get("statusCheckRollup")
+        if isinstance(raw_checks, list):
+            checks = raw_checks
+        else:
+            missing.append("metadata.statusCheckRollup")
+        raw_head = facts.get("headRefOid")
+        if isinstance(raw_head, str) and raw_head:
+            head_oid = raw_head
+        else:
+            missing.append("metadata.headRefOid")
+
+    review_head_bindings: list[dict[str, Any]] | None = None
+    if review_rows is not None:
+        review_head_bindings = []
+        for index, review in enumerate(review_rows):
+            raw_commit = review.get("commit_id")
+            review_commit = raw_commit if isinstance(raw_commit, str) and raw_commit else None
+            if head_oid is not None and review_commit is not None:
+                current_head_binding: bool | str = review_commit == head_oid
+            else:
+                current_head_binding = "unknown"
+                if review_commit is None:
+                    missing.append(f"reviews[{index}].commit_id")
+            review_head_bindings.append({
+                "review_id": review.get("id"),
+                "review_commit_id": review_commit,
+                "pr_head_oid": head_oid,
+                "current_head_binding": current_head_binding,
+            })
+
+    missing_evidence = sorted(set(missing))
+    sources = {
+        "metadata": metadata_state,
+        "reviews": reviews_state,
+        "inline_comments": comments_state,
+    }
+    source_complete = all(state["source_complete"] for state in sources.values())
+    observation_complete = source_complete and not missing_evidence
+    return {
+        "facts": facts,
+        "checks": checks,
+        "reviews": review_rows,
+        "inline_comments": inline_comments,
+        "review_head_bindings": review_head_bindings,
+        "sources": sources,
+        "source_complete": source_complete,
+        "observation_complete": observation_complete,
+        "missing_evidence": missing_evidence,
+        "observed_at": observed_at,
+        "does_not_establish": [
+            "review_validity",
+            "review_sufficiency",
+            "approval",
+            "merge_readiness",
+            "merge_authorization",
+        ],
+    }
+
+
 @mcp.tool(name="github_pr", annotations=READ_ANNOTATIONS)
 def github_pr(repo: str, pr: int) -> dict[str, Any]:
-    """Read live GitHub PR metadata, review submissions, inline review comments and checks read-only."""
+    """Read raw GitHub PR evidence plus a source-local deterministic projection."""
     owner, name = _split_github_repo(repo)
     gh_repo = f"{owner}/{name}"
     if not isinstance(pr, int) or isinstance(pr, bool) or not 1 <= pr <= 2_147_483_647:
@@ -1171,15 +1316,18 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     review_comments = _run([
         "/usr/bin/gh", "api", f"repos/{owner}/{name}/pulls/{pr}/comments", "--paginate",
     ], timeout=20)
+    observed_at = _utc_now()
     return {
         "repo": gh_repo,
         "pr": pr,
         "metadata": metadata,
         "reviews": reviews,
         "review_comments": review_comments,
-        "observed_at": _utc_now(),
+        "structured": _structured_github_pr(
+            metadata, reviews, review_comments, observed_at=observed_at
+        ),
+        "observed_at": observed_at,
     }
-
 
 def _parse_service_units(text: str) -> tuple[list[dict[str, str]], bool]:
     """Parse bounded, already-redacted `systemctl list-units` rows.
