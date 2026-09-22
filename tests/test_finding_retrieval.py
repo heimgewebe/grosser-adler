@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,48 @@ def test_cursor_fails_closed_if_store_changes_between_pages(
     _persist("ga-20260919T130001Z-000000000005", subject="repo:later")
     with pytest.raises(ValueError, match="store membership changed"):
         server.list_findings(limit=2, cursor=cursor)
+
+
+def test_cursor_fails_closed_if_legacy_record_bytes_change_only_by_formatting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_state(tmp_path, monkeypatch)
+    first_result = server.submit_finding_legacy(
+        subject_kind="repo",
+        subject="repo:legacy-format",
+        severity="low",
+        summary="legacy byte snapshot one",
+        evidence_refs=["fixture:test_finding_retrieval.py"],
+        checkpoint=OID_A,
+        status="finding",
+    )
+    server.submit_finding_legacy(
+        subject_kind="repo",
+        subject="repo:legacy-format",
+        severity="low",
+        summary="legacy byte snapshot two",
+        evidence_refs=["fixture:test_finding_retrieval.py"],
+        checkpoint=OID_A,
+        status="finding",
+    )
+
+    first_page = server.list_findings(limit=1)
+    cursor = first_page["pagination"]["next_cursor"]
+    assert cursor is not None
+
+    path = server.FINDINGS_ROOT / f"{first_result['finding_id']}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    canonical_before = server._sha256_json(payload)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    assert server._sha256_json(
+        json.loads(path.read_text(encoding="utf-8"))
+    ) == canonical_before
+
+    with pytest.raises(ValueError, match="restart retrieval"):
+        server.list_findings(limit=1, cursor=cursor)
 
 
 def test_exact_subject_checkpoint_kind_and_severity_filters_are_literal(

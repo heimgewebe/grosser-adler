@@ -1588,7 +1588,9 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _read_json_file_no_symlink(path: Path) -> dict[str, Any]:
+def _read_json_file_no_symlink_with_sha256(
+    path: Path,
+) -> tuple[dict[str, Any], str]:
     before = path.lstat()
     if (
         stat.S_ISLNK(before.st_mode)
@@ -1625,6 +1627,11 @@ def _read_json_file_no_symlink(path: Path) -> dict[str, Any]:
         raise RuntimeError(f"invalid JSON source: {path}") from exc
     if not isinstance(payload, dict):
         raise RuntimeError(f"JSON source is not an object: {path}")
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def _read_json_file_no_symlink(path: Path) -> dict[str, Any]:
+    payload, _record_sha256 = _read_json_file_no_symlink_with_sha256(path)
     return payload
 
 
@@ -1729,7 +1736,12 @@ def get_work_target(lane_id: str) -> dict[str, Any]:
     return _read_work_target(lane_id)
 
 
-def _finding_record_view(payload: dict[str, Any], path: Path) -> dict[str, Any]:
+def _finding_record_view(
+    payload: dict[str, Any],
+    path: Path,
+    *,
+    record_sha256: str | None = None,
+) -> dict[str, Any]:
     if payload.get("finding_contract") == FINDING_CONTRACT:
         fields = (
             "finding_id", "finding_sha256", "kind", "severity", "confidence",
@@ -1764,7 +1776,11 @@ def _finding_record_view(payload: dict[str, Any], path: Path) -> dict[str, Any]:
         "recommendation": payload.get("recommendation"),
         "rationale": payload.get("rationale"),
         "observed_at": payload["observed_at"],
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "sha256": (
+            record_sha256
+            if record_sha256 is not None
+            else hashlib.sha256(path.read_bytes()).hexdigest()
+        ),
         "legacy": True,
     }
 
@@ -1998,7 +2014,11 @@ def _finding_quarantine_evidence(path: Path, exc: BaseException) -> dict[str, st
 
 def _load_finding_payloads(
     names: list[str] | None = None,
-) -> tuple[list[tuple[Path, dict[str, Any]]], list[dict[str, str]]]:
+) -> tuple[
+    list[tuple[Path, dict[str, Any]]],
+    list[dict[str, str]],
+    dict[str, str],
+]:
     """Read immutable history while keeping malformed records explicit and isolated."""
     _ensure_state()
     if names is None:
@@ -2009,15 +2029,17 @@ def _load_finding_payloads(
         )
     records: list[tuple[Path, dict[str, Any]]] = []
     errors: list[dict[str, str]] = []
+    record_sha256s: dict[str, str] = {}
     for name in names:
         path = FINDINGS_ROOT / name
         try:
-            payload = _read_json_file_no_symlink(path)
+            payload, record_sha256 = _read_json_file_no_symlink_with_sha256(path)
             _validate_v1_finding_payload(payload, path)
         except Exception as exc:
             errors.append(_finding_quarantine_evidence(path, exc))
             continue
         records.append((path, payload))
+        record_sha256s[path.name] = record_sha256
 
     v1_by_id = {
         str(payload["finding_id"]): payload
@@ -2045,7 +2067,13 @@ def _load_finding_payloads(
             for path, payload in records
             if path not in invalid_paths
         ]
-    return records, errors
+    valid_names = {path.name for path, _payload in records}
+    record_sha256s = {
+        name: digest
+        for name, digest in record_sha256s.items()
+        if name in valid_names
+    }
+    return records, errors, record_sha256s
 
 
 def _severity_rank(value: Any) -> int:
@@ -2163,7 +2191,7 @@ def _scan_finding_store_index() -> dict[str, Any]:
         fcntl.flock(dir_fd, fcntl.LOCK_SH)
         locked = True
         before_names, before_digest = _finding_store_name_snapshot(dir_fd)
-        loaded, errors = _load_finding_payloads(before_names)
+        loaded, errors, _record_sha256s = _load_finding_payloads(before_names)
         after_names, after_digest = _finding_store_name_snapshot(dir_fd)
     finally:
         if locked:
@@ -2831,7 +2859,7 @@ def _load_bounded_finding_history() -> dict[str, Any]:
         fcntl.flock(dir_fd, fcntl.LOCK_SH)
         locked = True
         before_names = _bounded_finding_record_names()
-        records, errors = _load_finding_payloads(before_names)
+        records, errors, record_sha256s = _load_finding_payloads(before_names)
         after_names = _bounded_finding_record_names()
     finally:
         if locked:
@@ -2860,7 +2888,11 @@ def _load_bounded_finding_history() -> dict[str, Any]:
         {
             "record_names": before_names,
             "records": [
-                [path.name, _sha256_json(payload)]
+                [
+                    path.name,
+                    _sha256_json(payload),
+                    record_sha256s[path.name],
+                ]
                 for path, payload in records
             ],
             "errors": errors,
@@ -2870,6 +2902,7 @@ def _load_bounded_finding_history() -> dict[str, Any]:
         "records": records,
         "errors": errors,
         "record_names": before_names,
+        "record_sha256s": record_sha256s,
         "membership_stable": membership_stable,
         "name_reconciliation_complete": name_reconciliation_complete,
         "store_names_sha256": _sha256_json(before_names),
@@ -3045,7 +3078,11 @@ def list_findings(
 
     selected = ordered[offset : offset + limit]
     items = [
-        _finding_record_view(payload, path)
+        _finding_record_view(
+            payload,
+            path,
+            record_sha256=history["record_sha256s"][path.name],
+        )
         for path, payload in selected
     ]
     next_offset = offset + len(items)
