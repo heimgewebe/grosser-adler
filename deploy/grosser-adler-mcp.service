@@ -2,6 +2,7 @@
 Description=Großer Adler independent observer MCP
 After=network-online.target
 Wants=network-online.target
+Wants=tunnel-client-grosser-adler.service
 
 [Service]
 Type=simple
