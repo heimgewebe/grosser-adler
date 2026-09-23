@@ -22,6 +22,16 @@ def test_mcp_service_allows_netlink_for_read_only_socket_observation() -> None:
     assert "AF_NETLINK" not in tunnel_line
 
 
+def test_mcp_service_start_pulls_in_tunnel_without_ordering_cycle() -> None:
+    root = Path(__file__).parents[1]
+    mcp = _unit()
+    tunnel = (root / "deploy" / "tunnel-client-grosser-adler.service").read_text(encoding="utf-8")
+    assert "Wants=tunnel-client-grosser-adler.service" in mcp
+    assert "After=tunnel-client-grosser-adler.service" not in mcp
+    assert "After=network-online.target grosser-adler-mcp.service" in tunnel
+    assert "PartOf=grosser-adler-mcp.service" in tunnel
+
+
 def test_mcp_service_keeps_repositories_read_only_and_writes_only_adler_state() -> None:
     mcp = _unit()
     assert "Environment=GROSSER_ADLER_WORK_LANES_ROOT=%h/.local/state/grabowski/work-lanes" in mcp
