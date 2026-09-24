@@ -154,6 +154,14 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _configured_exact_secrets() -> tuple[str, ...]:
+    """Return configured observer secrets that must never appear in output."""
+    github_token = os.environ.get("GROSSER_ADLER_GITHUB_TOKEN")
+    if github_token is None or not github_token.strip():
+        return ()
+    return (github_token,)
+
+
 def _redaction_for(match: re.Match[str]) -> str:
     """Replace a secret with a marker, keeping the line structure it spanned.
 
@@ -351,12 +359,11 @@ def _run(
             "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus"
         ),
     }
-    gh_token: str | None = None
+    exact_secrets = _configured_exact_secrets()
     if argv[0] == "/usr/bin/gh":
-        gh_token = os.environ.get("GROSSER_ADLER_GITHUB_TOKEN")
-        if not gh_token or not gh_token.strip():
+        if not exact_secrets:
             raise RuntimeError("Großer Adler GitHub credential is not configured")
-        env["GH_TOKEN"] = gh_token
+        env["GH_TOKEN"] = exact_secrets[0]
 
     completed = subprocess.run(
         argv,
@@ -369,7 +376,6 @@ def _run(
         timeout=timeout,
         check=False,
     )
-    exact_secrets = (gh_token,) if gh_token else ()
     # systemd and journal reads name the exact units whose identity must
     # survive; everything else in those streams stays under normal redaction.
     stdout_identity = preserved_identity
@@ -1276,6 +1282,7 @@ def lab_list_directory(path: str = ".", max_entries: int = 200) -> dict[str, Any
 
     entries: list[dict[str, Any]] = []
     scan_complete = True
+    exact_secrets = _configured_exact_secrets()
     dir_fd, root = _open_lab_directory(path)
     try:
         with os.scandir(dir_fd) as iterator:
@@ -1293,7 +1300,7 @@ def lab_list_directory(path: str = ".", max_entries: int = 200) -> dict[str, Any
                     entry_type = "symlink"
                 else:
                     entry_type = "other"
-                safe_name = _redact(entry.name)
+                safe_name = _redact(entry.name, exact_secrets=exact_secrets)
                 entries.append(
                     {
                         "name": safe_name,
@@ -1345,13 +1352,10 @@ def lab_read_text(
     except UnicodeDecodeError as exc:
         raise ValueError("lab text file must be valid UTF-8") from exc
 
-    github_token = os.environ.get("GROSSER_ADLER_GITHUB_TOKEN")
-    exact_secrets = (
-        (github_token,)
-        if github_token is not None and github_token.strip()
-        else ()
+    redacted_source = _redact(
+        source_text,
+        exact_secrets=_configured_exact_secrets(),
     )
-    redacted_source = _redact(source_text, exact_secrets=exact_secrets)
     lines = redacted_source.splitlines(keepends=True)
     start_index = start_line - 1
     selected_lines = lines[start_index : start_index + max_lines]

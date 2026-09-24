@@ -118,6 +118,29 @@ def test_lab_observation_redacts_exact_github_credential(
     assert "<REDACTED>" in observed["text"]
 
 
+def test_lab_directory_listing_redacts_exact_github_credential_from_entry_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    credential = "opaque-dedicated-github-filename-value"
+    (lab_root / credential).write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", credential)
+
+    listing = server.lab_list_directory(".")
+    encoded = json.dumps(listing)
+    assert credential not in encoded
+    assert listing["entries"] == [
+        {
+            "name": "<REDACTED>",
+            "name_redacted": True,
+            "type": "file",
+            "size": 2,
+        }
+    ]
+
+
 def test_lab_observation_rejects_symlinked_lab_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -277,6 +300,33 @@ def test_github_token_is_not_forwarded_to_other_subprocesses(monkeypatch: pytest
 
     assert "GH_TOKEN" not in captured
     assert "GROSSER_ADLER_GITHUB_TOKEN" not in captured
+
+
+def test_github_token_is_redacted_from_other_subprocess_output_without_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+    token = "opaque-dedicated-github-secret-not-matching-a-known-prefix"
+
+    class Completed:
+        returncode = 0
+        stdout = f"stdout {token}"
+        stderr = f"stderr {token}"
+
+    def fake_run(argv, **kwargs):
+        captured.update(kwargs["env"])
+        return Completed()
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", token)
+    result = server._run(["/usr/bin/git", "--version"])
+
+    assert "GH_TOKEN" not in captured
+    assert "GROSSER_ADLER_GITHUB_TOKEN" not in captured
+    assert token not in result["stdout"]
+    assert token not in result["stderr"]
+    assert "<REDACTED>" in result["stdout"]
+    assert "<REDACTED>" in result["stderr"]
 
 
 def test_github_read_fails_closed_without_dedicated_credential(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -671,6 +721,14 @@ def test_deploy_templates_keep_credentials_separate() -> None:
     assert "grosser-adler-runtime.env" in tunnel
     assert "grabowski-runtime.env" not in tunnel
     assert ".config/grosser-adler/github.env" in mcp
+
+
+def test_deploy_template_keeps_absent_lab_root_optional() -> None:
+    root = Path(__file__).parents[1]
+    mcp = (root / "deploy" / "grosser-adler-mcp.service").read_text(encoding="utf-8")
+
+    assert "ReadOnlyPaths=-%h/labs" in mcp
+    assert "ReadOnlyPaths=%h/labs" not in mcp
 
 
 def _complete_git_fixture(head: str = OID_A, *, untracked: bool = False) -> dict:
