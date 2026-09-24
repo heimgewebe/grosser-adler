@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -28,11 +29,16 @@ FINDING_CONTRACT = "adler-finding-v1"
 SIDECAR_CONTRACT = "adler-worktree-inbox-v1"
 ARCHITECTURE_CONTRACT = "observer-evidence-finding-delivery-v1"
 REPO_ROOT = Path("/home/alex/repos").resolve()
+LAB_ROOT = Path("/home/alex/labs").resolve()
 STATE_ROOT = Path(os.environ.get("GROSSER_ADLER_STATE_ROOT", "/home/alex/.local/state/grosser-adler")).resolve()
 FINDINGS_ROOT = STATE_ROOT / "findings"
 INBOX_ROOT = STATE_ROOT / "worktree-inboxes"
 GRABOWSKI_WORK_LANES_ROOT = Path(os.environ.get("GROSSER_ADLER_WORK_LANES_ROOT", "/home/alex/.local/state/grabowski/work-lanes")).resolve()
 WORKTREE_ROOT = Path(os.environ.get("GROSSER_ADLER_WORKTREE_ROOT", "/home/alex/repos/.grabowski-worktrees")).resolve()
+MAX_LAB_TEXT_BYTES = 1_000_000
+MAX_LAB_DIRECTORY_SCAN = 5_000
+MAX_LAB_LIST_ENTRIES = 500
+MAX_LAB_READ_LINES = 2_000
 MAX_OUTPUT_BYTES = 160_000
 MAX_JSON_SOURCE_BYTES = 1_000_000
 MAX_SUMMARY_CHARS = 4_000
@@ -435,6 +441,100 @@ def _resolve_repo(repo: str) -> Path:
     if not marker.exists():
         raise ValueError("repository has no .git marker")
     return resolved
+
+
+def _lab_path_parts(path: str) -> tuple[str, ...]:
+    if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        raise ValueError("path must be non-empty text without NUL")
+    raw = Path(path).expanduser()
+    if raw.is_absolute():
+        try:
+            relative = raw.relative_to(LAB_ROOT)
+        except ValueError as exc:
+            raise PermissionError(f"path is outside {LAB_ROOT}") from exc
+    else:
+        relative = raw
+    parts = tuple(part for part in relative.parts if part not in {"", "."})
+    if any(part == ".." for part in parts):
+        raise PermissionError(f"path is outside {LAB_ROOT}")
+    return parts
+
+
+def _lab_open_flags(*, directory: bool) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if directory:
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _lab_open_component(name: str, *, dir_fd: int, directory: bool) -> int:
+    try:
+        return os.open(name, _lab_open_flags(directory=directory), dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("lab path contains a symlink or non-directory component") from exc
+        raise
+
+
+def _open_lab_directory(path: str) -> tuple[int, Path]:
+    parts = _lab_path_parts(path)
+    try:
+        fd = os.open(LAB_ROOT, _lab_open_flags(directory=True))
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("lab root must be a real directory") from exc
+        raise
+    try:
+        for part in parts:
+            next_fd = _lab_open_component(part, dir_fd=fd, directory=True)
+            os.close(fd)
+            fd = next_fd
+        return fd, LAB_ROOT.joinpath(*parts)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _read_lab_bytes(path: str) -> tuple[Path, bytes]:
+    parts = _lab_path_parts(path)
+    if not parts:
+        raise ValueError("lab text path must name a file")
+    try:
+        parent_fd = os.open(LAB_ROOT, _lab_open_flags(directory=True))
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("lab root must be a real directory") from exc
+        raise
+    fd: int | None = None
+    try:
+        for part in parts[:-1]:
+            next_fd = _lab_open_component(part, dir_fd=parent_fd, directory=True)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        fd = _lab_open_component(parts[-1], dir_fd=parent_fd, directory=False)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("lab text path must be a regular file")
+        if metadata.st_size > MAX_LAB_TEXT_BYTES:
+            raise ValueError("lab text file exceeds the observation byte limit")
+        chunks: list[bytes] = []
+        remaining = MAX_LAB_TEXT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > MAX_LAB_TEXT_BYTES:
+            raise ValueError("lab text file exceeds the observation byte limit")
+        return LAB_ROOT.joinpath(*parts), payload
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent_fd)
 
 
 def _validate_unit(unit: str) -> str:
@@ -1076,6 +1176,8 @@ def adler_status() -> dict[str, Any]:
         "finding_contract": FINDING_CONTRACT,
         "worktree_sidecar_contract": SIDECAR_CONTRACT,
         "repository_root": str(REPO_ROOT),
+        "lab_root": str(LAB_ROOT),
+        "lab_root_available": LAB_ROOT.is_dir(),
         "finding_store": str(FINDINGS_ROOT),
         "inbox_store": str(INBOX_ROOT),
         "work_lane_store": str(GRABOWSKI_WORK_LANES_ROOT),
@@ -1152,6 +1254,112 @@ def git_show(repo: str, revision: str = "HEAD") -> dict[str, Any]:
         "show", "--no-ext-diff", "--no-textconv", "--format=fuller", rev,
     ])
     return {"repo": str(root), "revision": rev, "show": result, "observed_at": _utc_now()}
+
+
+@mcp.tool(name="lab_list_directory", annotations=READ_ANNOTATIONS)
+def lab_list_directory(path: str = ".", max_entries: int = 200) -> dict[str, Any]:
+    """List one bounded directory under the fixed lab observation root."""
+    if (
+        not isinstance(max_entries, int)
+        or isinstance(max_entries, bool)
+        or not 1 <= max_entries <= MAX_LAB_LIST_ENTRIES
+    ):
+        raise ValueError(f"max_entries must be between 1 and {MAX_LAB_LIST_ENTRIES}")
+
+    entries: list[dict[str, Any]] = []
+    scan_complete = True
+    dir_fd, root = _open_lab_directory(path)
+    try:
+        with os.scandir(dir_fd) as iterator:
+            for index, entry in enumerate(iterator):
+                if index >= MAX_LAB_DIRECTORY_SCAN:
+                    scan_complete = False
+                    break
+                metadata = entry.stat(follow_symlinks=False)
+                mode = metadata.st_mode
+                if stat.S_ISDIR(mode):
+                    entry_type = "directory"
+                elif stat.S_ISREG(mode):
+                    entry_type = "file"
+                elif stat.S_ISLNK(mode):
+                    entry_type = "symlink"
+                else:
+                    entry_type = "other"
+                safe_name = _redact(entry.name)
+                entries.append(
+                    {
+                        "name": safe_name,
+                        "name_redacted": safe_name != entry.name,
+                        "type": entry_type,
+                        "size": metadata.st_size if entry_type == "file" else None,
+                    }
+                )
+    finally:
+        os.close(dir_fd)
+
+    entries.sort(key=lambda item: item["name"])
+    returned = entries[:max_entries]
+    return {
+        "root": str(LAB_ROOT),
+        "path": str(root),
+        "entries": returned,
+        "returned": len(returned),
+        "truncated": len(entries) > max_entries or not scan_complete,
+        "scan_complete": scan_complete,
+        "scan_limit": MAX_LAB_DIRECTORY_SCAN,
+        "observed_at": _utc_now(),
+    }
+
+
+@mcp.tool(name="lab_read_text", annotations=READ_ANNOTATIONS)
+def lab_read_text(
+    path: str,
+    start_line: int = 1,
+    max_lines: int = 400,
+) -> dict[str, Any]:
+    """Read one bounded, secret-redacted UTF-8 text window under the lab root."""
+    if (
+        not isinstance(start_line, int)
+        or isinstance(start_line, bool)
+        or start_line < 1
+    ):
+        raise ValueError("start_line must be a positive integer")
+    if (
+        not isinstance(max_lines, int)
+        or isinstance(max_lines, bool)
+        or not 1 <= max_lines <= MAX_LAB_READ_LINES
+    ):
+        raise ValueError(f"max_lines must be between 1 and {MAX_LAB_READ_LINES}")
+
+    root, payload = _read_lab_bytes(path)
+    try:
+        source_text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("lab text file must be valid UTF-8") from exc
+
+    lines = source_text.splitlines(keepends=True)
+    start_index = start_line - 1
+    selected_lines = lines[start_index : start_index + max_lines]
+    excerpt = "".join(selected_lines)
+    redacted = _redact(excerpt)
+    bounded, output_truncated = _bounded(redacted)
+    end_line = start_line + len(selected_lines) - 1 if selected_lines else None
+    has_more = end_line is not None and end_line < len(lines)
+    return {
+        "root": str(LAB_ROOT),
+        "path": str(root),
+        "content_sha256": hashlib.sha256(payload).hexdigest(),
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": len(lines),
+        "text": bounded,
+        "redaction_applied": redacted != excerpt,
+        "output_truncated": output_truncated,
+        "has_more": has_more,
+        "requested_window_complete": not output_truncated,
+        "source_complete": start_line == 1 and not has_more and not output_truncated,
+        "observed_at": _utc_now(),
+    }
 
 
 def _decode_json_documents(text: str) -> list[Any]:

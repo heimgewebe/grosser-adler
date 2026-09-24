@@ -2,7 +2,7 @@
 
 Großer Adler is an independent observer, auditor and advisor. The authoritative V1 architecture is `ARCHITECTURE.md`.
 
-Adler may read typed, bounded, secret-safe primary evidence; append immutable findings under its own state root; read one exact active Grabowski lane target; and publish the computed current finding view only to its own state root after validating a Grabowski-owned `.adler/inbox.json` pointer.
+Adler may read typed, bounded, secret-safe primary evidence; inspect bounded non-Git laboratory evidence below the fixed `/home/alex/labs` root; append immutable findings under its own state root; read one exact active Grabowski lane target; and publish the computed current finding view only to its own state root after validating a Grabowski-owned `.adler/inbox.json` pointer. Lab observation is limited to non-recursive directory listing and bounded UTF-8 text windows with path/symlink escape rejection and output redaction; it is not generic host filesystem or root access.
 
 Adler has no work-state authority and no decision or execution authority. It must not acquire claims or leases, create Bureau/operator tasks, start coding agents, edit product/configuration files, mutate the Git index, commit, push, mutate pull requests, merge, deploy, control services, signal processes, mutate/reveal credentials, or create an admission/blocking policy.
 

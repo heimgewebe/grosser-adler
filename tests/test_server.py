@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import threading
@@ -24,6 +25,8 @@ def test_status_declares_minimal_read_mostly_boundary() -> None:
     assert status["mode"] == "read-mostly"
     assert status["architecture_contract"] == "observer-evidence-finding-delivery-v1"
     assert status["allowed_effects"] == ["append_finding", "publish_worktree_inbox"]
+    assert status["lab_root"] == str(server.LAB_ROOT)
+    assert status["lab_root_available"] is server.LAB_ROOT.is_dir()
     assert "general_file_write" in status["forbidden_effects"]
     assert "git_index_mutation" in status["forbidden_effects"]
     assert "bureau_mutation" in status["forbidden_effects"]
@@ -37,6 +40,101 @@ def test_repo_path_escape_is_rejected(tmp_path: Path) -> None:
     (outside / ".git").mkdir()
     with pytest.raises(PermissionError):
         server._resolve_repo(str(outside))
+
+
+def test_lab_observation_is_bounded_and_secret_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    project = lab_root / "project"
+    project.mkdir(parents=True)
+    evidence = project / "evidence.txt"
+    evidence.write_text("status=ok\ntoken=super-secret\nresult=pass\n", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    listing = server.lab_list_directory("project", max_entries=10)
+    assert listing["root"] == str(lab_root.resolve())
+    assert listing["path"] == str(project.resolve())
+    assert listing["scan_complete"] is True
+    assert listing["truncated"] is False
+    assert listing["entries"] == [
+        {
+            "name": "evidence.txt",
+            "name_redacted": False,
+            "type": "file",
+            "size": evidence.stat().st_size,
+        }
+    ]
+
+    observed = server.lab_read_text("project/evidence.txt")
+    assert observed["content_sha256"] == hashlib.sha256(evidence.read_bytes()).hexdigest()
+    assert observed["source_complete"] is True
+    assert observed["requested_window_complete"] is True
+    assert observed["redaction_applied"] is True
+    assert "super-secret" not in observed["text"]
+    assert "<REDACTED>" in observed["text"]
+    assert "result=pass" in observed["text"]
+
+
+def test_lab_observation_rejects_path_and_symlink_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "nested.txt").write_text("nested", encoding="utf-8")
+    escape = lab_root / "escape.txt"
+    escape.symlink_to(outside)
+    parent_escape = lab_root / "parent-escape"
+    parent_escape.symlink_to(outside_dir, target_is_directory=True)
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    with pytest.raises(PermissionError):
+        server.lab_read_text(str(outside))
+    with pytest.raises(PermissionError):
+        server.lab_read_text("escape.txt")
+    with pytest.raises(PermissionError):
+        server.lab_read_text("parent-escape/nested.txt")
+    with pytest.raises(PermissionError):
+        server.lab_list_directory("parent-escape")
+
+    listing = server.lab_list_directory(".")
+    assert listing["entries"] == [
+        {
+            "name": "escape.txt",
+            "name_redacted": False,
+            "type": "symlink",
+            "size": None,
+        },
+        {
+            "name": "parent-escape",
+            "name_redacted": False,
+            "type": "symlink",
+            "size": None,
+        },
+    ]
+
+
+def test_lab_observation_reports_bounded_listing_and_rejects_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (lab_root / name).write_text(name, encoding="utf-8")
+    binary = lab_root / "binary.dat"
+    binary.write_bytes(b"\xff")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    listing = server.lab_list_directory(".", max_entries=2)
+    assert listing["returned"] == 2
+    assert listing["truncated"] is True
+    assert listing["scan_complete"] is True
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        server.lab_read_text("binary.dat")
 
 
 def test_service_validation_is_syntax_bound_not_name_allowlisted() -> None:
