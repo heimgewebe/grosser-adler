@@ -138,6 +138,42 @@ def test_lab_observation_preserves_non_lf_line_separators_during_redaction(
     assert observed["text"] == "result=pass"
 
 
+@pytest.mark.parametrize("separator", ["\r", "\u2028"])
+@pytest.mark.parametrize("trailing_separator", [False, True])
+def test_lab_observation_preserves_final_redacted_line_at_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    separator: str,
+    trailing_separator: bool,
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    evidence = lab_root / "secret-at-eof.txt"
+    source = separator.join(
+        [
+            "-----BEGIN PRIVATE KEY-----",
+            "secret-material",
+            "-----END PRIVATE KEY-----",
+        ]
+    )
+    if trailing_separator:
+        source += separator
+    evidence.write_text(source, encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    observed = server.lab_read_text(
+        "secret-at-eof.txt",
+        start_line=3,
+        max_lines=1,
+    )
+
+    assert observed["redaction_applied"] is True
+    assert observed["total_lines"] == 3
+    assert observed["start_line"] == 3
+    assert observed["end_line"] == 3
+    assert observed["text"].splitlines() == ["<REDACTED>"]
+
+
 def test_lab_observation_redacts_exact_github_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

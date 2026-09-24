@@ -166,7 +166,7 @@ def _configured_exact_secrets() -> tuple[str, ...]:
 
 
 def _redaction_marker(text: str) -> str:
-    """Return a secret marker while preserving every logical line separator."""
+    """Return one marker while preserving every logical line separator."""
     separators = "".join(
         separator.group(0)
         for separator in _LOGICAL_LINE_SEPARATOR_RE.finditer(text)
@@ -174,18 +174,37 @@ def _redaction_marker(text: str) -> str:
     return "<REDACTED>" + separators
 
 
-def _redaction_for(match: re.Match[str]) -> str:
-    """Replace a secret with a marker, keeping the line structure it spanned.
+def _line_preserving_redaction_marker(text: str) -> str:
+    """Redact every logical line while preserving its exact line separator."""
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return "<REDACTED>"
 
-    A match may legitimately cross logical line separators - a value written
-    on the line after its keyword, or a multi-line private-key block. Collapsing
-    it would delete
-    evidence rows: a description ending in `password:` used to swallow the next
-    unit row, and a key block swallowed the journal lines it spanned, in both
-    cases leaving a result that still looked complete. Re-emitting the exact
-    separators keeps every row addressable while the secret itself is gone.
+    redacted: list[str] = []
+    for line in lines:
+        separator_match = _LOGICAL_LINE_SEPARATOR_RE.search(line)
+        separator = (
+            separator_match.group(0)
+            if separator_match is not None and separator_match.end() == len(line)
+            else ""
+        )
+        redacted.append("<REDACTED>" + separator)
+    return "".join(redacted)
+
+
+def _redaction_for(match: re.Match[str]) -> str:
+    """Replace a secret while preserving separator positions for general output.
+
+    General structured subprocess output keeps one marker at the match origin and
+    re-emits the separators as blank continuation rows. This preserves physical
+    row boundaries without inventing parseable pseudo-records.
     """
     return _redaction_marker(match.group(0))
+
+
+def _line_preserving_redaction_for(match: re.Match[str]) -> str:
+    """Replace a secret while keeping every logical line addressable."""
+    return _line_preserving_redaction_marker(match.group(0))
 
 
 def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
@@ -195,6 +214,19 @@ def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
             result = result.replace(secret, _redaction_marker(secret))
     for pattern in _SECRET_PATTERNS:
         result = pattern.sub(_redaction_for, result)
+    return result
+
+
+def _redact_preserving_logical_lines(
+    text: str, *, exact_secrets: tuple[str, ...] = ()
+) -> str:
+    """Redact text without changing its splitlines-addressable line structure."""
+    result = text
+    for secret in exact_secrets:
+        if secret:
+            result = result.replace(secret, _line_preserving_redaction_marker(secret))
+    for pattern in _SECRET_PATTERNS:
+        result = pattern.sub(_line_preserving_redaction_for, result)
     return result
 
 
@@ -1396,7 +1428,7 @@ def lab_read_text(
         raise ValueError("lab text file must be valid UTF-8") from exc
 
     exact_secrets = _configured_exact_secrets()
-    redacted_source = _redact(
+    redacted_source = _redact_preserving_logical_lines(
         source_text,
         exact_secrets=exact_secrets,
     )
