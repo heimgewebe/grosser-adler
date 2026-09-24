@@ -29,7 +29,7 @@ FINDING_CONTRACT = "adler-finding-v1"
 SIDECAR_CONTRACT = "adler-worktree-inbox-v1"
 ARCHITECTURE_CONTRACT = "observer-evidence-finding-delivery-v1"
 REPO_ROOT = Path("/home/alex/repos").resolve()
-LAB_ROOT = Path("/home/alex/labs").resolve()
+LAB_ROOT = Path("/home/alex/labs")
 STATE_ROOT = Path(os.environ.get("GROSSER_ADLER_STATE_ROOT", "/home/alex/.local/state/grosser-adler")).resolve()
 FINDINGS_ROOT = STATE_ROOT / "findings"
 INBOX_ROOT = STATE_ROOT / "worktree-inboxes"
@@ -458,6 +458,14 @@ def _lab_path_parts(path: str) -> tuple[str, ...]:
     if any(part == ".." for part in parts):
         raise PermissionError(f"path is outside {LAB_ROOT}")
     return parts
+
+
+def _lab_root_available() -> bool:
+    try:
+        metadata = LAB_ROOT.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(metadata.st_mode)
 
 
 def _lab_open_flags(*, directory: bool) -> int:
@@ -1177,7 +1185,7 @@ def adler_status() -> dict[str, Any]:
         "worktree_sidecar_contract": SIDECAR_CONTRACT,
         "repository_root": str(REPO_ROOT),
         "lab_root": str(LAB_ROOT),
-        "lab_root_available": LAB_ROOT.is_dir(),
+        "lab_root_available": _lab_root_available(),
         "finding_store": str(FINDINGS_ROOT),
         "inbox_store": str(INBOX_ROOT),
         "work_lane_store": str(GRABOWSKI_WORK_LANES_ROOT),
@@ -1337,7 +1345,13 @@ def lab_read_text(
     except UnicodeDecodeError as exc:
         raise ValueError("lab text file must be valid UTF-8") from exc
 
-    redacted_source = _redact(source_text)
+    github_token = os.environ.get("GROSSER_ADLER_GITHUB_TOKEN")
+    exact_secrets = (
+        (github_token,)
+        if github_token is not None and github_token.strip()
+        else ()
+    )
+    redacted_source = _redact(source_text, exact_secrets=exact_secrets)
     lines = redacted_source.splitlines(keepends=True)
     start_index = start_line - 1
     selected_lines = lines[start_index : start_index + max_lines]

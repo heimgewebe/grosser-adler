@@ -26,7 +26,7 @@ def test_status_declares_minimal_read_mostly_boundary() -> None:
     assert status["architecture_contract"] == "observer-evidence-finding-delivery-v1"
     assert status["allowed_effects"] == ["append_finding", "publish_worktree_inbox"]
     assert status["lab_root"] == str(server.LAB_ROOT)
-    assert status["lab_root_available"] is server.LAB_ROOT.is_dir()
+    assert status["lab_root_available"] is server._lab_root_available()
     assert "general_file_write" in status["forbidden_effects"]
     assert "git_index_mutation" in status["forbidden_effects"]
     assert "bureau_mutation" in status["forbidden_effects"]
@@ -99,6 +99,41 @@ def test_lab_observation_redacts_before_window_selection(
     assert observed["redaction_applied"] is True
     assert "lowentropy" not in observed["text"]
     assert observed["requested_window_complete"] is True
+
+
+def test_lab_observation_redacts_exact_github_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    credential = "opaque-dedicated-github-value"
+    evidence = lab_root / "credential.txt"
+    evidence.write_text(f"prefix\n{credential}\nsuffix\n", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", credential)
+
+    observed = server.lab_read_text("credential.txt")
+    assert observed["redaction_applied"] is True
+    assert credential not in observed["text"]
+    assert "<REDACTED>" in observed["text"]
+
+
+def test_lab_observation_rejects_symlinked_lab_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_root = tmp_path / "real-labs"
+    real_root.mkdir()
+    (real_root / "evidence.txt").write_text("outside-boundary", encoding="utf-8")
+    lab_root = tmp_path / "labs"
+    lab_root.symlink_to(real_root, target_is_directory=True)
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root)
+
+    assert server._lab_root_available() is False
+    assert server.adler_status()["lab_root_available"] is False
+    with pytest.raises(PermissionError):
+        server.lab_list_directory(".")
+    with pytest.raises(PermissionError):
+        server.lab_read_text("evidence.txt")
 
 
 def test_lab_observation_rejects_path_and_symlink_escape(
