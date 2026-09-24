@@ -141,6 +141,27 @@ def test_lab_directory_listing_redacts_exact_github_credential_from_entry_name(
     ]
 
 
+def test_lab_observation_redacts_exact_github_credential_from_returned_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    credential = "opaque-dedicated-github-path-value"
+    secret_dir = lab_root / credential
+    secret_dir.mkdir()
+    (secret_dir / "note.txt").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", credential)
+
+    listing = server.lab_list_directory(credential)
+    observed = server.lab_read_text(f"{credential}/note.txt")
+
+    assert credential not in json.dumps(listing)
+    assert credential not in json.dumps(observed)
+    assert "<REDACTED>" in listing["path"]
+    assert "<REDACTED>" in observed["path"]
+
+
 def test_lab_observation_rejects_symlinked_lab_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

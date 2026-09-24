@@ -1334,9 +1334,10 @@ def lab_list_directory(path: str = ".", max_entries: int = 200) -> dict[str, Any
 
     entries.sort(key=lambda item: item["name"])
     returned = entries[:max_entries]
+    safe_path = _redact(str(root), exact_secrets=exact_secrets)
     return {
         "root": str(LAB_ROOT),
-        "path": str(root),
+        "path": safe_path,
         "entries": returned,
         "returned": len(returned),
         "truncated": len(entries) > max_entries or not scan_complete,
@@ -1372,10 +1373,12 @@ def lab_read_text(
     except UnicodeDecodeError as exc:
         raise ValueError("lab text file must be valid UTF-8") from exc
 
+    exact_secrets = _configured_exact_secrets()
     redacted_source = _redact(
         source_text,
-        exact_secrets=_configured_exact_secrets(),
+        exact_secrets=exact_secrets,
     )
+    safe_path = _redact(str(root), exact_secrets=exact_secrets)
     lines = redacted_source.splitlines(keepends=True)
     start_index = start_line - 1
     selected_lines = lines[start_index : start_index + max_lines]
@@ -1385,7 +1388,7 @@ def lab_read_text(
     has_more = end_line is not None and end_line < len(lines)
     return {
         "root": str(LAB_ROOT),
-        "path": str(root),
+        "path": safe_path,
         "redacted_content_sha256": hashlib.sha256(
             redacted_source.encode("utf-8")
         ).hexdigest(),
