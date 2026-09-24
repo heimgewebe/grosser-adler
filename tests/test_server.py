@@ -266,19 +266,20 @@ def test_lab_listing_skips_entries_that_disappear_during_scan(
     assert listing["truncated"] is True
 
 
-def test_lab_listing_propagates_nonstale_stat_errors(
+def test_lab_listing_propagates_nonstale_stat_errors_without_leaking_entry_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lab_root = tmp_path / "labs"
     lab_root.mkdir()
+    secret_name = "api_key=opaque-error-value"
     monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
 
     class FaultingEntry:
-        name = "blocked.txt"
+        name = secret_name
 
         def stat(self, *, follow_symlinks):
             assert follow_symlinks is False
-            raise OSError(server.errno.EACCES, "permission denied")
+            raise OSError(server.errno.EACCES, "permission denied", self.name)
 
     class FaultingScan:
         def __enter__(self):
@@ -292,6 +293,54 @@ def test_lab_listing_propagates_nonstale_stat_errors(
     with pytest.raises(OSError) as exc_info:
         server.lab_list_directory(".")
     assert exc_info.value.errno == server.errno.EACCES
+    assert secret_name not in str(exc_info.value)
+    assert exc_info.value.filename is None
+
+
+def test_lab_listing_omits_surrogate_entry_names_and_marks_scan_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    stay = lab_root / "stay.txt"
+    stay.write_text("stay", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    class SurrogateEntry:
+        name = "invalid-" + chr(0xDCFF) + ".txt"
+
+        def stat(self, *, follow_symlinks):
+            raise AssertionError("surrogate-bearing entry should be skipped before stat")
+
+    class StayEntry:
+        name = "stay.txt"
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            return stay.stat(follow_symlinks=False)
+
+    class MixedScan:
+        def __enter__(self):
+            return iter([SurrogateEntry(), StayEntry()])
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(server.os, "scandir", lambda _fd: MixedScan())
+
+    listing = server.lab_list_directory(".")
+
+    assert listing["entries"] == [
+        {
+            "name": "stay.txt",
+            "name_redacted": False,
+            "type": "file",
+            "size": 4,
+        }
+    ]
+    assert listing["scan_complete"] is False
+    assert listing["truncated"] is True
+    json.dumps(listing, ensure_ascii=False).encode("utf-8")
 
 
 def test_lab_observation_opens_final_component_nonblocking_before_type_check(

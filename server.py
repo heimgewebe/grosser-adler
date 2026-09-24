@@ -1303,12 +1303,18 @@ def lab_list_directory(path: str = ".", max_entries: int = 200) -> dict[str, Any
                 if index >= MAX_LAB_DIRECTORY_SCAN:
                     scan_complete = False
                     break
+                safe_name = _redact(entry.name, exact_secrets=exact_secrets)
+                try:
+                    safe_name.encode("utf-8")
+                except UnicodeEncodeError:
+                    scan_complete = False
+                    continue
                 try:
                     metadata = entry.stat(follow_symlinks=False)
                 except OSError as exc:
                     stale_errnos = (errno.ENOENT, getattr(errno, "ESTALE", errno.ENOENT))
                     if exc.errno not in stale_errnos:
-                        raise
+                        raise OSError(exc.errno, "lab directory entry stat failed") from None
                     scan_complete = False
                     continue
                 mode = metadata.st_mode
@@ -1320,7 +1326,6 @@ def lab_list_directory(path: str = ".", max_entries: int = 200) -> dict[str, Any
                     entry_type = "symlink"
                 else:
                     entry_type = "other"
-                safe_name = _redact(entry.name, exact_secrets=exact_secrets)
                 entries.append(
                     {
                         "name": safe_name,
