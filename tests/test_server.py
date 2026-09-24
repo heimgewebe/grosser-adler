@@ -162,6 +162,20 @@ def test_lab_observation_redacts_exact_github_credential_from_returned_paths(
     assert "<REDACTED>" in observed["path"]
 
 
+def test_lab_observation_rejects_surrogate_request_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    invalid_path = "bad-" + chr(0xDCFF) + ".txt"
+
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        server.lab_list_directory(invalid_path)
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        server.lab_read_text(invalid_path)
+
+
 def test_lab_observation_sanitizes_component_open_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -452,6 +452,10 @@ def _resolve_repo(repo: str) -> Path:
 def _lab_path_parts(path: str) -> tuple[str, ...]:
     if not isinstance(path, str) or not path.strip() or "\x00" in path:
         raise ValueError("path must be non-empty text without NUL")
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("path must be valid UTF-8 text") from None
     raw = Path(path).expanduser()
     if raw.is_absolute():
         try:
