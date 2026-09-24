@@ -201,6 +201,78 @@ def test_lab_observation_rejects_path_and_symlink_escape(
     ]
 
 
+def test_lab_listing_skips_entries_that_disappear_during_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    gone = lab_root / "gone.txt"
+    gone.write_text("gone", encoding="utf-8")
+    (lab_root / "stay.txt").write_text("stay", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    real_scandir = server.os.scandir
+
+    class RacingScan:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            iterator = self.inner.__enter__()
+            entries = list(iterator)
+            gone.unlink()
+            return iter(entries)
+
+        def __exit__(self, exc_type, exc, tb):
+            return self.inner.__exit__(exc_type, exc, tb)
+
+    def racing_scandir(path):
+        return RacingScan(real_scandir(path))
+
+    monkeypatch.setattr(server.os, "scandir", racing_scandir)
+
+    listing = server.lab_list_directory(".")
+    assert listing["entries"] == [
+        {
+            "name": "stay.txt",
+            "name_redacted": False,
+            "type": "file",
+            "size": 4,
+        }
+    ]
+    assert listing["returned"] == 1
+    assert listing["scan_complete"] is False
+    assert listing["truncated"] is True
+
+
+def test_lab_listing_propagates_nonstale_stat_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    class FaultingEntry:
+        name = "blocked.txt"
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            raise OSError(server.errno.EACCES, "permission denied")
+
+    class FaultingScan:
+        def __enter__(self):
+            return iter([FaultingEntry()])
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(server.os, "scandir", lambda _fd: FaultingScan())
+
+    with pytest.raises(OSError) as exc_info:
+        server.lab_list_directory(".")
+    assert exc_info.value.errno == server.errno.EACCES
+
+
 def test_lab_observation_opens_final_component_nonblocking_before_type_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

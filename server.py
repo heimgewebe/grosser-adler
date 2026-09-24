@@ -1303,7 +1303,14 @@ def lab_list_directory(path: str = ".", max_entries: int = 200) -> dict[str, Any
                 if index >= MAX_LAB_DIRECTORY_SCAN:
                     scan_complete = False
                     break
-                metadata = entry.stat(follow_symlinks=False)
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    stale_errnos = (errno.ENOENT, getattr(errno, "ESTALE", errno.ENOENT))
+                    if exc.errno not in stale_errnos:
+                        raise
+                    scan_complete = False
+                    continue
                 mode = metadata.st_mode
                 if stat.S_ISDIR(mode):
                     entry_type = "directory"
