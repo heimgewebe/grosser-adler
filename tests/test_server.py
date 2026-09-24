@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import threading
@@ -24,6 +25,8 @@ def test_status_declares_minimal_read_mostly_boundary() -> None:
     assert status["mode"] == "read-mostly"
     assert status["architecture_contract"] == "observer-evidence-finding-delivery-v1"
     assert status["allowed_effects"] == ["append_finding", "publish_worktree_inbox"]
+    assert status["lab_root"] == str(server.LAB_ROOT)
+    assert status["lab_root_available"] is server._lab_root_available()
     assert "general_file_write" in status["forbidden_effects"]
     assert "git_index_mutation" in status["forbidden_effects"]
     assert "bureau_mutation" in status["forbidden_effects"]
@@ -37,6 +40,464 @@ def test_repo_path_escape_is_rejected(tmp_path: Path) -> None:
     (outside / ".git").mkdir()
     with pytest.raises(PermissionError):
         server._resolve_repo(str(outside))
+
+
+def test_lab_observation_is_bounded_and_secret_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    project = lab_root / "project"
+    project.mkdir(parents=True)
+    evidence = project / "evidence.txt"
+    evidence.write_text("status=ok\ntoken=super-secret\nresult=pass\n", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    listing = server.lab_list_directory("project", max_entries=10)
+    assert listing["root"] == str(lab_root.resolve())
+    assert listing["path"] == str(project.resolve())
+    assert listing["scan_complete"] is True
+    assert listing["truncated"] is False
+    assert listing["entries"] == [
+        {
+            "name": "evidence.txt",
+            "name_redacted": False,
+            "type": "file",
+            "size": evidence.stat().st_size,
+        }
+    ]
+
+    observed = server.lab_read_text("project/evidence.txt")
+    redacted_source = server._redact(evidence.read_text(encoding="utf-8"))
+    assert observed["redacted_content_sha256"] == hashlib.sha256(
+        redacted_source.encode("utf-8")
+    ).hexdigest()
+    assert observed["source_complete"] is True
+    assert observed["requested_window_complete"] is True
+    assert observed["redaction_applied"] is True
+    assert "super-secret" not in observed["text"]
+    assert "<REDACTED>" in observed["text"]
+    assert "result=pass" in observed["text"]
+
+
+def test_lab_observation_redacts_before_window_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    evidence = lab_root / "multiline-secret.txt"
+    evidence.write_text(
+        "status=ok\ntoken:\nlowentropy\nresult=pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    observed = server.lab_read_text(
+        "multiline-secret.txt",
+        start_line=3,
+        max_lines=1,
+    )
+    assert observed["redaction_applied"] is True
+    assert "lowentropy" not in observed["text"]
+    assert observed["requested_window_complete"] is True
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+)
+def test_lab_observation_preserves_non_lf_line_separators_during_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, separator: str
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    evidence = lab_root / "separator-secret.txt"
+    evidence.write_text(
+        separator.join(
+            [
+                "status=ok",
+                "-----BEGIN PRIVATE KEY-----",
+                "secret-material",
+                "-----END PRIVATE KEY-----",
+                "result=pass",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    observed = server.lab_read_text(
+        "separator-secret.txt",
+        start_line=5,
+        max_lines=1,
+    )
+
+    assert observed["redaction_applied"] is True
+    assert observed["total_lines"] == 5
+    assert observed["start_line"] == 5
+    assert observed["end_line"] == 5
+    assert observed["text"] == "result=pass"
+
+
+@pytest.mark.parametrize("separator", ["\r", "\u2028"])
+@pytest.mark.parametrize("trailing_separator", [False, True])
+def test_lab_observation_preserves_final_redacted_line_at_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    separator: str,
+    trailing_separator: bool,
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    evidence = lab_root / "secret-at-eof.txt"
+    source = separator.join(
+        [
+            "-----BEGIN PRIVATE KEY-----",
+            "secret-material",
+            "-----END PRIVATE KEY-----",
+        ]
+    )
+    if trailing_separator:
+        source += separator
+    evidence.write_text(source, encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    observed = server.lab_read_text(
+        "secret-at-eof.txt",
+        start_line=3,
+        max_lines=1,
+    )
+
+    assert observed["redaction_applied"] is True
+    assert observed["total_lines"] == 3
+    assert observed["start_line"] == 3
+    assert observed["end_line"] == 3
+    assert observed["text"].splitlines() == ["<REDACTED>"]
+
+
+def test_lab_observation_redacts_exact_github_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    credential = "opaque-dedicated-github-value"
+    evidence = lab_root / "credential.txt"
+    evidence.write_text(f"prefix\n{credential}\nsuffix\n", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", credential)
+
+    observed = server.lab_read_text("credential.txt")
+    assert observed["redaction_applied"] is True
+    assert credential not in observed["text"]
+    assert "<REDACTED>" in observed["text"]
+
+
+def test_lab_directory_listing_redacts_exact_github_credential_from_entry_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    credential = "opaque-dedicated-github-filename-value"
+    (lab_root / credential).write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", credential)
+
+    listing = server.lab_list_directory(".")
+    encoded = json.dumps(listing)
+    assert credential not in encoded
+    assert listing["entries"] == [
+        {
+            "name": "<REDACTED>",
+            "name_redacted": True,
+            "type": "file",
+            "size": 2,
+        }
+    ]
+
+
+def test_lab_observation_redacts_exact_github_credential_from_returned_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    credential = "opaque-dedicated-github-path-value"
+    secret_dir = lab_root / credential
+    secret_dir.mkdir()
+    (secret_dir / "note.txt").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", credential)
+
+    listing = server.lab_list_directory(credential)
+    observed = server.lab_read_text(f"{credential}/note.txt")
+
+    assert credential not in json.dumps(listing)
+    assert credential not in json.dumps(observed)
+    assert "<REDACTED>" in listing["path"]
+    assert "<REDACTED>" in observed["path"]
+
+
+def test_lab_observation_rejects_surrogate_request_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    invalid_path = "bad-" + chr(0xDCFF) + ".txt"
+
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        server.lab_list_directory(invalid_path)
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        server.lab_read_text(invalid_path)
+
+
+def test_lab_observation_sanitizes_component_open_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    credential = "opaque-dedicated-github-open-error-value"
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", credential)
+
+    real_open = server.os.open
+
+    def faulting_open(path, flags, *args, **kwargs):
+        if path == credential:
+            raise OSError(server.errno.EACCES, "permission denied", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(server.os, "open", faulting_open)
+
+    with pytest.raises(OSError) as exc_info:
+        server.lab_read_text(f"{credential}/note.txt")
+
+    assert exc_info.value.errno == server.errno.EACCES
+    assert exc_info.value.filename is None
+    assert credential not in str(exc_info.value)
+
+
+def test_lab_observation_rejects_symlinked_lab_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_root = tmp_path / "real-labs"
+    real_root.mkdir()
+    (real_root / "evidence.txt").write_text("outside-boundary", encoding="utf-8")
+    lab_root = tmp_path / "labs"
+    lab_root.symlink_to(real_root, target_is_directory=True)
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root)
+
+    assert server._lab_root_available() is False
+    assert server.adler_status()["lab_root_available"] is False
+    with pytest.raises(PermissionError):
+        server.lab_list_directory(".")
+    with pytest.raises(PermissionError):
+        server.lab_read_text("evidence.txt")
+
+
+def test_lab_observation_rejects_path_and_symlink_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "nested.txt").write_text("nested", encoding="utf-8")
+    escape = lab_root / "escape.txt"
+    escape.symlink_to(outside)
+    parent_escape = lab_root / "parent-escape"
+    parent_escape.symlink_to(outside_dir, target_is_directory=True)
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    with pytest.raises(PermissionError):
+        server.lab_read_text(str(outside))
+    with pytest.raises(PermissionError):
+        server.lab_read_text("escape.txt")
+    with pytest.raises(PermissionError):
+        server.lab_read_text("parent-escape/nested.txt")
+    with pytest.raises(PermissionError):
+        server.lab_list_directory("parent-escape")
+
+    listing = server.lab_list_directory(".")
+    assert listing["entries"] == [
+        {
+            "name": "escape.txt",
+            "name_redacted": False,
+            "type": "symlink",
+            "size": None,
+        },
+        {
+            "name": "parent-escape",
+            "name_redacted": False,
+            "type": "symlink",
+            "size": None,
+        },
+    ]
+
+
+def test_lab_listing_skips_entries_that_disappear_during_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    gone = lab_root / "gone.txt"
+    gone.write_text("gone", encoding="utf-8")
+    (lab_root / "stay.txt").write_text("stay", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    real_scandir = server.os.scandir
+
+    class RacingScan:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            iterator = self.inner.__enter__()
+            entries = list(iterator)
+            gone.unlink()
+            return iter(entries)
+
+        def __exit__(self, exc_type, exc, tb):
+            return self.inner.__exit__(exc_type, exc, tb)
+
+    def racing_scandir(path):
+        return RacingScan(real_scandir(path))
+
+    monkeypatch.setattr(server.os, "scandir", racing_scandir)
+
+    listing = server.lab_list_directory(".")
+    assert listing["entries"] == [
+        {
+            "name": "stay.txt",
+            "name_redacted": False,
+            "type": "file",
+            "size": 4,
+        }
+    ]
+    assert listing["returned"] == 1
+    assert listing["scan_complete"] is False
+    assert listing["truncated"] is True
+
+
+def test_lab_listing_propagates_nonstale_stat_errors_without_leaking_entry_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    secret_name = "api_key=opaque-error-value"
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    class FaultingEntry:
+        name = secret_name
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            raise OSError(server.errno.EACCES, "permission denied", self.name)
+
+    class FaultingScan:
+        def __enter__(self):
+            return iter([FaultingEntry()])
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(server.os, "scandir", lambda _fd: FaultingScan())
+
+    with pytest.raises(OSError) as exc_info:
+        server.lab_list_directory(".")
+    assert exc_info.value.errno == server.errno.EACCES
+    assert secret_name not in str(exc_info.value)
+    assert exc_info.value.filename is None
+
+
+def test_lab_listing_omits_surrogate_entry_names_and_marks_scan_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    stay = lab_root / "stay.txt"
+    stay.write_text("stay", encoding="utf-8")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    class SurrogateEntry:
+        name = "invalid-" + chr(0xDCFF) + ".txt"
+
+        def stat(self, *, follow_symlinks):
+            raise AssertionError("surrogate-bearing entry should be skipped before stat")
+
+    class StayEntry:
+        name = "stay.txt"
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            return stay.stat(follow_symlinks=False)
+
+    class MixedScan:
+        def __enter__(self):
+            return iter([SurrogateEntry(), StayEntry()])
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(server.os, "scandir", lambda _fd: MixedScan())
+
+    listing = server.lab_list_directory(".")
+
+    assert listing["entries"] == [
+        {
+            "name": "stay.txt",
+            "name_redacted": False,
+            "type": "file",
+            "size": 4,
+        }
+    ]
+    assert listing["scan_complete"] is False
+    assert listing["truncated"] is True
+    json.dumps(listing, ensure_ascii=False).encode("utf-8")
+
+
+def test_lab_observation_opens_final_component_nonblocking_before_type_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    fifo = lab_root / "blocking.fifo"
+    os.mkfifo(fifo)
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    real_open = server.os.open
+    final_open_seen = False
+
+    def checked_open(path, flags, *args, **kwargs):
+        nonlocal final_open_seen
+        if path == "blocking.fifo":
+            final_open_seen = True
+            assert flags & server.os.O_NONBLOCK
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(server.os, "open", checked_open)
+    with pytest.raises(ValueError, match="regular file"):
+        server.lab_read_text("blocking.fifo")
+    assert final_open_seen
+
+
+def test_lab_observation_reports_bounded_listing_and_rejects_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (lab_root / name).write_text(name, encoding="utf-8")
+    binary = lab_root / "binary.dat"
+    binary.write_bytes(b"\xff")
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    listing = server.lab_list_directory(".", max_entries=2)
+    assert listing["returned"] == 2
+    assert listing["truncated"] is True
+    assert listing["scan_complete"] is True
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        server.lab_read_text("binary.dat")
 
 
 def test_service_validation_is_syntax_bound_not_name_allowlisted() -> None:
@@ -119,6 +580,33 @@ def test_github_token_is_not_forwarded_to_other_subprocesses(monkeypatch: pytest
 
     assert "GH_TOKEN" not in captured
     assert "GROSSER_ADLER_GITHUB_TOKEN" not in captured
+
+
+def test_github_token_is_redacted_from_other_subprocess_output_without_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+    token = "opaque-dedicated-github-secret-not-matching-a-known-prefix"
+
+    class Completed:
+        returncode = 0
+        stdout = f"stdout {token}"
+        stderr = f"stderr {token}"
+
+    def fake_run(argv, **kwargs):
+        captured.update(kwargs["env"])
+        return Completed()
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", token)
+    result = server._run(["/usr/bin/git", "--version"])
+
+    assert "GH_TOKEN" not in captured
+    assert "GROSSER_ADLER_GITHUB_TOKEN" not in captured
+    assert token not in result["stdout"]
+    assert token not in result["stderr"]
+    assert "<REDACTED>" in result["stdout"]
+    assert "<REDACTED>" in result["stderr"]
 
 
 def test_github_read_fails_closed_without_dedicated_credential(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -513,6 +1001,14 @@ def test_deploy_templates_keep_credentials_separate() -> None:
     assert "grosser-adler-runtime.env" in tunnel
     assert "grabowski-runtime.env" not in tunnel
     assert ".config/grosser-adler/github.env" in mcp
+
+
+def test_deploy_template_keeps_absent_lab_root_optional() -> None:
+    root = Path(__file__).parents[1]
+    mcp = (root / "deploy" / "grosser-adler-mcp.service").read_text(encoding="utf-8")
+
+    assert "ReadOnlyPaths=-%h/labs" in mcp
+    assert "ReadOnlyPaths=%h/labs" not in mcp
 
 
 def _complete_git_fixture(head: str = OID_A, *, untracked: bool = False) -> dict:

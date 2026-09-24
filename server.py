@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -28,11 +29,16 @@ FINDING_CONTRACT = "adler-finding-v1"
 SIDECAR_CONTRACT = "adler-worktree-inbox-v1"
 ARCHITECTURE_CONTRACT = "observer-evidence-finding-delivery-v1"
 REPO_ROOT = Path("/home/alex/repos").resolve()
+LAB_ROOT = Path("/home/alex/labs")
 STATE_ROOT = Path(os.environ.get("GROSSER_ADLER_STATE_ROOT", "/home/alex/.local/state/grosser-adler")).resolve()
 FINDINGS_ROOT = STATE_ROOT / "findings"
 INBOX_ROOT = STATE_ROOT / "worktree-inboxes"
 GRABOWSKI_WORK_LANES_ROOT = Path(os.environ.get("GROSSER_ADLER_WORK_LANES_ROOT", "/home/alex/.local/state/grabowski/work-lanes")).resolve()
 WORKTREE_ROOT = Path(os.environ.get("GROSSER_ADLER_WORKTREE_ROOT", "/home/alex/repos/.grabowski-worktrees")).resolve()
+MAX_LAB_TEXT_BYTES = 1_000_000
+MAX_LAB_DIRECTORY_SCAN = 5_000
+MAX_LAB_LIST_ENTRIES = 500
+MAX_LAB_READ_LINES = 2_000
 MAX_OUTPUT_BYTES = 160_000
 MAX_JSON_SOURCE_BYTES = 1_000_000
 MAX_SUMMARY_CHARS = 4_000
@@ -142,34 +148,85 @@ _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
     re.compile(r"(?i)(authorization|api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+"),
 )
+_LOGICAL_LINE_SEPARATOR_RE = re.compile(
+    r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]"
+)
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _redaction_for(match: re.Match[str]) -> str:
-    """Replace a secret with a marker, keeping the line structure it spanned.
+def _configured_exact_secrets() -> tuple[str, ...]:
+    """Return configured observer secrets that must never appear in output."""
+    github_token = os.environ.get("GROSSER_ADLER_GITHUB_TOKEN")
+    if github_token is None or not github_token.strip():
+        return ()
+    return (github_token,)
 
-    A match may legitimately cross newlines - a value written on the line after
-    its keyword, or a multi-line private-key block. Collapsing it would delete
-    evidence rows: a description ending in `password:` used to swallow the next
-    unit row, and a key block swallowed the journal lines it spanned, in both
-    cases leaving a result that still looked complete. Re-emitting the newlines
-    keeps every row addressable while the secret itself is gone.
+
+def _redaction_marker(text: str) -> str:
+    """Return one marker while preserving every logical line separator."""
+    separators = "".join(
+        separator.group(0)
+        for separator in _LOGICAL_LINE_SEPARATOR_RE.finditer(text)
+    )
+    return "<REDACTED>" + separators
+
+
+def _line_preserving_redaction_marker(text: str) -> str:
+    """Redact every logical line while preserving its exact line separator."""
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return "<REDACTED>"
+
+    redacted: list[str] = []
+    for line in lines:
+        separator_match = _LOGICAL_LINE_SEPARATOR_RE.search(line)
+        separator = (
+            separator_match.group(0)
+            if separator_match is not None and separator_match.end() == len(line)
+            else ""
+        )
+        redacted.append("<REDACTED>" + separator)
+    return "".join(redacted)
+
+
+def _redaction_for(match: re.Match[str]) -> str:
+    """Replace a secret while preserving separator positions for general output.
+
+    General structured subprocess output keeps one marker at the match origin and
+    re-emits the separators as blank continuation rows. This preserves physical
+    row boundaries without inventing parseable pseudo-records.
     """
-    return "<REDACTED>" + "\n" * match.group(0).count("\n")
+    return _redaction_marker(match.group(0))
+
+
+def _line_preserving_redaction_for(match: re.Match[str]) -> str:
+    """Replace a secret while keeping every logical line addressable."""
+    return _line_preserving_redaction_marker(match.group(0))
 
 
 def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     result = text
     for secret in exact_secrets:
         if secret:
-            result = result.replace(
-                secret, "<REDACTED>" + "\n" * secret.count("\n")
-            )
+            result = result.replace(secret, _redaction_marker(secret))
     for pattern in _SECRET_PATTERNS:
         result = pattern.sub(_redaction_for, result)
+    return result
+
+
+def _redact_preserving_logical_lines(
+    text: str, *, exact_secrets: tuple[str, ...] = ()
+) -> str:
+    """Redact text without changing its splitlines-addressable line structure."""
+    result = text
+    for secret in exact_secrets:
+        if secret:
+            result = result.replace(secret, _line_preserving_redaction_marker(secret))
+    for pattern in _SECRET_PATTERNS:
+        result = pattern.sub(_line_preserving_redaction_for, result)
     return result
 
 
@@ -345,12 +402,11 @@ def _run(
             "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus"
         ),
     }
-    gh_token: str | None = None
+    exact_secrets = _configured_exact_secrets()
     if argv[0] == "/usr/bin/gh":
-        gh_token = os.environ.get("GROSSER_ADLER_GITHUB_TOKEN")
-        if not gh_token or not gh_token.strip():
+        if not exact_secrets:
             raise RuntimeError("Großer Adler GitHub credential is not configured")
-        env["GH_TOKEN"] = gh_token
+        env["GH_TOKEN"] = exact_secrets[0]
 
     completed = subprocess.run(
         argv,
@@ -363,7 +419,6 @@ def _run(
         timeout=timeout,
         check=False,
     )
-    exact_secrets = (gh_token,) if gh_token else ()
     # systemd and journal reads name the exact units whose identity must
     # survive; everything else in those streams stays under normal redaction.
     stdout_identity = preserved_identity
@@ -435,6 +490,127 @@ def _resolve_repo(repo: str) -> Path:
     if not marker.exists():
         raise ValueError("repository has no .git marker")
     return resolved
+
+
+def _lab_path_parts(path: str) -> tuple[str, ...]:
+    if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        raise ValueError("path must be non-empty text without NUL")
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("path must be valid UTF-8 text") from None
+    raw = Path(path).expanduser()
+    if raw.is_absolute():
+        try:
+            relative = raw.relative_to(LAB_ROOT)
+        except ValueError as exc:
+            raise PermissionError(f"path is outside {LAB_ROOT}") from exc
+    else:
+        relative = raw
+    parts = tuple(part for part in relative.parts if part not in {"", "."})
+    if any(part == ".." for part in parts):
+        raise PermissionError(f"path is outside {LAB_ROOT}")
+    return parts
+
+
+def _lab_root_available() -> bool:
+    try:
+        metadata = LAB_ROOT.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(metadata.st_mode)
+
+
+def _lab_open_flags(*, directory: bool, nonblocking: bool = False) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if directory:
+        flags |= os.O_DIRECTORY
+    if nonblocking and hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _lab_open_component(
+    name: str, *, dir_fd: int, directory: bool, nonblocking: bool = False
+) -> int:
+    try:
+        return os.open(
+            name,
+            _lab_open_flags(directory=directory, nonblocking=nonblocking),
+            dir_fd=dir_fd,
+        )
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("lab path contains a symlink or non-directory component") from exc
+        if exc.errno is None:
+            raise OSError("lab path component open failed") from None
+        raise OSError(exc.errno, os.strerror(exc.errno)) from None
+
+
+def _open_lab_directory(path: str) -> tuple[int, Path]:
+    parts = _lab_path_parts(path)
+    try:
+        fd = os.open(LAB_ROOT, _lab_open_flags(directory=True))
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("lab root must be a real directory") from exc
+        raise
+    try:
+        for part in parts:
+            next_fd = _lab_open_component(part, dir_fd=fd, directory=True)
+            os.close(fd)
+            fd = next_fd
+        return fd, LAB_ROOT.joinpath(*parts)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _read_lab_bytes(path: str) -> tuple[Path, bytes]:
+    parts = _lab_path_parts(path)
+    if not parts:
+        raise ValueError("lab text path must name a file")
+    try:
+        parent_fd = os.open(LAB_ROOT, _lab_open_flags(directory=True))
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("lab root must be a real directory") from exc
+        raise
+    fd: int | None = None
+    try:
+        for part in parts[:-1]:
+            next_fd = _lab_open_component(part, dir_fd=parent_fd, directory=True)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        fd = _lab_open_component(
+            parts[-1],
+            dir_fd=parent_fd,
+            directory=False,
+            nonblocking=True,
+        )
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("lab text path must be a regular file")
+        if metadata.st_size > MAX_LAB_TEXT_BYTES:
+            raise ValueError("lab text file exceeds the observation byte limit")
+        chunks: list[bytes] = []
+        remaining = MAX_LAB_TEXT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > MAX_LAB_TEXT_BYTES:
+            raise ValueError("lab text file exceeds the observation byte limit")
+        return LAB_ROOT.joinpath(*parts), payload
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent_fd)
 
 
 def _validate_unit(unit: str) -> str:
@@ -1076,6 +1252,8 @@ def adler_status() -> dict[str, Any]:
         "finding_contract": FINDING_CONTRACT,
         "worktree_sidecar_contract": SIDECAR_CONTRACT,
         "repository_root": str(REPO_ROOT),
+        "lab_root": str(LAB_ROOT),
+        "lab_root_available": _lab_root_available(),
         "finding_store": str(FINDINGS_ROOT),
         "inbox_store": str(INBOX_ROOT),
         "work_lane_store": str(GRABOWSKI_WORK_LANES_ROOT),
@@ -1152,6 +1330,133 @@ def git_show(repo: str, revision: str = "HEAD") -> dict[str, Any]:
         "show", "--no-ext-diff", "--no-textconv", "--format=fuller", rev,
     ])
     return {"repo": str(root), "revision": rev, "show": result, "observed_at": _utc_now()}
+
+
+@mcp.tool(name="lab_list_directory", annotations=READ_ANNOTATIONS)
+def lab_list_directory(path: str = ".", max_entries: int = 200) -> dict[str, Any]:
+    """List one bounded directory under the fixed lab observation root."""
+    if (
+        not isinstance(max_entries, int)
+        or isinstance(max_entries, bool)
+        or not 1 <= max_entries <= MAX_LAB_LIST_ENTRIES
+    ):
+        raise ValueError(f"max_entries must be between 1 and {MAX_LAB_LIST_ENTRIES}")
+
+    entries: list[dict[str, Any]] = []
+    scan_complete = True
+    exact_secrets = _configured_exact_secrets()
+    dir_fd, root = _open_lab_directory(path)
+    try:
+        with os.scandir(dir_fd) as iterator:
+            for index, entry in enumerate(iterator):
+                if index >= MAX_LAB_DIRECTORY_SCAN:
+                    scan_complete = False
+                    break
+                safe_name = _redact(entry.name, exact_secrets=exact_secrets)
+                try:
+                    safe_name.encode("utf-8")
+                except UnicodeEncodeError:
+                    scan_complete = False
+                    continue
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    stale_errnos = (errno.ENOENT, getattr(errno, "ESTALE", errno.ENOENT))
+                    if exc.errno not in stale_errnos:
+                        raise OSError(exc.errno, "lab directory entry stat failed") from None
+                    scan_complete = False
+                    continue
+                mode = metadata.st_mode
+                if stat.S_ISDIR(mode):
+                    entry_type = "directory"
+                elif stat.S_ISREG(mode):
+                    entry_type = "file"
+                elif stat.S_ISLNK(mode):
+                    entry_type = "symlink"
+                else:
+                    entry_type = "other"
+                entries.append(
+                    {
+                        "name": safe_name,
+                        "name_redacted": safe_name != entry.name,
+                        "type": entry_type,
+                        "size": metadata.st_size if entry_type == "file" else None,
+                    }
+                )
+    finally:
+        os.close(dir_fd)
+
+    entries.sort(key=lambda item: item["name"])
+    returned = entries[:max_entries]
+    safe_path = _redact(str(root), exact_secrets=exact_secrets)
+    return {
+        "root": str(LAB_ROOT),
+        "path": safe_path,
+        "entries": returned,
+        "returned": len(returned),
+        "truncated": len(entries) > max_entries or not scan_complete,
+        "scan_complete": scan_complete,
+        "scan_limit": MAX_LAB_DIRECTORY_SCAN,
+        "observed_at": _utc_now(),
+    }
+
+
+@mcp.tool(name="lab_read_text", annotations=READ_ANNOTATIONS)
+def lab_read_text(
+    path: str,
+    start_line: int = 1,
+    max_lines: int = 400,
+) -> dict[str, Any]:
+    """Read one bounded, secret-redacted UTF-8 text window under the lab root."""
+    if (
+        not isinstance(start_line, int)
+        or isinstance(start_line, bool)
+        or start_line < 1
+    ):
+        raise ValueError("start_line must be a positive integer")
+    if (
+        not isinstance(max_lines, int)
+        or isinstance(max_lines, bool)
+        or not 1 <= max_lines <= MAX_LAB_READ_LINES
+    ):
+        raise ValueError(f"max_lines must be between 1 and {MAX_LAB_READ_LINES}")
+
+    root, payload = _read_lab_bytes(path)
+    try:
+        source_text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("lab text file must be valid UTF-8") from exc
+
+    exact_secrets = _configured_exact_secrets()
+    redacted_source = _redact_preserving_logical_lines(
+        source_text,
+        exact_secrets=exact_secrets,
+    )
+    safe_path = _redact(str(root), exact_secrets=exact_secrets)
+    lines = redacted_source.splitlines(keepends=True)
+    start_index = start_line - 1
+    selected_lines = lines[start_index : start_index + max_lines]
+    excerpt = "".join(selected_lines)
+    bounded, output_truncated = _bounded(excerpt)
+    end_line = start_line + len(selected_lines) - 1 if selected_lines else None
+    has_more = end_line is not None and end_line < len(lines)
+    return {
+        "root": str(LAB_ROOT),
+        "path": safe_path,
+        "redacted_content_sha256": hashlib.sha256(
+            redacted_source.encode("utf-8")
+        ).hexdigest(),
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": len(lines),
+        "text": bounded,
+        "redaction_applied": redacted_source != source_text,
+        "output_truncated": output_truncated,
+        "has_more": has_more,
+        "requested_window_complete": not output_truncated,
+        "source_complete": start_line == 1 and not has_more and not output_truncated,
+        "observed_at": _utc_now(),
+    }
 
 
 def _decode_json_documents(text: str) -> list[Any]:

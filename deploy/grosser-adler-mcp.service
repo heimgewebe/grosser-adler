@@ -20,6 +20,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadOnlyPaths=%h/repos %h/.local/state/grabowski/work-lanes
+ReadOnlyPaths=-%h/labs
 ReadWritePaths=%h/.local/state/grosser-adler
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictSUIDSGID=true
