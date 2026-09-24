@@ -162,6 +162,32 @@ def test_lab_observation_redacts_exact_github_credential_from_returned_paths(
     assert "<REDACTED>" in observed["path"]
 
 
+def test_lab_observation_sanitizes_component_open_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    credential = "opaque-dedicated-github-open-error-value"
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", credential)
+
+    real_open = server.os.open
+
+    def faulting_open(path, flags, *args, **kwargs):
+        if path == credential:
+            raise OSError(server.errno.EACCES, "permission denied", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(server.os, "open", faulting_open)
+
+    with pytest.raises(OSError) as exc_info:
+        server.lab_read_text(f"{credential}/note.txt")
+
+    assert exc_info.value.errno == server.errno.EACCES
+    assert exc_info.value.filename is None
+    assert credential not in str(exc_info.value)
+
+
 def test_lab_observation_rejects_symlinked_lab_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

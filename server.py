@@ -497,7 +497,9 @@ def _lab_open_component(
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise PermissionError("lab path contains a symlink or non-directory component") from exc
-        raise
+        if exc.errno is None:
+            raise OSError("lab path component open failed") from None
+        raise OSError(exc.errno, os.strerror(exc.errno)) from None
 
 
 def _open_lab_directory(path: str) -> tuple[int, Path]:
