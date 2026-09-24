@@ -1337,23 +1337,25 @@ def lab_read_text(
     except UnicodeDecodeError as exc:
         raise ValueError("lab text file must be valid UTF-8") from exc
 
-    lines = source_text.splitlines(keepends=True)
+    redacted_source = _redact(source_text)
+    lines = redacted_source.splitlines(keepends=True)
     start_index = start_line - 1
     selected_lines = lines[start_index : start_index + max_lines]
     excerpt = "".join(selected_lines)
-    redacted = _redact(excerpt)
-    bounded, output_truncated = _bounded(redacted)
+    bounded, output_truncated = _bounded(excerpt)
     end_line = start_line + len(selected_lines) - 1 if selected_lines else None
     has_more = end_line is not None and end_line < len(lines)
     return {
         "root": str(LAB_ROOT),
         "path": str(root),
-        "content_sha256": hashlib.sha256(payload).hexdigest(),
+        "redacted_content_sha256": hashlib.sha256(
+            redacted_source.encode("utf-8")
+        ).hexdigest(),
         "start_line": start_line,
         "end_line": end_line,
         "total_lines": len(lines),
         "text": bounded,
-        "redaction_applied": redacted != excerpt,
+        "redaction_applied": redacted_source != source_text,
         "output_truncated": output_truncated,
         "has_more": has_more,
         "requested_window_complete": not output_truncated,

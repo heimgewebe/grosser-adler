@@ -67,13 +67,38 @@ def test_lab_observation_is_bounded_and_secret_safe(
     ]
 
     observed = server.lab_read_text("project/evidence.txt")
-    assert observed["content_sha256"] == hashlib.sha256(evidence.read_bytes()).hexdigest()
+    redacted_source = server._redact(evidence.read_text(encoding="utf-8"))
+    assert observed["redacted_content_sha256"] == hashlib.sha256(
+        redacted_source.encode("utf-8")
+    ).hexdigest()
     assert observed["source_complete"] is True
     assert observed["requested_window_complete"] is True
     assert observed["redaction_applied"] is True
     assert "super-secret" not in observed["text"]
     assert "<REDACTED>" in observed["text"]
     assert "result=pass" in observed["text"]
+
+
+def test_lab_observation_redacts_before_window_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    evidence = lab_root / "multiline-secret.txt"
+    evidence.write_text(
+        "status=ok\ntoken:\nlowentropy\nresult=pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    observed = server.lab_read_text(
+        "multiline-secret.txt",
+        start_line=3,
+        max_lines=1,
+    )
+    assert observed["redaction_applied"] is True
+    assert "lowentropy" not in observed["text"]
+    assert observed["requested_window_complete"] is True
 
 
 def test_lab_observation_rejects_path_and_symlink_escape(
