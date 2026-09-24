@@ -474,18 +474,26 @@ def _lab_root_available() -> bool:
     return stat.S_ISDIR(metadata.st_mode)
 
 
-def _lab_open_flags(*, directory: bool) -> int:
+def _lab_open_flags(*, directory: bool, nonblocking: bool = False) -> int:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if directory:
         flags |= os.O_DIRECTORY
+    if nonblocking and hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     return flags
 
 
-def _lab_open_component(name: str, *, dir_fd: int, directory: bool) -> int:
+def _lab_open_component(
+    name: str, *, dir_fd: int, directory: bool, nonblocking: bool = False
+) -> int:
     try:
-        return os.open(name, _lab_open_flags(directory=directory), dir_fd=dir_fd)
+        return os.open(
+            name,
+            _lab_open_flags(directory=directory, nonblocking=nonblocking),
+            dir_fd=dir_fd,
+        )
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise PermissionError("lab path contains a symlink or non-directory component") from exc
@@ -527,7 +535,12 @@ def _read_lab_bytes(path: str) -> tuple[Path, bytes]:
             next_fd = _lab_open_component(part, dir_fd=parent_fd, directory=True)
             os.close(parent_fd)
             parent_fd = next_fd
-        fd = _lab_open_component(parts[-1], dir_fd=parent_fd, directory=False)
+        fd = _lab_open_component(
+            parts[-1],
+            dir_fd=parent_fd,
+            directory=False,
+            nonblocking=True,
+        )
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError("lab text path must be a regular file")

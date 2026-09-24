@@ -201,6 +201,31 @@ def test_lab_observation_rejects_path_and_symlink_escape(
     ]
 
 
+def test_lab_observation_opens_final_component_nonblocking_before_type_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    fifo = lab_root / "blocking.fifo"
+    os.mkfifo(fifo)
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    real_open = server.os.open
+    final_open_seen = False
+
+    def checked_open(path, flags, *args, **kwargs):
+        nonlocal final_open_seen
+        if path == "blocking.fifo":
+            final_open_seen = True
+            assert flags & server.os.O_NONBLOCK
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(server.os, "open", checked_open)
+    with pytest.raises(ValueError, match="regular file"):
+        server.lab_read_text("blocking.fifo")
+    assert final_open_seen
+
+
 def test_lab_observation_reports_bounded_listing_and_rejects_binary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
