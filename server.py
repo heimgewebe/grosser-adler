@@ -148,6 +148,9 @@ _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
     re.compile(r"(?i)(authorization|api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+"),
 )
+_LOGICAL_LINE_SEPARATOR_RE = re.compile(
+    r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]"
+)
 
 
 def _utc_now() -> str:
@@ -162,26 +165,34 @@ def _configured_exact_secrets() -> tuple[str, ...]:
     return (github_token,)
 
 
+def _redaction_marker(text: str) -> str:
+    """Return a secret marker while preserving every logical line separator."""
+    separators = "".join(
+        separator.group(0)
+        for separator in _LOGICAL_LINE_SEPARATOR_RE.finditer(text)
+    )
+    return "<REDACTED>" + separators
+
+
 def _redaction_for(match: re.Match[str]) -> str:
     """Replace a secret with a marker, keeping the line structure it spanned.
 
-    A match may legitimately cross newlines - a value written on the line after
-    its keyword, or a multi-line private-key block. Collapsing it would delete
+    A match may legitimately cross logical line separators - a value written
+    on the line after its keyword, or a multi-line private-key block. Collapsing
+    it would delete
     evidence rows: a description ending in `password:` used to swallow the next
     unit row, and a key block swallowed the journal lines it spanned, in both
-    cases leaving a result that still looked complete. Re-emitting the newlines
-    keeps every row addressable while the secret itself is gone.
+    cases leaving a result that still looked complete. Re-emitting the exact
+    separators keeps every row addressable while the secret itself is gone.
     """
-    return "<REDACTED>" + "\n" * match.group(0).count("\n")
+    return _redaction_marker(match.group(0))
 
 
 def _redact(text: str, *, exact_secrets: tuple[str, ...] = ()) -> str:
     result = text
     for secret in exact_secrets:
         if secret:
-            result = result.replace(
-                secret, "<REDACTED>" + "\n" * secret.count("\n")
-            )
+            result = result.replace(secret, _redaction_marker(secret))
     for pattern in _SECRET_PATTERNS:
         result = pattern.sub(_redaction_for, result)
     return result

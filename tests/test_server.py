@@ -101,6 +101,43 @@ def test_lab_observation_redacts_before_window_selection(
     assert observed["requested_window_complete"] is True
 
 
+@pytest.mark.parametrize(
+    "separator",
+    ["\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+)
+def test_lab_observation_preserves_non_lf_line_separators_during_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, separator: str
+) -> None:
+    lab_root = tmp_path / "labs"
+    lab_root.mkdir()
+    evidence = lab_root / "separator-secret.txt"
+    evidence.write_text(
+        separator.join(
+            [
+                "status=ok",
+                "-----BEGIN PRIVATE KEY-----",
+                "secret-material",
+                "-----END PRIVATE KEY-----",
+                "result=pass",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "LAB_ROOT", lab_root.resolve())
+
+    observed = server.lab_read_text(
+        "separator-secret.txt",
+        start_line=5,
+        max_lines=1,
+    )
+
+    assert observed["redaction_applied"] is True
+    assert observed["total_lines"] == 5
+    assert observed["start_line"] == 5
+    assert observed["end_line"] == 5
+    assert observed["text"] == "result=pass"
+
+
 def test_lab_observation_redacts_exact_github_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
