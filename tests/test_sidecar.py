@@ -95,6 +95,8 @@ def test_v1_lane_delivery_and_full_rebuild_preserve_exact_binding(
     original_path = state / "findings" / f"{first['finding_id']}.json"
     original_bytes = original_path.read_bytes()
     original = json.loads(original_bytes)
+    assert original["schema_version"] == inbox["findings"][0]["schema_version"] == 2
+    assert original["finding_contract"] == "adler-finding-v1"
     assert original.get("target_lane_id") == (lane_id if explicit_target else None)
     assert ("target_lane_id" in original) is explicit_target
     core = dict(original)
@@ -118,6 +120,7 @@ def test_v1_lane_delivery_and_full_rebuild_preserve_exact_binding(
     assert original_path.read_bytes() == original_bytes
     assert server._current_lane_findings("e" * 32, OID_A) == []
     for item in server.list_findings(limit=10)["findings"]:
+        assert item["schema_version"] == 2
         assert item.get("target_lane_id") == (lane_id if explicit_target else None)
 
 
@@ -190,7 +193,7 @@ def test_explicit_target_retains_server_side_lane_validation(
     assert not inbox_path.exists()
 
 
-@pytest.mark.parametrize("stored_target", ["A" * 32, "e" * 32, False, []])
+@pytest.mark.parametrize("stored_target", ["A" * 32, "e" * 32, False, [], None])
 def test_full_rebuild_quarantines_invalid_or_conflicting_explicit_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored_target,
 ) -> None:
@@ -225,6 +228,84 @@ def test_explicit_target_is_covered_by_finding_digest(
     payload["target_lane_id"] = "e" * 32
     with pytest.raises(RuntimeError, match="digest mismatch"):
         server._validate_v1_finding_payload(payload, path)
+
+
+@pytest.mark.parametrize("root_schema", [1, 2])
+@pytest.mark.parametrize("explicit_recheck_target", [False, True])
+def test_historical_subject_binding_projects_and_accepts_schema2_recheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    root_schema: int, explicit_recheck_target: bool,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    inbox_path = _install_pointer(worktree, state, lane_id)
+    server._ensure_state()
+    finding_id = "ga-20260916T000000Z-aaaaaaaaaaaa"
+    server._persist_finding({
+        **_finding_args(subject=f"lane:{lane_id}"),
+        "schema_version": root_schema,
+        "finding_contract": server.FINDING_CONTRACT,
+        "finding_id": finding_id,
+        "adler_identity": server.IDENTITY,
+        "observed_at": "2026-09-16T00:00:00Z",
+        "effect_contract": "advisory_only_no_automatic_action",
+    })
+    root_path = state / "findings" / f"{finding_id}.json"
+    root_bytes = root_path.read_bytes()
+    initial = server.publish_worktree_inbox(lane_id)
+    assert initial["source_complete"] is True
+    assert initial["finding_count"] == 1
+    item = json.loads(inbox_path.read_text())["findings"][0]
+    assert item["schema_version"] == root_schema
+    assert item["legacy"] is False
+
+    monkeypatch.setattr(
+        server, "_read_work_target", lambda lane: _target(worktree, lane, checkpoint=OID_B),
+    )
+    recheck = server.submit_finding(**_finding_args(
+        subject=f"lane:{lane_id}", checkpoint=OID_B,
+        target_lane_id=lane_id if explicit_recheck_target else None,
+        recheck_of=finding_id, conclusion="still_current",
+    ))
+    assert recheck["delivery"]["state"] == "published"
+    monkeypatch.setattr(server, "_FINDING_INDEX", None)
+    rebuilt = server.publish_worktree_inbox(lane_id)
+    assert rebuilt["source_complete"] is True
+    items = json.loads(inbox_path.read_text())["findings"]
+    assert [item["finding_id"] for item in items] == [finding_id]
+    assert items[0]["schema_version"] == root_schema
+    assert items[0]["current_recheck"]["schema_version"] == 2
+    assert items[0]["current_recheck"]["finding_id"] == recheck["finding_id"]
+    assert root_path.read_bytes() == root_bytes
+
+
+@pytest.mark.parametrize("stored_schema", [1, 3, 999])
+def test_rebuild_quarantines_unsupported_schema_with_explicit_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored_schema: int,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    inbox_path = _install_pointer(tmp_path / "worktree", state, lane_id)
+    result = server.submit_finding(**_finding_args(target_lane_id=lane_id))
+    path = state / "findings" / f"{result['finding_id']}.json"
+    payload = json.loads(path.read_text())
+    payload["schema_version"] = stored_schema
+    payload.pop("finding_sha256")
+    payload["finding_sha256"] = server._sha256_json(payload)
+    path.write_text(json.dumps(payload))
+    before = path.read_bytes()
+
+    monkeypatch.setattr(server, "_FINDING_INDEX", None)
+    rebuilt = server.publish_worktree_inbox(lane_id)
+    assert rebuilt["source_complete"] is False
+    assert rebuilt["quarantined_record_count"] == 1
+    assert json.loads(inbox_path.read_text())["findings"] == []
+    listing = server.list_findings()
+    assert listing["source_complete"] is False
+    assert listing["source_error_count"] == 1
+    assert listing["findings"] == []
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("conclusion", ["still_current", "no_longer_reproduced"])

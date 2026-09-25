@@ -34,14 +34,6 @@ def test_status_declares_minimal_read_mostly_boundary() -> None:
     assert "admission_policy" in status["forbidden_effects"]
 
 
-def test_mcp_machine_name_is_ascii_stable_and_display_name_is_preserved() -> None:
-    status = server.adler_status()
-    assert server.APP_NAME == status["service"] == status["display_name"] == "Großer Adler"
-    assert server.MCP_SERVER_NAME == server.mcp.name == status["mcp_server_name"] == "grosser_adler"
-    assert server.MCP_SERVER_NAME.isascii()
-    assert status["identity"] == "grosser-adler-observer-v1"
-
-
 def test_repo_path_escape_is_rejected(tmp_path: Path) -> None:
     outside = tmp_path / "repo"
     outside.mkdir()
@@ -973,8 +965,7 @@ def test_github_pr_round_trips_structured_projection_over_real_mcp_stdio() -> No
         )
         async with stdio_client(params) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
-                initialized = await session.initialize()
-                assert initialized.serverInfo.name == "grosser_adler"
+                await session.initialize()
                 result = await session.call_tool(
                     "github_pr", {"repo": "heimgewebe/grosser-adler", "pr": 17}
                 )

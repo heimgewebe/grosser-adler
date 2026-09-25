@@ -24,7 +24,6 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 APP_NAME = "Großer Adler"
-MCP_SERVER_NAME = "grosser_adler"
 IDENTITY = "grosser-adler-observer-v1"
 FINDING_CONTRACT = "adler-finding-v1"
 SIDECAR_CONTRACT = "adler-worktree-inbox-v1"
@@ -78,7 +77,7 @@ SIDECAR_ANNOTATIONS = ToolAnnotations(
 
 INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and advisor. Operator statements are claims, not primary evidence: reconstruct relevant state from the responsible primary sources whenever possible. Look for contradictions and missing evidence without optimizing to produce a contradiction. Independent observation is not independent decision review; a same-turn Adler observation is not cognitive independence. You do not own work state, decisions, execution, admission or lifecycle. Your only writes are immutable advisory findings and computed inbox files inside your own state root. Grabowski owns the worktree-local .adler/inbox.json symlink that points at the exact external inbox file. Findings are facts or advice, never commands. Never create work, acquire leases, edit worktree or product files, commit, push, merge, deploy, control services, signal processes or mutate credentials. Partial evidence is incomplete, never absence. Prefer exact checkpoints and explicit uncertainty; do not manufacture findings."""
 
-mcp = FastMCP(MCP_SERVER_NAME, instructions=INSTRUCTIONS)
+mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
 
 _GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _GITHUB_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
@@ -1247,8 +1246,6 @@ def adler_status() -> dict[str, Any]:
         "schema_version": 2,
         "identity": IDENTITY,
         "service": APP_NAME,
-        "display_name": APP_NAME,
-        "mcp_server_name": MCP_SERVER_NAME,
         "healthy": True,
         "mode": "read-mostly",
         "architecture_contract": ARCHITECTURE_CONTRACT,
@@ -2234,7 +2231,7 @@ def _finding_record_view(
 ) -> dict[str, Any]:
     if payload.get("finding_contract") == FINDING_CONTRACT:
         fields = (
-            "finding_id", "finding_sha256", "kind", "severity", "confidence",
+            "schema_version", "finding_id", "finding_sha256", "kind", "severity", "confidence",
             "subject", "target_lane_id", "checkpoint", "binding_strength", "summary", "evidence_refs",
             "recommendation", "affected_effects", "recheck_of", "conclusion", "observed_at",
         )
@@ -2244,6 +2241,7 @@ def _finding_record_view(
 
     legacy_status = payload["status"]
     return {
+        "schema_version": payload["schema_version"],
         "finding_id": payload["finding_id"],
         "finding_sha256": _sha256_json(payload),
         "compatibility_contract": payload.get("compatibility_contract"),
@@ -2406,7 +2404,7 @@ def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
         return
 
     schema_version = payload.get("schema_version")
-    if type(schema_version) is not int or schema_version != 1:
+    if type(schema_version) is not int or schema_version not in {1, 2}:
         raise RuntimeError("V1 finding schema version is invalid")
     if payload.get("adler_identity") != IDENTITY:
         raise RuntimeError("V1 finding Adler identity is invalid")
@@ -2445,8 +2443,13 @@ def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
         if clean != value or _redact(clean) != clean or "<REDACTED>" in clean:
             raise RuntimeError(f"V1 finding {field} is invalid")
 
+    target_lane_id = payload.get("target_lane_id")
+    if "target_lane_id" in payload and (
+        schema_version == 1 or not isinstance(target_lane_id, str)
+    ):
+        raise RuntimeError("V1 finding lane target is invalid for schema")
     try:
-        _v1_target_lane_id(payload["subject"], payload.get("target_lane_id"))
+        _v1_target_lane_id(payload["subject"], target_lane_id)
     except ValueError as exc:
         raise RuntimeError("V1 finding lane target is invalid") from exc
 
@@ -2673,6 +2676,7 @@ def _lane_findings_from_loaded(
             item["current_recheck"] = {
                 key: latest_recheck.get(key)
                 for key in (
+                    "schema_version",
                     "finding_id",
                     "finding_sha256",
                     "checkpoint",
@@ -3766,7 +3770,10 @@ def submit_finding(
     conclusion: Literal["still_current", "no_longer_reproduced"] | None = None,
     target_lane_id: str | None = None,
 ) -> dict[str, Any]:
-    """Append V1 evidence; target_lane_id is 32 lowercase hex, lane:<id> a compatibility fallback."""
+    """Append adler-finding-v1 schema 2; target_lane_id is exactly 32 lowercase hex.
+
+    The exact lane:<id> subject is a compatibility fallback when no target is supplied.
+    """
     _ensure_state()
     subject_clean = _clean_required_identity_text(subject, "subject")
     checkpoint_clean = _clean_required_identity_text(checkpoint, "checkpoint")
@@ -3815,7 +3822,7 @@ def submit_finding(
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "finding_contract": FINDING_CONTRACT,
         "finding_id": finding_id,
         "adler_identity": IDENTITY,
