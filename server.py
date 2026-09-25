@@ -2628,12 +2628,19 @@ def _lane_findings_from_loaded(
     loaded: list[tuple[Path, dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     unique_loaded: dict[str, tuple[Path, dict[str, Any]]] = {}
+    colliding_ids: set[str] = set()
     for path, payload in loaded:
         finding_id = str(payload.get("finding_id", ""))
         existing = unique_loaded.get(finding_id)
         if existing is not None and (existing[0] != path or existing[1] != payload):
-            raise RuntimeError("finding_id collision in loaded findings")
+            colliding_ids.add(finding_id)
+            continue
         unique_loaded[finding_id] = (path, payload)
+    # Canonical validation binds each finding_id to its exact <finding_id>.json
+    # filename. Keep this helper defensive for duplicated or synthetic loaded
+    # input without letting one conflicting ID suppress unrelated findings.
+    for finding_id in colliding_ids:
+        unique_loaded.pop(finding_id, None)
     loaded = list(unique_loaded.values())
 
     subject = f"lane:{lane_id}"

@@ -460,6 +460,31 @@ def test_current_view_deduplicates_finding_ids_without_coalescing_legacy_and_v1(
     assert legacy_view["binding_strength"] == "legacy-unbound"
 
 
+def test_current_view_omits_conflicting_duplicate_id_without_suppressing_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    _install_pointer(tmp_path / "worktree", state, lane_id)
+    v1 = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}", target_lane_id=lane_id))
+    legacy = server.submit_finding_legacy(
+        subject_kind="grabowski_lane", subject=lane_id, checkpoint=OID_A,
+        severity="medium", summary="unrelated legacy finding", evidence_refs=["fixture:legacy"],
+    )
+    loaded, errors, _ = server._load_finding_payloads()
+    assert errors == []
+    v1_path, v1_payload = next(
+        pair for pair in loaded if pair[1]["finding_id"] == v1["finding_id"]
+    )
+    conflicting_payload = {**v1_payload, "summary": "synthetic conflicting duplicate"}
+    current = server._lane_findings_from_loaded(
+        lane_id,
+        OID_A,
+        loaded + [(v1_path.with_name("synthetic-conflict.json"), conflicting_payload)],
+    )
+    assert [item["finding_id"] for item in current] == [legacy["finding_id"]]
+
+
 def _seal_lane(lane: dict) -> dict:
     lane = json.loads(json.dumps(lane))
     lane["kind"] = "grabowski.work_lane"
