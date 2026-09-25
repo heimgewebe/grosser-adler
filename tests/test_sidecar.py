@@ -64,6 +64,247 @@ def _target(worktree: Path, lane_id: str, *, checkpoint: str = OID_A) -> dict:
     }
 
 
+@pytest.mark.parametrize(
+    ("subject_template", "explicit_target"),
+    [
+        ("grabowski lane {lane_id}", True),
+        ("repo:fixture", True),
+        ("lane:{lane_id}", True),
+        ("lane:{lane_id}", False),
+    ],
+)
+def test_v1_lane_delivery_and_full_rebuild_preserve_exact_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    subject_template: str, explicit_target: bool,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    inbox_path = _install_pointer(tmp_path / "worktree", state, lane_id)
+    subject = subject_template.format(lane_id=lane_id)
+    args = _finding_args(subject=subject)
+    if explicit_target:
+        args["target_lane_id"] = lane_id
+
+    first = server.submit_finding(**args)
+    assert first["delivery"]["state"] == "published"
+    assert first["delivery"]["source_scan_mode"] == "full-history-scan"
+    inbox = json.loads(inbox_path.read_text(encoding="utf-8"))
+    assert [item["finding_id"] for item in inbox["findings"]] == [first["finding_id"]]
+    assert inbox["findings"][0]["legacy"] is False
+    assert inbox["findings"][0]["subject"] == subject
+    original_path = state / "findings" / f"{first['finding_id']}.json"
+    original_bytes = original_path.read_bytes()
+    original = json.loads(original_bytes)
+    assert original.get("target_lane_id") == (lane_id if explicit_target else None)
+    assert ("target_lane_id" in original) is explicit_target
+    core = dict(original)
+    assert core.pop("finding_sha256") == first["finding_sha256"]
+    assert server._sha256_json(core) == first["finding_sha256"]
+
+    # Distinct finding IDs remain separate even when their content is identical.
+    second = server.submit_finding(**args)
+    assert second["delivery"]["source_scan_mode"] == "incremental-memory-index"
+    expected_ids = sorted([first["finding_id"], second["finding_id"]])
+    inbox = json.loads(inbox_path.read_text(encoding="utf-8"))
+    assert [item["finding_id"] for item in inbox["findings"]] == expected_ids
+    monkeypatch.setattr(server, "_FINDING_INDEX", None)
+    inbox_path.unlink()
+    rebuilt = server.publish_worktree_inbox(lane_id)
+    assert rebuilt["source_scan_mode"] == "full-history-scan"
+    assert rebuilt["source_complete"] is True
+    inbox = json.loads(inbox_path.read_text(encoding="utf-8"))
+    assert [item["finding_id"] for item in inbox["findings"]] == expected_ids
+    assert inbox["finding_count"] == inbox["total_current_finding_count"] == 2
+    assert original_path.read_bytes() == original_bytes
+    assert server._current_lane_findings("e" * 32, OID_A) == []
+    for item in server.list_findings(limit=10)["findings"]:
+        assert item.get("target_lane_id") == (lane_id if explicit_target else None)
+
+
+@pytest.mark.parametrize(
+    "target_lane_id",
+    ["", "A" * 32, "a" * 31, "a" * 33, "g" * 32, " " + "a" * 32,
+     "a" * 32 + " ", "a" * 32 + "\n", "lane:" + "a" * 32, "../lane", 123, True, []],
+)
+def test_invalid_explicit_target_is_rejected_before_append_or_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_lane_id,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "_publish_worktree_inbox", lambda *a, **kw: pytest.fail("delivery"))
+    with pytest.raises(ValueError, match="target_lane_id"):
+        server.submit_finding(**_finding_args(
+            subject="lane:" + "a" * 32, target_lane_id=target_lane_id,
+        ))
+    assert list((state / "findings").glob("*.json")) == []
+    assert list((state / "worktree-inboxes").glob("*.json")) == []
+
+
+def test_explicit_target_subject_conflict_is_rejected_before_append_or_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "_publish_worktree_inbox", lambda *a, **kw: pytest.fail("delivery"))
+    with pytest.raises(ValueError, match="conflicts"):
+        server.submit_finding(**_finding_args(
+            subject="lane:" + "a" * 32, target_lane_id="b" * 32,
+        ))
+    assert list((state / "findings").glob("*.json")) == []
+    assert list((state / "worktree-inboxes").glob("*.json")) == []
+
+
+@pytest.mark.parametrize(
+    "subject_template",
+    ["grabowski lane {lane_id}", "observe lane:{lane_id}", "{lane_id}", "unrelated observation"],
+)
+def test_unbound_v1_free_text_and_evidence_remain_durable_without_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subject_template: str,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    inbox_path = _install_pointer(tmp_path / "worktree", state, lane_id)
+    with monkeypatch.context() as unbound:
+        unbound.setattr(server, "_publish_worktree_inbox", lambda *a, **kw: pytest.fail("delivery"))
+        result = server.submit_finding(**_finding_args(
+            subject=subject_template.format(lane_id=lane_id),
+            evidence_refs=[f"lane:{lane_id}", f"target_lane_id={lane_id}"],
+        ))
+    assert result["accepted"] is True
+    assert result["delivery"]["state"] == "not_applicable"
+    assert (state / "findings" / f"{result['finding_id']}.json").exists()
+    assert not inbox_path.exists()
+    rebuilt = server.publish_worktree_inbox(lane_id)
+    assert rebuilt["source_complete"] is True
+    assert rebuilt["finding_count"] == 0
+
+
+def test_explicit_target_retains_server_side_lane_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch, registered=False)
+    inbox_path = _install_pointer(tmp_path / "worktree", state, lane_id)
+    result = server.submit_finding(**_finding_args(target_lane_id=lane_id))
+    assert result["delivery"]["state"] == "delivery_failed"
+    assert result["delivery"]["finding_remains_durable"] is True
+    assert (state / "findings" / f"{result['finding_id']}.json").exists()
+    assert not inbox_path.exists()
+
+
+@pytest.mark.parametrize("stored_target", ["A" * 32, "e" * 32, False, []])
+def test_full_rebuild_quarantines_invalid_or_conflicting_explicit_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored_target,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    inbox_path = _install_pointer(tmp_path / "worktree", state, lane_id)
+    result = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}"))
+    path = state / "findings" / f"{result['finding_id']}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["target_lane_id"] = stored_target
+    payload.pop("finding_sha256")
+    payload["finding_sha256"] = server._sha256_json(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    before = path.read_bytes()
+
+    rebuilt = server.publish_worktree_inbox(lane_id)
+    assert rebuilt["source_complete"] is False
+    assert rebuilt["quarantined_record_count"] == 1
+    assert json.loads(inbox_path.read_text(encoding="utf-8"))["findings"] == []
+    assert path.read_bytes() == before
+
+
+def test_explicit_target_is_covered_by_finding_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    _install_pointer(tmp_path / "worktree", state, lane_id)
+    result = server.submit_finding(**_finding_args(target_lane_id=lane_id))
+    path = state / "findings" / f"{result['finding_id']}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["target_lane_id"] = "e" * 32
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        server._validate_v1_finding_payload(payload, path)
+
+
+@pytest.mark.parametrize("conclusion", ["still_current", "no_longer_reproduced"])
+def test_explicit_target_rechecks_survive_full_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conclusion: str,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    inbox_path = _install_pointer(worktree, state, lane_id)
+    root = server.submit_finding(**_finding_args(target_lane_id=lane_id))
+    root_path = state / "findings" / f"{root['finding_id']}.json"
+    original_bytes = root_path.read_bytes()
+    monkeypatch.setattr(
+        server, "_read_work_target", lambda lane: _target(worktree, lane, checkpoint=OID_B),
+    )
+    recheck = server.submit_finding(**_finding_args(
+        target_lane_id=lane_id, checkpoint=OID_B,
+        recheck_of=root["finding_id"], conclusion=conclusion,
+    ))
+    assert recheck["delivery"]["state"] == "published"
+    monkeypatch.setattr(server, "_FINDING_INDEX", None)
+    rebuilt = server.publish_worktree_inbox(lane_id)
+    assert rebuilt["source_complete"] is True
+    findings = json.loads(inbox_path.read_text(encoding="utf-8"))["findings"]
+    if conclusion == "still_current":
+        assert [item["finding_id"] for item in findings] == [root["finding_id"]]
+        assert findings[0]["current_recheck"]["finding_id"] == recheck["finding_id"]
+    else:
+        assert findings == []
+    assert root_path.read_bytes() == original_bytes
+
+    # Even a digest-valid stored recheck cannot reroute its root to another lane.
+    recheck_path = state / "findings" / f"{recheck['finding_id']}.json"
+    payload = json.loads(recheck_path.read_text(encoding="utf-8"))
+    payload["target_lane_id"] = "e" * 32
+    payload.pop("finding_sha256")
+    payload["finding_sha256"] = server._sha256_json(payload)
+    recheck_path.write_text(json.dumps(payload), encoding="utf-8")
+    rebuilt = server.publish_worktree_inbox(lane_id)
+    assert rebuilt["source_complete"] is False
+    assert rebuilt["quarantined_record_count"] == 1
+    assert rebuilt["finding_count"] == 0
+
+
+@pytest.mark.parametrize("recheck_target", [None, "e" * 32])
+def test_recheck_cannot_drop_or_change_explicit_lane_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recheck_target: str | None,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    _install_pointer(tmp_path / "worktree", state, lane_id)
+    root = server.submit_finding(**_finding_args(target_lane_id=lane_id))
+    with pytest.raises(ValueError, match="recheck lane target"):
+        server.submit_finding(**_finding_args(
+            target_lane_id=recheck_target, recheck_of=root["finding_id"], conclusion="still_current",
+        ))
+    assert len(list((state / "findings").glob("*.json"))) == 1
+
+
+def test_current_view_deduplicates_finding_ids_without_coalescing_legacy_and_v1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    _install_pointer(tmp_path / "worktree", state, lane_id)
+    v1 = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}", target_lane_id=lane_id))
+    legacy = server.submit_finding_legacy(
+        subject_kind="grabowski_lane", subject=lane_id, checkpoint=OID_A,
+        severity="medium", summary="legacy finding", evidence_refs=["fixture:legacy"],
+    )
+    loaded, errors, _ = server._load_finding_payloads()
+    assert errors == []
+    current = server._lane_findings_from_loaded(lane_id, OID_A, loaded + loaded)
+    assert [item["finding_id"] for item in current] == sorted([v1["finding_id"], legacy["finding_id"]])
+    legacy_view = next(item for item in current if item["finding_id"] == legacy["finding_id"])
+    assert legacy_view["legacy"] is True
+    assert legacy_view["binding_strength"] == "legacy-unbound"
+
+
 def _seal_lane(lane: dict) -> dict:
     lane = json.loads(json.dumps(lane))
     lane["kind"] = "grabowski.work_lane"

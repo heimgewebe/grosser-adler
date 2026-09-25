@@ -12,6 +12,16 @@ OID_A = "a" * 40
 OID_B = "b" * 40
 
 
+def test_explicit_lane_target_is_optional_in_v1_mcp_schema_only() -> None:
+    import asyncio
+
+    tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+    v1 = tools["submit_finding_v1"].inputSchema
+    assert "target_lane_id" in v1["properties"]
+    assert "target_lane_id" not in v1["required"]
+    assert "target_lane_id" not in tools["submit_finding"].inputSchema["properties"]
+
+
 def _configure_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
@@ -341,8 +351,9 @@ def test_legacy_lane_delivery_fails_closed_if_checkpoint_advances_after_inbox_wr
     assert inbox["checkpoint"] == OID_A
 
 
+@pytest.mark.parametrize("explicit_target", [False, True])
 def test_strict_v1_lane_delivery_fails_closed_if_checkpoint_has_advanced(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_target: bool
 ) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     worktree = tmp_path / "worktree"
@@ -358,7 +369,8 @@ def test_strict_v1_lane_delivery_fails_closed_if_checkpoint_has_advanced(
         kind="risk",
         severity="medium",
         confidence=0.9,
-        subject=f"lane:{lane_id}",
+        subject=f"grabowski lane {lane_id}" if explicit_target else f"lane:{lane_id}",
+        target_lane_id=lane_id if explicit_target else None,
         checkpoint=OID_A,
         binding_strength="exact",
         summary="strict V1 checkpoint race fixture",

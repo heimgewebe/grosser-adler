@@ -24,6 +24,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 APP_NAME = "Großer Adler"
+MCP_SERVER_NAME = "grosser_adler"
 IDENTITY = "grosser-adler-observer-v1"
 FINDING_CONTRACT = "adler-finding-v1"
 SIDECAR_CONTRACT = "adler-worktree-inbox-v1"
@@ -77,7 +78,7 @@ SIDECAR_ANNOTATIONS = ToolAnnotations(
 
 INSTRUCTIONS = """You are Großer Adler, an independent observer, auditor and advisor. Operator statements are claims, not primary evidence: reconstruct relevant state from the responsible primary sources whenever possible. Look for contradictions and missing evidence without optimizing to produce a contradiction. Independent observation is not independent decision review; a same-turn Adler observation is not cognitive independence. You do not own work state, decisions, execution, admission or lifecycle. Your only writes are immutable advisory findings and computed inbox files inside your own state root. Grabowski owns the worktree-local .adler/inbox.json symlink that points at the exact external inbox file. Findings are facts or advice, never commands. Never create work, acquire leases, edit worktree or product files, commit, push, merge, deploy, control services, signal processes or mutate credentials. Partial evidence is incomplete, never absence. Prefer exact checkpoints and explicit uncertainty; do not manufacture findings."""
 
-mcp = FastMCP(APP_NAME, instructions=INSTRUCTIONS)
+mcp = FastMCP(MCP_SERVER_NAME, instructions=INSTRUCTIONS)
 
 _GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _GITHUB_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
@@ -118,7 +119,7 @@ _LEGACY_RELATIONAL_FIELDS = (
 )
 _V1_ONLY_MARKERS = {
     "finding_contract", "finding_sha256", "kind", "binding_strength",
-    "recheck_of", "conclusion", "affected_effects",
+    "recheck_of", "conclusion", "affected_effects", "target_lane_id",
 }
 _SYSTEMD_SERVICE_PROPERTIES = (
     "LoadState",
@@ -1246,6 +1247,8 @@ def adler_status() -> dict[str, Any]:
         "schema_version": 2,
         "identity": IDENTITY,
         "service": APP_NAME,
+        "display_name": APP_NAME,
+        "mcp_server_name": MCP_SERVER_NAME,
         "healthy": True,
         "mode": "read-mostly",
         "architecture_contract": ARCHITECTURE_CONTRACT,
@@ -2205,6 +2208,24 @@ def get_work_target(lane_id: str) -> dict[str, Any]:
     return _read_work_target(lane_id)
 
 
+def _v1_target_lane_id(subject: str, target_lane_id: str | None = None) -> str | None:
+    """Resolve an explicit V1 target or the exact compatibility subject only."""
+    if target_lane_id is not None and (
+        not isinstance(target_lane_id, str)
+        or _LANE_ID_RE.fullmatch(target_lane_id) is None
+    ):
+        raise ValueError("target_lane_id must be exactly 32 lowercase hexadecimal characters")
+    match = _LANE_SUBJECT_RE.fullmatch(subject)
+    subject_lane_id = match.group(1) if match is not None else None
+    if (
+        target_lane_id is not None
+        and subject_lane_id is not None
+        and target_lane_id != subject_lane_id
+    ):
+        raise ValueError("target_lane_id conflicts with canonical lane subject")
+    return target_lane_id if target_lane_id is not None else subject_lane_id
+
+
 def _finding_record_view(
     payload: dict[str, Any],
     path: Path,
@@ -2214,7 +2235,7 @@ def _finding_record_view(
     if payload.get("finding_contract") == FINDING_CONTRACT:
         fields = (
             "finding_id", "finding_sha256", "kind", "severity", "confidence",
-            "subject", "checkpoint", "binding_strength", "summary", "evidence_refs",
+            "subject", "target_lane_id", "checkpoint", "binding_strength", "summary", "evidence_refs",
             "recommendation", "affected_effects", "recheck_of", "conclusion", "observed_at",
         )
         view = {key: payload.get(key) for key in fields if key in payload}
@@ -2424,6 +2445,11 @@ def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
         if clean != value or _redact(clean) != clean or "<REDACTED>" in clean:
             raise RuntimeError(f"V1 finding {field} is invalid")
 
+    try:
+        _v1_target_lane_id(payload["subject"], payload.get("target_lane_id"))
+    except ValueError as exc:
+        raise RuntimeError("V1 finding lane target is invalid") from exc
+
     summary = payload.get("summary")
     if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
         raise RuntimeError("V1 finding summary is invalid")
@@ -2554,6 +2580,8 @@ def _load_finding_payloads(
             parent is None
             or parent.get("recheck_of") is not None
             or parent.get("subject") != payload.get("subject")
+            or _v1_target_lane_id(parent["subject"], parent.get("target_lane_id"))
+            != _v1_target_lane_id(payload["subject"], payload.get("target_lane_id"))
         ):
             errors.append({"record": path.name, "error_type": "RuntimeError"})
             invalid_paths.add(path)
@@ -2595,7 +2623,7 @@ def _lane_findings_from_loaded(
         (path, payload)
         for path, payload in loaded
         if payload.get("finding_contract") == FINDING_CONTRACT
-        and payload.get("subject") == subject
+        and _v1_target_lane_id(payload["subject"], payload.get("target_lane_id")) == lane_id
     ]
     legacy_subjects = {lane_id, subject}
     legacy_records = [
@@ -2624,7 +2652,7 @@ def _lane_findings_from_loaded(
         if isinstance(parent, str):
             rechecks.setdefault(parent, []).append((path, payload))
 
-    current: list[dict[str, Any]] = []
+    current: dict[str, dict[str, Any]] = {}
     for finding_id, (root_path, root) in roots.items():
         matching_rechecks = [
             pair
@@ -2654,16 +2682,16 @@ def _lane_findings_from_loaded(
                     "observed_at",
                 )
             }
-        current.append(item)
+        current[finding_id] = item
     for path, payload in legacy_records:
-        current.append(_finding_record_view(payload, path))
-    current.sort(
+        current.setdefault(str(payload["finding_id"]), _finding_record_view(payload, path))
+    return sorted(
+        current.values(),
         key=lambda item: (
             _severity_rank(item.get("severity")),
             str(item.get("finding_id", "")),
         )
     )
-    return current
 
 
 def _finding_store_name_snapshot(dir_fd: int) -> tuple[list[str], str]:
@@ -3736,11 +3764,13 @@ def submit_finding(
     affected_effects: list[str] | None = None,
     recheck_of: str | None = None,
     conclusion: Literal["still_current", "no_longer_reproduced"] | None = None,
+    target_lane_id: str | None = None,
 ) -> dict[str, Any]:
-    """Append one strict adler-finding-v1 record and best-effort project exact lane findings."""
+    """Append V1 evidence; target_lane_id is 32 lowercase hex, lane:<id> a compatibility fallback."""
     _ensure_state()
     subject_clean = _clean_required_identity_text(subject, "subject")
     checkpoint_clean = _clean_required_identity_text(checkpoint, "checkpoint")
+    lane_id = _v1_target_lane_id(subject_clean, target_lane_id)
     if not isinstance(summary, str) or not summary.strip() or len(summary) > MAX_SUMMARY_CHARS:
         raise ValueError(f"summary must be 1..{MAX_SUMMARY_CHARS} characters")
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1:
@@ -3779,6 +3809,8 @@ def submit_finding(
             raise ValueError("recheck_of must reference a root finding")
         if parent.get("subject") != subject_clean:
             raise ValueError("recheck subject must match original finding")
+        if _v1_target_lane_id(parent["subject"], parent.get("target_lane_id")) != lane_id:
+            raise ValueError("recheck lane target must match original finding")
 
     observed_at = _utc_now()
     finding_id = f"ga-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
@@ -3798,6 +3830,8 @@ def submit_finding(
         "observed_at": observed_at,
         "effect_contract": "advisory_only_no_automatic_action",
     }
+    if target_lane_id is not None:
+        payload["target_lane_id"] = target_lane_id
     if recommendation_clean is not None:
         payload["recommendation"] = recommendation_clean
     if effects:
@@ -3811,11 +3845,10 @@ def submit_finding(
     persisted_payload["finding_sha256"] = finding_sha256
     persisted_path = FINDINGS_ROOT / f"{finding_id}.json"
     delivery: dict[str, Any] = {"state": "not_applicable"}
-    lane_match = _LANE_SUBJECT_RE.fullmatch(subject_clean)
-    if lane_match is not None:
+    if lane_id is not None:
         try:
             delivery = _publish_worktree_inbox(
-                lane_match.group(1),
+                lane_id,
                 expected_checkpoint=checkpoint_clean,
                 incremental_record=(persisted_path, persisted_payload),
             )
