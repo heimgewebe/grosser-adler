@@ -2444,10 +2444,11 @@ def _validate_v1_finding_payload(payload: dict[str, Any], path: Path) -> None:
             raise RuntimeError(f"V1 finding {field} is invalid")
 
     target_lane_id = payload.get("target_lane_id")
-    if "target_lane_id" in payload and (
-        schema_version == 1 or not isinstance(target_lane_id, str)
-    ):
-        raise RuntimeError("V1 finding lane target is invalid for schema")
+    if "target_lane_id" in payload:
+        if schema_version == 1:
+            raise RuntimeError("V1 finding lane target is invalid for schema")
+        if not isinstance(target_lane_id, str):
+            raise RuntimeError("V1 finding lane target is invalid")
     try:
         _v1_target_lane_id(payload["subject"], target_lane_id)
     except ValueError as exc:
@@ -2583,6 +2584,11 @@ def _load_finding_payloads(
             parent is None
             or parent.get("recheck_of") is not None
             or parent.get("subject") != payload.get("subject")
+            or (
+                parent.get("target_lane_id") is not None
+                and payload.get("schema_version") == 2
+                and payload.get("target_lane_id") != parent.get("target_lane_id")
+            )
             or _v1_target_lane_id(parent["subject"], parent.get("target_lane_id"))
             != _v1_target_lane_id(payload["subject"], payload.get("target_lane_id"))
         ):
@@ -2621,6 +2627,15 @@ def _lane_findings_from_loaded(
     checkpoint: str,
     loaded: list[tuple[Path, dict[str, Any]]],
 ) -> list[dict[str, Any]]:
+    unique_loaded: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for path, payload in loaded:
+        finding_id = str(payload.get("finding_id", ""))
+        existing = unique_loaded.get(finding_id)
+        if existing is not None and (existing[0] != path or existing[1] != payload):
+            raise RuntimeError("finding_id collision in loaded findings")
+        unique_loaded[finding_id] = (path, payload)
+    loaded = list(unique_loaded.values())
+
     subject = f"lane:{lane_id}"
     v1_records = [
         (path, payload)
@@ -2673,7 +2688,7 @@ def _lane_findings_from_loaded(
             continue
         item = _finding_record_view(root, root_path)
         if latest_recheck is not None:
-            item["current_recheck"] = {
+            current_recheck = {
                 key: latest_recheck.get(key)
                 for key in (
                     "schema_version",
@@ -2686,6 +2701,9 @@ def _lane_findings_from_loaded(
                     "observed_at",
                 )
             }
+            if "target_lane_id" in latest_recheck:
+                current_recheck["target_lane_id"] = latest_recheck["target_lane_id"]
+            item["current_recheck"] = current_recheck
         current[finding_id] = item
     for path, payload in legacy_records:
         current.setdefault(str(payload["finding_id"]), _finding_record_view(payload, path))
@@ -3816,7 +3834,10 @@ def submit_finding(
             raise ValueError("recheck_of must reference a root finding")
         if parent.get("subject") != subject_clean:
             raise ValueError("recheck subject must match original finding")
-        if _v1_target_lane_id(parent["subject"], parent.get("target_lane_id")) != lane_id:
+        parent_target_lane_id = parent.get("target_lane_id")
+        if parent_target_lane_id is not None and target_lane_id != parent_target_lane_id:
+            raise ValueError("recheck lane target must match original finding")
+        if _v1_target_lane_id(parent["subject"], parent_target_lane_id) != lane_id:
             raise ValueError("recheck lane target must match original finding")
 
     observed_at = _utc_now()

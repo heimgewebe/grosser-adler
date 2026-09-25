@@ -124,6 +124,29 @@ def test_v1_lane_delivery_and_full_rebuild_preserve_exact_binding(
         assert item.get("target_lane_id") == (lane_id if explicit_target else None)
 
 
+def test_incremental_index_handles_mixed_lane_binding_forms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    inbox_path = _install_pointer(tmp_path / "worktree", state, lane_id)
+
+    fallback = server.submit_finding(**_finding_args(subject=f"lane:{lane_id}"))
+    assert fallback["delivery"]["source_scan_mode"] == "full-history-scan"
+    explicit = server.submit_finding(**_finding_args(
+        subject="repo:fixture", target_lane_id=lane_id,
+    ))
+    assert explicit["delivery"]["source_scan_mode"] == "incremental-memory-index"
+
+    findings = json.loads(inbox_path.read_text(encoding="utf-8"))["findings"]
+    assert [item["finding_id"] for item in findings] == sorted([
+        fallback["finding_id"], explicit["finding_id"],
+    ])
+    by_id = {item["finding_id"]: item for item in findings}
+    assert "target_lane_id" not in by_id[fallback["finding_id"]]
+    assert by_id[explicit["finding_id"]]["target_lane_id"] == lane_id
+
+
 @pytest.mark.parametrize(
     "target_lane_id",
     ["", "A" * 32, "a" * 31, "a" * 33, "g" * 32, " " + "a" * 32,
@@ -256,7 +279,7 @@ def test_historical_subject_binding_projects_and_accepts_schema2_recheck(
     initial = server.publish_worktree_inbox(lane_id)
     assert initial["source_complete"] is True
     assert initial["finding_count"] == 1
-    item = json.loads(inbox_path.read_text())["findings"][0]
+    item = json.loads(inbox_path.read_text(encoding="utf-8"))["findings"][0]
     assert item["schema_version"] == root_schema
     assert item["legacy"] is False
 
@@ -272,7 +295,7 @@ def test_historical_subject_binding_projects_and_accepts_schema2_recheck(
     monkeypatch.setattr(server, "_FINDING_INDEX", None)
     rebuilt = server.publish_worktree_inbox(lane_id)
     assert rebuilt["source_complete"] is True
-    items = json.loads(inbox_path.read_text())["findings"]
+    items = json.loads(inbox_path.read_text(encoding="utf-8"))["findings"]
     assert [item["finding_id"] for item in items] == [finding_id]
     assert items[0]["schema_version"] == root_schema
     assert items[0]["current_recheck"]["schema_version"] == 2
@@ -289,18 +312,18 @@ def test_rebuild_quarantines_unsupported_schema_with_explicit_target(
     inbox_path = _install_pointer(tmp_path / "worktree", state, lane_id)
     result = server.submit_finding(**_finding_args(target_lane_id=lane_id))
     path = state / "findings" / f"{result['finding_id']}.json"
-    payload = json.loads(path.read_text())
+    payload = json.loads(path.read_text(encoding="utf-8"))
     payload["schema_version"] = stored_schema
     payload.pop("finding_sha256")
     payload["finding_sha256"] = server._sha256_json(payload)
-    path.write_text(json.dumps(payload))
+    path.write_text(json.dumps(payload), encoding="utf-8")
     before = path.read_bytes()
 
     monkeypatch.setattr(server, "_FINDING_INDEX", None)
     rebuilt = server.publish_worktree_inbox(lane_id)
     assert rebuilt["source_complete"] is False
     assert rebuilt["quarantined_record_count"] == 1
-    assert json.loads(inbox_path.read_text())["findings"] == []
+    assert json.loads(inbox_path.read_text(encoding="utf-8"))["findings"] == []
     listing = server.list_findings()
     assert listing["source_complete"] is False
     assert listing["source_error_count"] == 1
@@ -334,6 +357,7 @@ def test_explicit_target_rechecks_survive_full_rebuild(
     if conclusion == "still_current":
         assert [item["finding_id"] for item in findings] == [root["finding_id"]]
         assert findings[0]["current_recheck"]["finding_id"] == recheck["finding_id"]
+        assert findings[0]["current_recheck"]["target_lane_id"] == lane_id
     else:
         assert findings == []
     assert root_path.read_bytes() == original_bytes
@@ -364,6 +388,56 @@ def test_recheck_cannot_drop_or_change_explicit_lane_target(
             target_lane_id=recheck_target, recheck_of=root["finding_id"], conclusion="still_current",
         ))
     assert len(list((state / "findings").glob("*.json"))) == 1
+
+
+def test_recheck_cannot_drop_explicit_target_when_subject_also_binds_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    _install_pointer(tmp_path / "worktree", state, lane_id)
+    subject = f"lane:{lane_id}"
+    root = server.submit_finding(**_finding_args(subject=subject, target_lane_id=lane_id))
+    with pytest.raises(ValueError, match="recheck lane target"):
+        server.submit_finding(**_finding_args(
+            subject=subject,
+            target_lane_id=None,
+            recheck_of=root["finding_id"],
+            conclusion="still_current",
+        ))
+    assert len(list((state / "findings").glob("*.json"))) == 1
+
+
+def test_rebuild_quarantines_recheck_that_drops_explicit_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    worktree = tmp_path / "worktree"
+    _install_pointer(worktree, state, lane_id)
+    subject = f"lane:{lane_id}"
+    root = server.submit_finding(**_finding_args(subject=subject, target_lane_id=lane_id))
+    monkeypatch.setattr(
+        server, "_read_work_target", lambda lane: _target(worktree, lane, checkpoint=OID_B),
+    )
+    recheck = server.submit_finding(**_finding_args(
+        subject=subject,
+        target_lane_id=lane_id,
+        checkpoint=OID_B,
+        recheck_of=root["finding_id"],
+        conclusion="still_current",
+    ))
+    recheck_path = state / "findings" / f"{recheck['finding_id']}.json"
+    payload = json.loads(recheck_path.read_text(encoding="utf-8"))
+    payload.pop("target_lane_id")
+    payload.pop("finding_sha256")
+    payload["finding_sha256"] = server._sha256_json(payload)
+    recheck_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(server, "_FINDING_INDEX", None)
+    rebuilt = server.publish_worktree_inbox(lane_id)
+    assert rebuilt["source_complete"] is False
+    assert rebuilt["quarantined_record_count"] == 1
+    assert rebuilt["finding_count"] == 0
 
 
 def test_current_view_deduplicates_finding_ids_without_coalescing_legacy_and_v1(

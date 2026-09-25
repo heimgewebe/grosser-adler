@@ -259,6 +259,21 @@ def test_schema1_forbids_target_field_even_with_valid_digest(
     assert listing["findings"] == []
 
 
+@pytest.mark.parametrize("target_lane_id", [None, 123, False, []])
+def test_schema2_invalid_target_type_is_reported_as_invalid_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_lane_id,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    path = state / "findings" / f"{FINDING_ID}.json"
+    payload = _v1_payload(
+        schema_version=2,
+        subject="lane:" + "a" * 32,
+        target_lane_id=target_lane_id,
+    )
+    with pytest.raises(RuntimeError, match=r"V1 finding lane target is invalid$"):
+        server._validate_v1_finding_payload(payload, path)
+
+
 def test_schema_version_is_digest_covered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -284,6 +299,8 @@ def test_supported_schema_rechecks_require_same_subject_and_resolved_target(
         schema_version=recheck_schema, finding_id=recheck_id, subject=root["subject"],
         recheck_of=FINDING_ID, conclusion="still_current",
     )
+    if root_schema == 2 and recheck_schema == 2:
+        recheck = _v1_payload(**{**recheck, "target_lane_id": lane_id})
     for payload in (root, recheck):
         _write_payload(state / "findings" / f"{payload['finding_id']}.json", payload)
     listing = server.list_findings()
@@ -294,6 +311,8 @@ def test_supported_schema_rechecks_require_same_subject_and_resolved_target(
     current = server._current_lane_findings(lane_id, CHECKPOINT)
     assert [item["finding_id"] for item in current] == [FINDING_ID]
     assert current[0]["current_recheck"]["schema_version"] == recheck_schema
+    if root_schema == 2 and recheck_schema == 2:
+        assert current[0]["current_recheck"]["target_lane_id"] == lane_id
 
     # A valid digest cannot authorize a recheck with another subject/binding.
     recheck = _v1_payload(**{**recheck, "subject": "lane:" + "b" * 32})
