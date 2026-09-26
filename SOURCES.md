@@ -19,7 +19,7 @@
 1. Primärevidenz vor Operatorzusammenfassung.
 2. Fehlende, abgeschnittene oder nicht lesbare Quellen bleiben `incomplete`/`unknown`; keine negative Existenzaussage aus partieller Beobachtung.
 3. `get_work_target` bestimmt nur das von Grabowski registrierte Arbeitsziel. Adler rekonstruiert die fachliche/technische Korrektheit weiterhin unabhängig aus Primärquellen.
-4. Findings werden nicht über Task-, Checkout- oder Current-Work-Resolver zugeordnet. Lane-Zustellung benötigt die explizite `lane:<lane_id>`-Bindung.
+4. Findings werden nicht über Task-, Checkout- oder Current-Work-Resolver zugeordnet. Für `adler-finding-v1` ist ab Schema 2 das optionale `target_lane_id` die kanonische Lane-Bindung (exakt 32 lowercase Hex-Zeichen). Der exakte Subject-Wert `lane:<id>` bleibt Compatibility-Fallback, wenn `target_lane_id` fehlt; bei beiden Angaben müssen die IDs übereinstimmen. Historische Schema-1-Records dürfen kein `target_lane_id` enthalten und binden nur über diesen exakten Subject-Fallback. Kein Routing aus Freitext oder `evidence_refs`.
 5. Der zentrale Finding Store ist Historie; der externe Adler-Inbox-Store enthält nur checkpoint-gebundene aktuelle Sichten. `.adler/inbox.json` ist ein von Grabowski verwalteter Zeiger darauf.
 6. V1 besitzt keinen `supervise_work`-Lifecycle, kein Adler-current_work, keine Delivery Queue, keine ACKs und keine Admission Engine.
 7. Listener-Beobachtung belegt nur positiv zugeordnete TCP/UDP-Listener; ein leeres oder unvollständig attribuiertes Ergebnis ist keine Abwesenheitsbehauptung.

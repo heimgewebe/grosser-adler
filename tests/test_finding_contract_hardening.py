@@ -194,7 +194,12 @@ def test_legacy_filename_identity_mismatch_fails_closed(
     ("field", "value"),
     [
         ("schema_version", True),
-        ("schema_version", 2),
+        ("schema_version", 3),
+        ("schema_version", 0),
+        ("schema_version", -1),
+        ("schema_version", "2"),
+        ("schema_version", 2.0),
+        ("schema_version", None),
         ("adler_identity", "other-observer"),
         ("effect_contract", "automatic_action_allowed"),
         ("kind", "unknown"),
@@ -220,18 +225,127 @@ def test_v1_schema_and_identity_fields_fail_closed(
     assert server.list_findings(limit=10)["source_complete"] is False
 
 
+@pytest.mark.parametrize("schema_version", [1, 2])
 def test_digest_covers_full_stored_core_including_extra_unicode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema_version: int,
 ) -> None:
     state = _configure_state(tmp_path, monkeypatch)
     path = state / "findings" / f"{FINDING_ID}.json"
-    payload = _v1_payload(extra={"note": "Grüßer Adler 🦅"})
+    payload = _v1_payload(schema_version=schema_version, extra={"note": "Grüßer Adler 🦅"})
     _write_payload(path, payload)
     server._validate_v1_finding_payload(payload, path)
 
     payload["extra"]["note"] = "mutated"
     with pytest.raises(RuntimeError, match="digest mismatch"):
         server._validate_v1_finding_payload(payload, path)
+
+
+@pytest.mark.parametrize("target_lane_id", [None, "a" * 32, "A" * 32, False])
+def test_schema1_forbids_target_field_even_with_valid_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_lane_id,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    path = state / "findings" / f"{FINDING_ID}.json"
+    payload = _v1_payload(subject="lane:" + "a" * 32, target_lane_id=target_lane_id)
+    core = dict(payload)
+    core.pop("finding_sha256")
+    with pytest.raises(RuntimeError, match="lane target"):
+        server._persist_finding(core)
+    assert not path.exists()
+    _write_payload(path, payload)
+    listing = server.list_findings()
+    assert listing["source_complete"] is False
+    assert listing["source_error_count"] == 1
+    assert listing["findings"] == []
+
+
+@pytest.mark.parametrize("target_lane_id", [None, 123, False, []])
+def test_schema2_invalid_target_type_is_reported_as_invalid_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_lane_id,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    path = state / "findings" / f"{FINDING_ID}.json"
+    payload = _v1_payload(
+        schema_version=2,
+        subject="lane:" + "a" * 32,
+        target_lane_id=target_lane_id,
+    )
+    with pytest.raises(RuntimeError, match=r"V1 finding lane target is invalid$"):
+        server._validate_v1_finding_payload(payload, path)
+
+
+def test_schema_version_is_digest_covered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    payload = _v1_payload(schema_version=2)
+    payload["schema_version"] = 1
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        server._validate_v1_finding_payload(payload, state / "findings" / f"{FINDING_ID}.json")
+
+
+@pytest.mark.parametrize("root_schema", [1, 2])
+@pytest.mark.parametrize("recheck_schema", [1, 2])
+def test_supported_schema_rechecks_require_same_subject_and_resolved_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_schema: int, recheck_schema: int,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    lane_id = "a" * 32
+    root = _v1_payload(schema_version=root_schema, subject=f"lane:{lane_id}")
+    if root_schema == 2:
+        root = _v1_payload(**{**root, "target_lane_id": lane_id})
+    recheck_id = "ga-20260916T000023Z-bbbbbbbbbbbb"
+    recheck = _v1_payload(
+        schema_version=recheck_schema, finding_id=recheck_id, subject=root["subject"],
+        recheck_of=FINDING_ID, conclusion="still_current",
+    )
+    if root_schema == 2 and recheck_schema == 2:
+        recheck = _v1_payload(**{**recheck, "target_lane_id": lane_id})
+    for payload in (root, recheck):
+        _write_payload(state / "findings" / f"{payload['finding_id']}.json", payload)
+    listing = server.list_findings()
+    assert listing["source_complete"] is True
+    assert {item["finding_id"]: item["schema_version"] for item in listing["findings"]} == {
+        FINDING_ID: root_schema, recheck_id: recheck_schema,
+    }
+    current = server._current_lane_findings(lane_id, CHECKPOINT)
+    assert [item["finding_id"] for item in current] == [FINDING_ID]
+    assert current[0]["current_recheck"]["schema_version"] == recheck_schema
+    if root_schema == 2 and recheck_schema == 2:
+        assert current[0]["current_recheck"]["target_lane_id"] == lane_id
+
+    # A valid digest cannot authorize a recheck with another subject/binding.
+    recheck = _v1_payload(**{**recheck, "subject": "lane:" + "b" * 32})
+    _write_payload(state / "findings" / f"{recheck_id}.json", recheck)
+    listing = server.list_findings()
+    assert listing["source_complete"] is False
+    assert listing["source_error_count"] == 1
+    assert [item["finding_id"] for item in listing["findings"]] == [FINDING_ID]
+
+
+@pytest.mark.parametrize("root_schema", [1, 2])
+def test_unbound_root_cannot_gain_lane_binding_via_recheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_schema: int,
+) -> None:
+    state = _configure_state(tmp_path, monkeypatch)
+    root = _v1_payload(schema_version=root_schema)
+    _write_payload(state / "findings" / f"{FINDING_ID}.json", root)
+    with pytest.raises(ValueError, match="recheck lane target"):
+        server.submit_finding(**_finding_args(
+            target_lane_id="a" * 32, recheck_of=FINDING_ID, conclusion="still_current",
+        ))
+    assert len(list((state / "findings").glob("*.json"))) == 1
+
+    recheck_id = "ga-20260916T000023Z-bbbbbbbbbbbb"
+    recheck = _v1_payload(
+        schema_version=2, finding_id=recheck_id, target_lane_id="a" * 32,
+        recheck_of=FINDING_ID, conclusion="still_current",
+    )
+    _write_payload(state / "findings" / f"{recheck_id}.json", recheck)
+    listing = server.list_findings()
+    assert listing["source_complete"] is False
+    assert listing["source_error_count"] == 1
+    assert [item["finding_id"] for item in listing["findings"]] == [FINDING_ID]
 
 
 def test_orphaned_persisted_recheck_marks_store_incomplete(
@@ -304,7 +418,7 @@ def test_recheck_rejects_corrupted_parent_even_with_recomputed_digest(
     root = server.submit_finding(**_finding_args())
     parent_path = state / "findings" / f"{root['finding_id']}.json"
     parent = json.loads(parent_path.read_text(encoding="utf-8"))
-    parent["schema_version"] = 2
+    parent["schema_version"] = 3
     parent.pop("finding_sha256")
     parent["finding_sha256"] = server._sha256_json(parent)
     _write_payload(parent_path, parent)
