@@ -2975,49 +2975,48 @@ def test_legacy_finding_remains_readable_without_driving_v1_semantics(tmp_path: 
     assert listing["findings"][0]["binding_strength"] == "legacy-unbound"
 
 
-def test_work_target_reads_exact_active_grabowski_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_work_target_reads_exact_active_grabowski_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
     repo = tmp_path / "repo"
-    worktree = tmp_path / "worktree"
-    lanes = tmp_path / "lanes"
     repo.mkdir()
-    worktree.mkdir()
-    lanes.mkdir()
-    (repo / ".git").mkdir()
-    (worktree / ".git").write_text("gitdir: fixture", encoding="utf-8")
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["/usr/bin/git", *args], check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        )
+
+    git("init", "-q", str(repo))
+    (repo / "README").write_text("fixture\n", encoding="utf-8")
+    git("-C", str(repo), "add", "README")
+    git(
+        "-C", str(repo), "-c", "user.name=fixture", "-c",
+        "user.email=fixture@example.invalid", "commit", "-qm", "fixture",
+    )
+    worktree = tmp_path / "worktree"
+    git("-C", str(repo), "worktree", "add", "-q", "-b", "feature/minimal", str(worktree), "HEAD")
+    lanes = tmp_path / "lanes"
+    lanes.mkdir(mode=0o700)
     lane_id = "1" * 32
     lane = _seal_lane({
-        "lane_id": lane_id,
-        "state": "ready",
-        "terminal_closeout": None,
+        "lane_id": lane_id, "state": "ready", "terminal_closeout": None,
         "inputs": {
-            "lane_id": lane_id,
-            "repo": str(repo),
-            "target_path": str(worktree),
-            "branch": "feature/minimal",
-            "purpose": "fixture",
-            "base_head": OID_B,
+            "lane_id": lane_id, "repo": str(repo), "target_path": str(worktree),
+            "branch": "feature/minimal", "purpose": "fixture", "base_head": OID_B,
         },
     })
-    (lanes / f"{lane_id}.json").write_text(json.dumps(lane), encoding="utf-8")
+    lane_file = lanes / f"{lane_id}.json"
+    lane_file.write_text(json.dumps(lane), encoding="utf-8")
+    lane_file.chmod(0o600)
     monkeypatch.setattr(server, "REPO_ROOT", tmp_path.resolve())
     monkeypatch.setattr(server, "GRABOWSKI_WORK_LANES_ROOT", lanes.resolve())
-    def fake_run(argv, **kwargs):
-        if "worktree" in argv and "list" in argv:
-            out = f"worktree {worktree.resolve()}\nHEAD {OID_A}\nbranch refs/heads/feature/minimal\n\n"
-        elif argv[-2:] == ["rev-parse", "HEAD"]:
-            out = OID_A + "\n"
-        elif argv[-2:] == ["branch", "--show-current"]:
-            out = "feature/minimal\n"
-        elif argv[-2:] == ["rev-parse", "--show-toplevel"]:
-            out = str(worktree.resolve()) + "\n"
-        else:
-            raise AssertionError(argv)
-        return {"returncode": 0, "stdout": out, "stderr": "", "stdout_truncated": False, "stderr_truncated": False}
-    monkeypatch.setattr(server, "_run", fake_run)
     target = server.get_work_target(lane_id)
     assert target["worktree"] == str(worktree.resolve())
     assert target["branch"] == "feature/minimal"
-    assert target["checkpoint"] == OID_A
+    assert len(target["checkpoint"]) == 40
     assert target["purpose"] == "fixture"
 
 
