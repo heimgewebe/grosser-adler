@@ -2120,6 +2120,37 @@ def _parse_worktree_porcelain(text: str) -> list[dict[str, str]]:
     return items
 
 
+def _bounded_git_link(path: Path) -> str:
+    """Read one Git-managed metadata pointer without following a symlink."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 4096:
+                raise RuntimeError("Git worktree link metadata is not a bounded regular file")
+            raw = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        if len(raw) > 4096:
+            raise RuntimeError("Git worktree link metadata exceeds bounded size")
+        value = raw.decode("utf-8").strip()
+        if not value or "\n" in value or "\r" in value or "\x00" in value:
+            raise RuntimeError("Git worktree link metadata is not one valid line")
+        return value
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("Git worktree link metadata is unreadable") from exc
+
+
+def _exact_git_scalar(argv: list[str]) -> str:
+    result = _run(argv)
+    lines = result.get("stdout", "").splitlines()
+    if (result.get("returncode") != 0 or result.get("stdout_truncated")
+            or not result.get("rows_intact", True) or len(lines) != 1
+            or not lines[0].strip()):
+        raise RuntimeError("worktree identity read is incomplete")
+    return lines[0].strip()
+
+
 def _read_work_target(lane_id: str) -> dict[str, Any]:
     safe_lane_id = _validate_lane_id(lane_id)
     lane_path = GRABOWSKI_WORK_LANES_ROOT / f"{safe_lane_id}.json"
@@ -2160,30 +2191,57 @@ def _read_work_target(lane_id: str) -> dict[str, Any]:
     if not (repo / ".git").exists() or not (target / ".git").exists():
         raise RuntimeError("lane repository or worktree is not a Git checkout")
 
-    inventory = _run(["/usr/bin/git", "-C", str(repo), "worktree", "list", "--porcelain"])
-    if inventory["returncode"] != 0 or inventory["stdout_truncated"]:
-        raise RuntimeError("Git worktree inventory is incomplete")
-    matches = [
-        item for item in _parse_worktree_porcelain(inventory["stdout"])
-        if item.get("worktree") == str(target)
-    ]
-    if len(matches) != 1:
+    # Verify just this linked checkout. A global porcelain list may exceed the
+    # observer's 160-kB output contract when historical worktrees accumulate.
+    git = "/usr/bin/git"
+    common = Path(_exact_git_scalar([
+        git, "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir",
+    ])).resolve(strict=True)
+    target_common = Path(_exact_git_scalar([
+        git, "-C", str(target), "rev-parse", "--path-format=absolute", "--git-common-dir",
+    ])).resolve(strict=True)
+    admin_raw = Path(_exact_git_scalar([
+        git, "-C", str(target), "rev-parse", "--absolute-git-dir",
+    ]))
+    admin = admin_raw.resolve(strict=True)
+    worktrees_dir = common / "worktrees"
+    if (target_common != common or admin_raw.is_symlink()
+            or worktrees_dir.is_symlink()
+            or not worktrees_dir.is_dir()
+            or admin.parent != worktrees_dir.resolve(strict=True)
+            or not admin.is_dir()):
         raise RuntimeError("lane target is not one registered Git worktree")
-    entry = matches[0]
-    expected_ref = f"refs/heads/{branch}"
-    if entry.get("branch") != expected_ref or not entry.get("HEAD"):
-        raise RuntimeError("registered worktree branch does not match lane")
 
-    head = _run(["/usr/bin/git", "-C", str(target), "rev-parse", "HEAD"])
-    current_branch = _run(["/usr/bin/git", "-C", str(target), "branch", "--show-current"])
-    top = _run(["/usr/bin/git", "-C", str(target), "rev-parse", "--show-toplevel"])
-    reads = (head, current_branch, top)
-    if any(item["returncode"] != 0 or item["stdout_truncated"] for item in reads):
-        raise RuntimeError("worktree identity read is incomplete")
-    checkpoint = head["stdout"].strip()
-    if checkpoint != entry["HEAD"] or current_branch["stdout"].strip() != branch:
+    gitfile = target / ".git"
+    gitfile_link = _bounded_git_link(gitfile)
+    if not gitfile_link.startswith("gitdir: "):
+        raise RuntimeError("lane target Git worktree pointer is invalid")
+    recorded_admin = Path(gitfile_link[len("gitdir: "):])
+    if not recorded_admin.is_absolute():
+        recorded_admin = target / recorded_admin
+    if recorded_admin.resolve(strict=True) != admin:
+        raise RuntimeError("lane target Git worktree pointer disagrees with Git")
+    admin_gitfile = Path(_bounded_git_link(admin / "gitdir"))
+    if not admin_gitfile.is_absolute():
+        admin_gitfile = admin / admin_gitfile
+    if admin_gitfile.resolve(strict=True) != gitfile:
+        raise RuntimeError("Git worktree registration does not point back to lane target")
+
+    expected_ref = f"refs/heads/{branch}"
+    branch_ref = _exact_git_scalar([
+        git, "-C", str(target), "symbolic-ref", "HEAD",
+    ])
+    if branch_ref != expected_ref:
+        raise RuntimeError("registered worktree branch does not match lane")
+    checkpoint = _exact_git_scalar([git, "-C", str(target), "rev-parse", "HEAD"])
+    branch_head = _exact_git_scalar([
+        git, "-C", str(repo), "rev-parse", "--verify", expected_ref,
+    ])
+    if (checkpoint != branch_head
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", checkpoint) is None):
         raise RuntimeError("worktree identity drifted from registered lane")
-    if Path(top["stdout"].strip()).resolve() != target:
+    top = _exact_git_scalar([git, "-C", str(target), "rev-parse", "--show-toplevel"])
+    if Path(top).resolve(strict=True) != target:
         raise RuntimeError("worktree top-level does not match lane target")
 
     return {

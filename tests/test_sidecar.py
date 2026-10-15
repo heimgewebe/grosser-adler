@@ -512,7 +512,13 @@ def _work_target_fixture(
     worktree.mkdir()
     lanes.mkdir(mode=0o700)
     (repo / ".git").mkdir()
-    (worktree / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+    admin = (
+        repo / ".git" / "worktrees" / "worktree"
+        if registered else tmp_path / "unrelated-admin" / "worktrees" / "worktree"
+    )
+    admin.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    (admin / "gitdir").write_text(str(worktree / ".git") + "\n", encoding="utf-8")
     lane_id = "d" * 32
     lane = _seal_lane({
         "lane_id": lane_id,
@@ -534,33 +540,26 @@ def _work_target_fixture(
     monkeypatch.setattr(server, "GRABOWSKI_WORK_LANES_ROOT", lanes.resolve())
 
     def fake_run(argv, **kwargs):
-        if "worktree" in argv and "list" in argv:
-            if registered:
-                out = (
-                    f"worktree {worktree.resolve()}\n"
-                    f"HEAD {inventory_head}\n"
-                    f"branch refs/heads/{inventory_branch}\n\n"
-                )
-            else:
-                out = (
-                    f"worktree {repo.resolve()}\n"
-                    f"HEAD {OID_A}\n"
-                    "branch refs/heads/main\n\n"
-                )
+        if argv[-3:] == ["rev-parse", "--path-format=absolute", "--git-common-dir"]:
+            out = str(repo / ".git") + "\n"
+        elif argv[-2:] == ["rev-parse", "--absolute-git-dir"]:
+            out = str(admin) + "\n"
+        elif argv[-2:] == ["symbolic-ref", "HEAD"]:
+            selected_branch = (
+                inventory_branch if inventory_branch != "feature/minimal" else observed_branch
+            )
+            out = f"refs/heads/{selected_branch}\n"
+        elif len(argv) >= 3 and argv[-3:-1] == ["rev-parse", "--verify"]:
+            out = inventory_head + "\n"
         elif argv[-2:] == ["rev-parse", "HEAD"]:
             out = observed_head + "\n"
-        elif argv[-2:] == ["branch", "--show-current"]:
-            out = observed_branch + "\n"
         elif argv[-2:] == ["rev-parse", "--show-toplevel"]:
             out = str(worktree.resolve()) + "\n"
         else:
             raise AssertionError(argv)
         return {
-            "returncode": 0,
-            "stdout": out,
-            "stderr": "",
-            "stdout_truncated": False,
-            "stderr_truncated": False,
+            "returncode": 0, "stdout": out, "stderr": "",
+            "stdout_truncated": False, "stderr_truncated": False, "rows_intact": True,
         }
 
     monkeypatch.setattr(server, "_run", fake_run)
@@ -842,3 +841,87 @@ def test_minimal_surface_has_no_worktree_write_authority() -> None:
     assert not hasattr(server, "_ensure_sidecar_gitignore")
     assert not hasattr(server, "adler_probe")
     assert not hasattr(server, "write_file")
+def test_exact_lane_delivery_does_not_enumerate_all_worktrees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 160k-truncated global worktree list cannot block a known live lane."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["/usr/bin/git", *args], check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        )
+
+    git("init", "-q", str(repo))
+    (repo / "README").write_text("fixture\n", encoding="utf-8")
+    git("-C", str(repo), "add", "README")
+    git(
+        "-C", str(repo), "-c", "user.name=fixture", "-c",
+        "user.email=fixture@example.invalid", "commit", "-qm", "fixture",
+    )
+    worktree = tmp_path / "linked"
+    git("-C", str(repo), "worktree", "add", "-q", "-b", "feature/minimal", str(worktree), "HEAD")
+
+    lane_id = "c" * 32
+    lanes = tmp_path / "lanes"
+    lanes.mkdir(mode=0o700)
+    lane = _seal_lane({
+        "lane_id": lane_id, "state": "ready", "terminal_closeout": None,
+        "inputs": {
+            "lane_id": lane_id, "repo": str(repo),
+            "target_path": str(worktree), "branch": "feature/minimal",
+            "purpose": "bounded-exact-delivery", "base_head": OID_A,
+        },
+    })
+    lane_file = lanes / f"{lane_id}.json"
+    lane_file.write_text(json.dumps(lane), encoding="utf-8")
+    lane_file.chmod(0o600)
+    monkeypatch.setattr(server, "REPO_ROOT", tmp_path.resolve())
+    monkeypatch.setattr(server, "GRABOWSKI_WORK_LANES_ROOT", lanes.resolve())
+    state = _configure_state(tmp_path, monkeypatch)
+    inbox_path = _install_pointer(worktree, state, lane_id)
+
+    real_run = server._run
+    def deny_global_inventory(argv, **kwargs):
+        if argv[-3:] == ["worktree", "list", "--porcelain"]:
+            raise AssertionError("a complete global worktree inventory is not required")
+        return real_run(argv, **kwargs)
+    monkeypatch.setattr(server, "_run", deny_global_inventory)
+
+    target = server.get_work_target(lane_id)
+    assert target["worktree"] == str(worktree.resolve())
+    assert target["branch"] == "feature/minimal"
+    assert len(target["checkpoint"]) == 40
+    result = server.publish_worktree_inbox(lane_id)
+    assert result["state"] == "published"
+    assert result["source_complete"] is True
+    assert inbox_path.is_file()
+
+
+def test_work_target_rejects_symlinked_gitfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    gitfile = tmp_path / "worktree" / ".git"
+    other = tmp_path / "symlinked-gitfile"
+    other.write_bytes(gitfile.read_bytes())
+    gitfile.unlink()
+    gitfile.symlink_to(other)
+    with pytest.raises(RuntimeError, match="Git worktree link metadata is unreadable"):
+        server.get_work_target(lane_id)
+
+
+def test_work_target_rejects_different_git_admin_reverse_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lane_id = _work_target_fixture(tmp_path, monkeypatch)
+    foreign = tmp_path / "foreign.gitfile"
+    foreign.write_text("foreign", encoding="utf-8")
+    admin_gitdir = tmp_path / "repo" / ".git" / "worktrees" / "worktree" / "gitdir"
+    admin_gitdir.write_text(str(foreign) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="registration does not point back"):
+        server.get_work_target(lane_id)
