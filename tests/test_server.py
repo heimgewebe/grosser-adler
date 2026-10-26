@@ -3328,7 +3328,8 @@ def test_nixos_read_tools_resolve_only_immutable_store_targets(monkeypatch: pyte
     monkeypatch.setattr(path_cls, "is_file", fake_is_file)
     monkeypatch.setattr(path_cls, "resolve", fake_resolve)
     monkeypatch.setattr(server.os, "access", fake_access)
-    assert server._trusted_read_executable("/usr/bin/ps") == "/run/current-system/sw/bin/ps"
+    monkeypatch.setattr(server, "_trusted_nixos_binary_provenance", lambda candidate, resolved: True)
+    assert server._trusted_read_executable("/usr/bin/ps") == str(store_target)
     assert server._trusted_read_executable("/usr/bin/bash") == "/usr/bin/bash"
 
     def untrusted_resolve(self: Path, *args, **kwargs) -> Path:
@@ -3385,3 +3386,81 @@ def test_nixos_read_tool_fallback_fails_closed_when_system_link_missing(monkeypa
     monkeypatch.setattr(path_cls, "is_file", fake_is_file)
     monkeypatch.setattr(path_cls, "resolve", unavailable)
     assert server._trusted_read_executable("/usr/bin/ps") == "/usr/bin/ps"
+
+
+def test_nixos_reader_executes_attested_realpath_after_symlink_swap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid Store binary remains the exec target even after the symlink changes."""
+    from pathlib import Path
+    import subprocess
+
+    path_cls = type(Path("/usr/bin/ps"))
+    orig_file = path_cls.is_file
+    orig_resolve = path_cls.resolve
+    orig_access = server.os.access
+    a = Path("/nix/store/immutable-a/bin/ps")
+    b = Path("/nix/store/immutable-b/bin/ps")
+    swapped = False
+    observed = []
+
+    def fake_is_file(self: Path) -> bool:
+        if str(self) == "/usr/bin/ps":
+            return False
+        if self == a:
+            return True
+        return orig_file(self)
+
+    def fake_resolve(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/run/current-system/sw/bin/ps":
+            return b if swapped else a
+        return orig_resolve(self, *args, **kwargs)
+
+    def fake_access(path: str, mode: int) -> bool:
+        if str(path) == str(a) and mode == server.os.X_OK:
+            return True
+        return orig_access(path, mode)
+
+    def fake_run(argv, **kwargs):
+        nonlocal swapped
+        swapped = True
+        assert Path("/run/current-system/sw/bin/ps").resolve(strict=True) == b
+        observed.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "ps version", "")
+
+    monkeypatch.setattr(path_cls, "is_file", fake_is_file)
+    monkeypatch.setattr(path_cls, "resolve", fake_resolve)
+    monkeypatch.setattr(server.os, "access", fake_access)
+    monkeypatch.setattr(server, "_trusted_nixos_binary_provenance", lambda candidate, resolved: True)
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    result = server._run(["/usr/bin/ps", "--version"])
+    assert result["returncode"] == 0
+    assert observed == [[str(a), "--version"]]
+
+
+def test_nixos_root_provenance_rejects_observer_writable_hops(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    path_cls = type(Path("/nix/store"))
+    root_uid = 0
+    writable = set()
+    foreign = set()
+    requested = Path("/run/current-system/sw/bin/gh")
+    resolved = Path("/nix/store/immutable-a/bin/gh")
+
+    monkeypatch.setattr(
+        path_cls, "lstat",
+        lambda self: SimpleNamespace(st_uid=1234 if str(self) in foreign else root_uid),
+    )
+    monkeypatch.setattr(server.os, "access", lambda path, mode: str(path) in writable)
+
+    assert server._trusted_nixos_binary_provenance(requested, resolved) is True
+    foreign.add("/run/current-system")
+    assert server._trusted_nixos_binary_provenance(requested, resolved) is False
+    foreign.clear()
+    writable.add("/nix/store/immutable-a")
+    assert server._trusted_nixos_binary_provenance(requested, resolved) is False
+    writable.clear()
+    foreign.add(str(resolved))
+    assert server._trusted_nixos_binary_provenance(requested, resolved) is False
+    foreign.clear()
+    assert server._trusted_nixos_binary_provenance(requested, Path("/tmp/user-gh")) is False

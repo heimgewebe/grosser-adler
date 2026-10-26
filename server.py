@@ -385,6 +385,31 @@ _NIXOS_READ_EXECUTABLES = frozenset({
 })
 
 
+def _trusted_nixos_binary_provenance(candidate: Path, resolved: Path) -> bool:
+    """Require root-controlled, observer-nonwritable symlink and Store path hops."""
+    store = Path("/nix/store")
+    if store not in resolved.parents:
+        return False
+    hops = (
+        Path("/run"),
+        Path("/run/current-system"),
+        Path("/run/current-system/sw"),
+        candidate.parent,
+        candidate,
+        Path("/nix"),
+        store,
+        *(parent for parent in reversed(resolved.parents) if store in parent.parents),
+        resolved,
+    )
+    try:
+        for hop in dict.fromkeys(hops):
+            if hop.lstat().st_uid != 0 or os.access(hop, os.W_OK):
+                return False
+    except (OSError, RuntimeError):
+        return False
+    return True
+
+
 def _trusted_read_executable(requested: str) -> str:
     """Preserve FHS paths and only recover known read tools from the immutable NixOS store."""
     if requested not in _NIXOS_READ_EXECUTABLES or Path(requested).is_file():
@@ -398,9 +423,10 @@ def _trusted_read_executable(requested: str) -> str:
         Path("/nix/store") not in resolved.parents
         or not resolved.is_file()
         or not os.access(resolved, os.X_OK)
+        or not _trusted_nixos_binary_provenance(candidate, resolved)
     ):
         return requested
-    return str(candidate)
+    return str(resolved)
 
 
 def _run(
