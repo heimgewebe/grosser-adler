@@ -3296,3 +3296,92 @@ def test_recheck_chain_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPat
             kind="observation", severity="low", subject="repo:fixture", checkpoint=OID_C,
             recheck_of=recheck["finding_id"], conclusion="still_current",
         ))
+
+
+def test_nixos_read_tools_resolve_only_immutable_store_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the four known read binaries may use a trusted /run/current-system fallback."""
+    from pathlib import Path
+
+    path_cls = type(Path("/usr/bin/ps"))
+    original_is_file = path_cls.is_file
+    original_resolve = path_cls.resolve
+    original_access = server.os.access
+    store_target = Path("/nix/store/observer-test/bin/ps")
+
+    def fake_is_file(self: Path) -> bool:
+        if str(self) == "/usr/bin/ps":
+            return False
+        if self == store_target:
+            return True
+        return original_is_file(self)
+
+    def fake_resolve(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/run/current-system/sw/bin/ps":
+            return store_target
+        return original_resolve(self, *args, **kwargs)
+
+    def fake_access(path: str, mode: int) -> bool:
+        if str(path) == str(store_target):
+            return True
+        return original_access(path, mode)
+
+    monkeypatch.setattr(path_cls, "is_file", fake_is_file)
+    monkeypatch.setattr(path_cls, "resolve", fake_resolve)
+    monkeypatch.setattr(server.os, "access", fake_access)
+    assert server._trusted_read_executable("/usr/bin/ps") == "/run/current-system/sw/bin/ps"
+    assert server._trusted_read_executable("/usr/bin/bash") == "/usr/bin/bash"
+
+    def untrusted_resolve(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/run/current-system/sw/bin/ps":
+            return Path("/home/alex/bin/ps")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(path_cls, "resolve", untrusted_resolve)
+    assert server._trusted_read_executable("/usr/bin/ps") == "/usr/bin/ps"
+
+
+def test_nixos_read_tools_do_not_share_github_secret_with_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Executable fallback must not grant process reads the dedicated GitHub token."""
+    import subprocess
+
+    observed = []
+
+    def fake_run(argv, **kwargs):
+        observed.append((list(argv), dict(kwargs["env"])))
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        server, "_trusted_read_executable",
+        lambda name: "/run/current-system/sw/bin/" + name.rsplit("/", 1)[-1],
+    )
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", "dedicated-test-token")
+
+    assert server._run(["/usr/bin/ps", "--version"])["returncode"] == 0
+    assert observed[-1][0][0] == "/run/current-system/sw/bin/ps"
+    assert "GH_TOKEN" not in observed[-1][1]
+    assert server._run(["/usr/bin/gh", "--version"])["returncode"] == 0
+    assert observed[-1][0][0] == "/run/current-system/sw/bin/gh"
+    assert observed[-1][1]["GH_TOKEN"] == "dedicated-test-token"
+
+
+def test_nixos_read_tool_fallback_fails_closed_when_system_link_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+
+    path_cls = type(Path("/usr/bin/ps"))
+    original_is_file = path_cls.is_file
+    original_resolve = path_cls.resolve
+
+    def fake_is_file(self: Path) -> bool:
+        if str(self) == "/usr/bin/ps":
+            return False
+        return original_is_file(self)
+
+    def unavailable(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/run/current-system/sw/bin/ps":
+            raise FileNotFoundError("missing NixOS tool")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(path_cls, "is_file", fake_is_file)
+    monkeypatch.setattr(path_cls, "resolve", unavailable)
+    assert server._trusted_read_executable("/usr/bin/ps") == "/usr/bin/ps"
