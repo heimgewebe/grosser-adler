@@ -3296,3 +3296,171 @@ def test_recheck_chain_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPat
             kind="observation", severity="low", subject="repo:fixture", checkpoint=OID_C,
             recheck_of=recheck["finding_id"], conclusion="still_current",
         ))
+
+
+def test_nixos_read_tools_resolve_only_immutable_store_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the four known read binaries may use a trusted /run/current-system fallback."""
+    from pathlib import Path
+
+    path_cls = type(Path("/usr/bin/ps"))
+    original_is_file = path_cls.is_file
+    original_resolve = path_cls.resolve
+    original_access = server.os.access
+    store_target = Path("/nix/store/observer-test/bin/ps")
+
+    def fake_is_file(self: Path) -> bool:
+        if str(self) == "/usr/bin/ps":
+            return False
+        if self == store_target:
+            return True
+        return original_is_file(self)
+
+    def fake_resolve(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/run/current-system/sw/bin/ps":
+            return store_target
+        return original_resolve(self, *args, **kwargs)
+
+    def fake_access(path: str, mode: int) -> bool:
+        if str(path) == str(store_target):
+            return True
+        return original_access(path, mode)
+
+    monkeypatch.setattr(path_cls, "is_file", fake_is_file)
+    monkeypatch.setattr(path_cls, "resolve", fake_resolve)
+    monkeypatch.setattr(server.os, "access", fake_access)
+    monkeypatch.setattr(server, "_trusted_nixos_binary_provenance", lambda candidate, resolved: True)
+    assert server._trusted_read_executable("/usr/bin/ps") == str(store_target)
+    assert server._trusted_read_executable("/usr/bin/bash") == "/usr/bin/bash"
+
+    def untrusted_resolve(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/run/current-system/sw/bin/ps":
+            return Path("/home/alex/bin/ps")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(path_cls, "resolve", untrusted_resolve)
+    assert server._trusted_read_executable("/usr/bin/ps") == "/usr/bin/ps"
+
+
+def test_nixos_read_tools_do_not_share_github_secret_with_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Executable fallback must not grant process reads the dedicated GitHub token."""
+    import subprocess
+
+    observed = []
+
+    def fake_run(argv, **kwargs):
+        observed.append((list(argv), dict(kwargs["env"])))
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        server, "_trusted_read_executable",
+        lambda name: "/run/current-system/sw/bin/" + name.rsplit("/", 1)[-1],
+    )
+    monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", "dedicated-test-token")
+
+    assert server._run(["/usr/bin/ps", "--version"])["returncode"] == 0
+    assert observed[-1][0][0] == "/run/current-system/sw/bin/ps"
+    assert "GH_TOKEN" not in observed[-1][1]
+    assert server._run(["/usr/bin/gh", "--version"])["returncode"] == 0
+    assert observed[-1][0][0] == "/run/current-system/sw/bin/gh"
+    assert observed[-1][1]["GH_TOKEN"] == "dedicated-test-token"
+
+
+def test_nixos_read_tool_fallback_fails_closed_when_system_link_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+
+    path_cls = type(Path("/usr/bin/ps"))
+    original_is_file = path_cls.is_file
+    original_resolve = path_cls.resolve
+
+    def fake_is_file(self: Path) -> bool:
+        if str(self) == "/usr/bin/ps":
+            return False
+        return original_is_file(self)
+
+    def unavailable(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/run/current-system/sw/bin/ps":
+            raise FileNotFoundError("missing NixOS tool")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(path_cls, "is_file", fake_is_file)
+    monkeypatch.setattr(path_cls, "resolve", unavailable)
+    assert server._trusted_read_executable("/usr/bin/ps") == "/usr/bin/ps"
+
+
+def test_nixos_reader_executes_attested_realpath_after_symlink_swap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid Store binary remains the exec target even after the symlink changes."""
+    from pathlib import Path
+    import subprocess
+
+    path_cls = type(Path("/usr/bin/ps"))
+    orig_file = path_cls.is_file
+    orig_resolve = path_cls.resolve
+    orig_access = server.os.access
+    a = Path("/nix/store/immutable-a/bin/ps")
+    b = Path("/nix/store/immutable-b/bin/ps")
+    swapped = False
+    observed = []
+
+    def fake_is_file(self: Path) -> bool:
+        if str(self) == "/usr/bin/ps":
+            return False
+        if self == a:
+            return True
+        return orig_file(self)
+
+    def fake_resolve(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/run/current-system/sw/bin/ps":
+            return b if swapped else a
+        return orig_resolve(self, *args, **kwargs)
+
+    def fake_access(path: str, mode: int) -> bool:
+        if str(path) == str(a) and mode == server.os.X_OK:
+            return True
+        return orig_access(path, mode)
+
+    def fake_run(argv, **kwargs):
+        nonlocal swapped
+        swapped = True
+        assert Path("/run/current-system/sw/bin/ps").resolve(strict=True) == b
+        observed.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "ps version", "")
+
+    monkeypatch.setattr(path_cls, "is_file", fake_is_file)
+    monkeypatch.setattr(path_cls, "resolve", fake_resolve)
+    monkeypatch.setattr(server.os, "access", fake_access)
+    monkeypatch.setattr(server, "_trusted_nixos_binary_provenance", lambda candidate, resolved: True)
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    result = server._run(["/usr/bin/ps", "--version"])
+    assert result["returncode"] == 0
+    assert observed == [[str(a), "--version"]]
+
+
+def test_nixos_root_provenance_rejects_observer_writable_hops(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    path_cls = type(Path("/nix/store"))
+    root_uid = 0
+    writable = set()
+    foreign = set()
+    requested = Path("/run/current-system/sw/bin/gh")
+    resolved = Path("/nix/store/immutable-a/bin/gh")
+
+    monkeypatch.setattr(
+        path_cls, "lstat",
+        lambda self: SimpleNamespace(st_uid=1234 if str(self) in foreign else root_uid),
+    )
+    monkeypatch.setattr(server.os, "access", lambda path, mode: str(path) in writable)
+
+    assert server._trusted_nixos_binary_provenance(requested, resolved) is True
+    foreign.add("/run/current-system")
+    assert server._trusted_nixos_binary_provenance(requested, resolved) is False
+    foreign.clear()
+    writable.add("/nix/store/immutable-a")
+    assert server._trusted_nixos_binary_provenance(requested, resolved) is False
+    writable.clear()
+    foreign.add(str(resolved))
+    assert server._trusted_nixos_binary_provenance(requested, resolved) is False
+    foreign.clear()
+    assert server._trusted_nixos_binary_provenance(requested, Path("/tmp/user-gh")) is False

@@ -377,6 +377,58 @@ def _bounded(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]:
     return clipped + "\n<OUTPUT_TRUNCATED>", True
 
 
+_NIXOS_READ_EXECUTABLES = frozenset({
+    "/usr/bin/gh",
+    "/usr/bin/journalctl",
+    "/usr/bin/ps",
+    "/usr/bin/ss",
+})
+
+
+def _trusted_nixos_binary_provenance(candidate: Path, resolved: Path) -> bool:
+    """Require root-controlled, observer-nonwritable symlink and Store path hops."""
+    store = Path("/nix/store")
+    if store not in resolved.parents:
+        return False
+    hops = (
+        Path("/run"),
+        Path("/run/current-system"),
+        Path("/run/current-system/sw"),
+        candidate.parent,
+        candidate,
+        Path("/nix"),
+        store,
+        *(parent for parent in reversed(resolved.parents) if store in parent.parents),
+        resolved,
+    )
+    try:
+        for hop in dict.fromkeys(hops):
+            if hop.lstat().st_uid != 0 or os.access(hop, os.W_OK):
+                return False
+    except (OSError, RuntimeError):
+        return False
+    return True
+
+
+def _trusted_read_executable(requested: str) -> str:
+    """Preserve FHS paths and only recover known read tools from the immutable NixOS store."""
+    if requested not in _NIXOS_READ_EXECUTABLES or Path(requested).is_file():
+        return requested
+    candidate = Path("/run/current-system/sw/bin") / requested.rsplit("/", 1)[-1]
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return requested
+    if (
+        Path("/nix/store") not in resolved.parents
+        or not resolved.is_file()
+        or not os.access(resolved, os.X_OK)
+        or not _trusted_nixos_binary_provenance(candidate, resolved)
+    ):
+        return requested
+    return str(resolved)
+
+
 def _run(
     argv: list[str],
     *,
@@ -408,8 +460,9 @@ def _run(
             raise RuntimeError("Großer Adler GitHub credential is not configured")
         env["GH_TOKEN"] = exact_secrets[0]
 
+    effective_argv = [_trusted_read_executable(argv[0]), *argv[1:]]
     completed = subprocess.run(
-        argv,
+        effective_argv,
         cwd=str(cwd) if cwd else None,
         env=env,
         stdin=subprocess.DEVNULL,
