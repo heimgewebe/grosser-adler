@@ -1217,6 +1217,75 @@ def test_list_user_services_marks_bullet_and_malformed_rows(
     assert result["services"] == []
 
 
+def test_list_user_services_accepts_canonical_systemd_escaped_dashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Real NixOS/systemd response has 466 ordinary and three escaped unit IDs.
+    escaped = (
+        r"app-geoclue\x2ddemo\x2dagent@autostart.service",
+        r"app-org.kde.plasma\x2dfallback\x2dsession\x2drestore@autostart.service",
+        r"app-xdg\x2duser\x2ddirs@autostart.service",
+    )
+    ordinary = tuple(f"observer-normal-{index:03d}.service" for index in range(466))
+    units = (*escaped, *ordinary)
+    listing = "".join(
+        f"{unit} loaded active running Observed service\n" for unit in units
+    )
+    _systemctl_stdout(monkeypatch, listing)
+    result = server.list_user_services()
+
+    assert result["source"]["rows_intact"] is True
+    assert result["parse_complete"] is True
+    assert result["observation_complete"] is True
+    assert len(result["services"]) == 469
+    assert tuple(row["unit"] for row in result["services"]) == units
+    assert server._listed_unit_names(listing) == units
+    # Escaped names belong to a read-only listing, never the command allowlist.
+    for unit in escaped:
+        assert server._UNIT_RE.fullmatch(unit) is None
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        r"app-evil\x0aunit.service",
+        r"app-evil\x2Dunit.service",
+        r"app-evil\x2unit.service",
+        r"app-evil\x5cunit.service",
+        "app-evil/unit.service",
+    ],
+)
+def test_list_user_services_refuses_other_escapes_and_partial_rows(
+    monkeypatch: pytest.MonkeyPatch, invalid: str,
+) -> None:
+    _systemctl_stdout(
+        monkeypatch,
+        f"valid.service loaded active running Good\n"
+        f"{invalid} loaded active running Bad\n",
+    )
+    result = server.list_user_services()
+    assert result["observation_complete"] is False
+    assert result["services"] == []
+    assert invalid not in server._listed_unit_names(
+        f"{invalid} loaded active running Bad\n"
+    )
+
+
+def test_list_user_services_escaped_id_does_not_leak_description_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = r"app-geoclue\x2ddemo\x2dagent@autostart.service"
+    token = "ghp_" + ("s" * 24)
+    _systemctl_stdout(
+        monkeypatch,
+        f"{unit} loaded active running Unit token: {token}\n",
+    )
+    result = server.list_user_services()
+    assert result["observation_complete"] is True
+    assert [item["unit"] for item in result["services"]] == [unit]
+    assert token not in json.dumps(result)
+
+
 def test_list_user_services_fails_closed_on_non_structural_state_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
