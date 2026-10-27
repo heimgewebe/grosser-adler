@@ -3533,3 +3533,64 @@ def test_nixos_root_provenance_rejects_observer_writable_hops(monkeypatch: pytes
     assert server._trusted_nixos_binary_provenance(requested, resolved) is False
     foreign.clear()
     assert server._trusted_nixos_binary_provenance(requested, Path("/tmp/user-gh")) is False
+
+
+
+def test_nixos_root_provenance_accepts_systemd_single_uid_overflow_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    candidate = Path("/run/current-system/sw/bin/ps")
+    target = Path("/nix/store/immutable-a/bin/ps")
+    path_cls = type(candidate)
+    foreign = set()
+    writable = set()
+    monkeypatch.setattr(server, "_host_root_uid_unmapped_in_userns", lambda: True)
+    monkeypatch.setattr(
+        path_cls, "lstat",
+        lambda self: SimpleNamespace(st_uid=1000 if str(self) in foreign else 65534),
+    )
+    monkeypatch.setattr(server.os, "access", lambda p, mode: str(p) in writable)
+
+    assert server._trusted_nixos_binary_provenance(candidate, target)
+    foreign.add("/run/current-system")  # Even one observer-owned hop is rejected.
+    assert not server._trusted_nixos_binary_provenance(candidate, target)
+    foreign.clear()
+    writable.add("/run/current-system")
+    assert not server._trusted_nixos_binary_provenance(candidate, target)
+    writable.clear()
+    monkeypatch.setattr(server, "_host_root_uid_unmapped_in_userns", lambda: False)
+    assert not server._trusted_nixos_binary_provenance(candidate, target)
+
+
+def test_nixos_userns_overflow_owner_requires_exact_single_identity_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pathlib import Path
+
+    path_cls = type(Path("/proc/self/uid_map"))
+    original_read = path_cls.read_text
+    mapping = {"value": "1000 1000 1\n"}
+
+    def fake_read(self: Path, *args, **kwargs) -> str:
+        if str(self) == "/proc/self/uid_map":
+            return mapping["value"]
+        return original_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(path_cls, "read_text", fake_read)
+    monkeypatch.setattr(server.os, "geteuid", lambda: 1000)
+    assert server._host_root_uid_unmapped_in_userns()
+    for wrong in (
+        "0 0 4294967295\n",  # initial identity namespace
+        "1000 1000 2\n",   # more than this user's UID mapped
+        "1000 2000 1\n",   # UID shifted to another host identity
+        "1000 1000 1\n0 0 1\n",  # host root explicitly mapped
+        "not a map\n",
+    ):
+        mapping["value"] = wrong
+        assert not server._host_root_uid_unmapped_in_userns()
+    mapping["value"] = "1000 1000 1\n"
+    monkeypatch.setattr(server.os, "geteuid", lambda: 0)
+    assert not server._host_root_uid_unmapped_in_userns()
