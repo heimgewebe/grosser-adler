@@ -83,6 +83,9 @@ _GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
 _GITHUB_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _REV_RE = re.compile(r"^[A-Za-z0-9_./@{}^~:+-]{1,200}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,180}\.service$")
+# Systemctl list output can encode "-" as "\x2d" in unit identities.
+# Do not widen _UNIT_RE: user-supplied service arguments remain strict.
+_LISTED_UNIT_RE = re.compile(r"^(?:[A-Za-z0-9_.@:-]|\\x2d){1,180}\.service$")
 _RELEASE_ID_RE = re.compile(
     r"^(?P<head>[0-9a-f]{12})-srcset[0-9a-f]{12}-lock[0-9a-f]{12}-contract[0-9a-f]{12}"
     r"(?:-attempt[1-9][0-9]{0,2})?$"
@@ -364,7 +367,7 @@ def _listed_unit_names(text: str) -> tuple[str, ...]:
         if row.startswith("\u25cf"):
             row = row[1:].lstrip()
         candidate = row.split(None, 1)[0] if row.split(None, 1) else ""
-        if _UNIT_RE.fullmatch(candidate) is not None:
+        if _LISTED_UNIT_RE.fullmatch(candidate) is not None:
             names.append(candidate)
     return tuple(dict.fromkeys(names))
 
@@ -1708,7 +1711,7 @@ def _parse_service_units(text: str) -> tuple[list[dict[str, str]], bool]:
         if row.startswith("\u25cf"):
             row = row[1:].lstrip()
         parts = row.split(None, 4)
-        if len(parts) < 4 or not _UNIT_RE.fullmatch(parts[0]):
+        if len(parts) < 4 or not _LISTED_UNIT_RE.fullmatch(parts[0]):
             complete = False
             continue
         if any(_SYSTEMD_STATE_RE.fullmatch(part) is None for part in parts[1:4]):
