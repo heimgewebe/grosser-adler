@@ -385,11 +385,42 @@ _NIXOS_READ_EXECUTABLES = frozenset({
 })
 
 
+def _host_root_uid_unmapped_in_userns() -> bool:
+    """Recognize systemd's one-UID user namespace, not an arbitrary nobody owner.
+
+    An unprivileged systemd user unit with ProtectSystem=strict can map only its
+    own UID into the mount user namespace. Host root then appears as the kernel
+    overflow UID 65534 on otherwise immutable NixOS paths.
+    """
+    uid = os.geteuid()
+    if uid in (0, 65534):
+        return False
+    try:
+        rows = Path("/proc/self/uid_map").read_text(encoding="ascii").splitlines()
+        if len(rows) != 1:
+            return False
+        fields = rows[0].split()
+        if len(fields) != 3 or not all(field.isascii() and field.isdecimal() for field in fields):
+            return False
+        inside, outside, count = (int(field) for field in fields)
+    except (OSError, ValueError, UnicodeError, OverflowError):
+        return False
+    return (inside, outside, count) == (uid, uid, 1)
+
+
 def _trusted_nixos_binary_provenance(candidate: Path, resolved: Path) -> bool:
-    """Require root-controlled, observer-nonwritable symlink and Store path hops."""
+    """Require immutable Store binaries and a non-writable, trusted path chain.
+
+    In a singleton systemd user namespace host-root ownership reads as 65534.
+    This alias is accepted only with the exact kernel UID mapping and the
+    existing fixed /run/current-system and /nix/store non-writability checks.
+    """
     store = Path("/nix/store")
     if store not in resolved.parents:
         return False
+    trusted_uids = {0}
+    if _host_root_uid_unmapped_in_userns():
+        trusted_uids.add(65534)
     hops = (
         Path("/run"),
         Path("/run/current-system"),
@@ -403,7 +434,7 @@ def _trusted_nixos_binary_provenance(candidate: Path, resolved: Path) -> bool:
     )
     try:
         for hop in dict.fromkeys(hops):
-            if hop.lstat().st_uid != 0 or os.access(hop, os.W_OK):
+            if hop.lstat().st_uid not in trusted_uids or os.access(hop, os.W_OK):
                 return False
     except (OSError, RuntimeError):
         return False
