@@ -1698,10 +1698,24 @@ def github_pr(repo: str, pr: int) -> dict[str, Any]:
     gh_repo = f"{owner}/{name}"
     if not isinstance(pr, int) or isinstance(pr, bool) or not 1 <= pr <= 2_147_483_647:
         raise ValueError("invalid pull request number")
-    metadata = _run([
-        "/usr/bin/gh", "pr", "view", str(pr), "--repo", gh_repo,
-        "--json", "number,title,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,url,reviewDecision,statusCheckRollup",
-    ], timeout=20)
+    try:
+        metadata = _run([
+            "/usr/bin/gh", "pr", "view", str(pr), "--repo", gh_repo,
+            "--json", "number,title,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,url,reviewDecision,statusCheckRollup",
+        ], timeout=20)
+    except RuntimeError as exc:
+        if str(exc) != "Großer Adler GitHub credential is not configured":
+            raise
+        # Public GitHub REST is readable without a principal; private resources
+        # remain inaccessible, and a configured token always takes the GH path.
+        from github_public import read_public_pr
+        return read_public_pr(
+            owner, name, pr,
+            redactor=lambda value: _redact(value, exact_secrets=_configured_exact_secrets()),
+            bounded=_bounded,
+            projector=_structured_github_pr,
+            now=_utc_now,
+        )
     reviews = _run([
         "/usr/bin/gh", "api", f"repos/{owner}/{name}/pulls/{pr}/reviews", "--paginate",
     ], timeout=20)
