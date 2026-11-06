@@ -87,7 +87,7 @@ class FindingFreshnessTests(unittest.TestCase):
         self.assertEqual(changed["counts"]["recheck_required"], 1)
         self.assertEqual(changed["counts"]["resolved_at_checkpoint"], 0)
 
-        resolved = self._record(
+        self._record(
             3, checkpoint=B, recheck_of=root, conclusion="no_longer_reproduced",
         )
         result = server.assess_lane_findings(LANE)
