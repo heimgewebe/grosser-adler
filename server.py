@@ -3866,6 +3866,139 @@ def list_findings(
     }
 
 
+def _lane_finding_freshness_rows(
+    lane_id: str,
+    checkpoint: str,
+    loaded: list[tuple[Path, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Classify exact-lane findings against one observed head; do not infer fixes."""
+    lane_records = [
+        payload
+        for _path, payload in loaded
+        if payload.get("finding_contract") == FINDING_CONTRACT
+        and _v1_target_lane_id(payload["subject"], payload.get("target_lane_id")) == lane_id
+    ]
+    roots = {
+        payload["finding_id"]: payload
+        for payload in lane_records
+        if payload.get("recheck_of") is None
+    }
+    rechecks: dict[str, list[dict[str, Any]]] = {}
+    for payload in lane_records:
+        parent = payload.get("recheck_of")
+        if parent in roots:
+            rechecks.setdefault(parent, []).append(payload)
+
+    rows: list[dict[str, Any]] = []
+    for root_id, root in roots.items():
+        exact_rechecks = sorted(
+            (
+                item for item in rechecks.get(root_id, [])
+                if item["checkpoint"] == checkpoint
+            ),
+            key=lambda item: (item["observed_at"], item["finding_id"]),
+        )
+        latest = exact_rechecks[-1] if exact_rechecks else None
+        if latest is not None:
+            state = (
+                "resolved_at_checkpoint"
+                if latest["conclusion"] == "no_longer_reproduced"
+                else "still_current_at_checkpoint"
+            )
+        elif root["checkpoint"] == checkpoint:
+            state = "observed_at_checkpoint"
+        else:
+            state = "recheck_required"
+        rows.append({
+            "finding_id": root_id,
+            "severity": root["severity"],
+            "kind": root["kind"],
+            "subject": root["subject"],
+            "original_checkpoint": root["checkpoint"],
+            "state": state,
+            "latest_recheck_id": latest["finding_id"] if latest else None,
+            "latest_recheck_conclusion": latest["conclusion"] if latest else None,
+        })
+    state_rank = {
+        "recheck_required": 0,
+        "still_current_at_checkpoint": 1,
+        "observed_at_checkpoint": 1,
+        "resolved_at_checkpoint": 2,
+    }
+    return sorted(rows, key=lambda row: (
+        state_rank[row["state"]],
+        _severity_rank(row["severity"]),
+        row["finding_id"],
+    ))
+
+
+@mcp.tool(name="assess_lane_findings", annotations=READ_ANNOTATIONS)
+def assess_lane_findings(lane_id: str, limit: int = 50) -> dict[str, Any]:
+    """Fresh advisory status of one active Grabowski lane, without a review gate."""
+    lane_id = _validate_lane_id(lane_id)
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("limit must be between 1 and 50")
+    before = _read_work_target(lane_id)
+    history = _load_bounded_finding_history()
+    after = _read_work_target(lane_id)
+    if any(before[key] != after[key] for key in (
+        "checkpoint", "repository", "worktree", "branch"
+    )):
+        raise RuntimeError("lane identity changed during finding freshness read")
+    checkpoint = after["checkpoint"]
+    rows = _lane_finding_freshness_rows(lane_id, checkpoint, history["records"])
+    counts = {
+        state: sum(item["state"] == state for item in rows)
+        for state in (
+            "recheck_required",
+            "observed_at_checkpoint",
+            "still_current_at_checkpoint",
+            "resolved_at_checkpoint",
+        )
+    }
+    source_complete = bool(
+        history["membership_stable"]
+        and history["name_reconciliation_complete"]
+        and not history["errors"]
+    )
+    resolved = [row for row in rows if row["state"] == "resolved_at_checkpoint"]
+    # Incomplete history cannot justify suppressing any root finding.
+    open_rows = [
+        row for row in rows
+        if not (source_complete and row["state"] == "resolved_at_checkpoint")
+    ]
+    return {
+        "lane_id": lane_id,
+        "checkpoint": checkpoint,
+        "repository": after["repository"],
+        "worktree": after["worktree"],
+        "findings": open_rows[:limit],
+        "total_open_finding_count": len(open_rows),
+        "total_root_finding_count": len(rows),
+        "resolved_finding_ids": (
+            [row["finding_id"] for row in resolved[:limit]] if source_complete else []
+        ),
+        "resolved_finding_ids_omitted_count": (
+            max(0, len(resolved) - limit) if source_complete else len(resolved)
+        ),
+        "omitted_finding_count": max(0, len(open_rows) - limit),
+        "projection_complete": len(open_rows) <= limit,
+        "counts": counts,
+        "source_complete": source_complete,
+        "source_error_count": len(history["errors"]),
+        "history_snapshot_sha256": history["history_snapshot_sha256"],
+        "rechecks_are_explicit_evidence_only": True,
+        "effect_contract": "advisory_only_no_automatic_action",
+        "does_not_establish": [
+            "semantic_reproduction_without_an_explicit_recheck",
+            "absence_of_unbound_or_historical_findings",
+            "absence_of_findings_added_after_the_history_snapshot",
+            "decision_or_execution_authority",
+        ],
+        "observed_at": _utc_now(),
+    }
+
+
 def _clean_required_identity_text(value: str, field: str, *, max_chars: int = 500) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > max_chars:
         raise ValueError(f"{field} must be 1..{max_chars} characters")
