@@ -10,7 +10,6 @@ import pytest
 import github_public
 import server
 
-
 HEAD = "a" * 40
 BASE = "b" * 40
 
