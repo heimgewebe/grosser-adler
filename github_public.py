@@ -7,10 +7,13 @@ when configured. Missing or incomplete public evidence is not a PASS.
 from __future__ import annotations
 
 import json
+import math
 import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from threading import Lock
+from time import monotonic, time
 from typing import Any
 
 _API_ROOT = "https://api.github.com"
@@ -22,20 +25,73 @@ _API_HEADERS = {
 _MAX_RESPONSE_BYTES = 1_000_000
 _MAX_PAGES = 5
 _SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_MAX_COOLDOWN_SECONDS = 3600
+_DEFAULT_COOLDOWN_SECONDS = 60
+_quota_lock = Lock()
+_quota_deadline = 0.0
+_quota_reason = ""
 
 
 class PublicGithubIncomplete(RuntimeError):
     """No complete uncredentialed GitHub evidence was obtained."""
 
 
+def _header_integer(headers: Any, name: str) -> int | None:
+    value = headers.get(name) if headers is not None else None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value):
+        return int(value)
+    return None
+
+
+def _quota_delay(status: int, headers: Any) -> tuple[float, str] | None:
+    """Use only explicit provider quota evidence; an ordinary 403 is not a limit."""
+    remaining = _header_integer(headers, "X-RateLimit-Remaining")
+    reset = _header_integer(headers, "X-RateLimit-Reset")
+    retry = _header_integer(headers, "Retry-After")
+    if remaining == 0 and status in (200, 403, 429):
+        reset_delay = reset - time() if reset is not None else 0
+        delay = max(reset_delay, retry or 0)
+        return min(delay if delay > 0 else _DEFAULT_COOLDOWN_SECONDS,
+                   _MAX_COOLDOWN_SECONDS), "primary"
+    if status == 429 or (status == 403 and retry is not None and retry > 0):
+        return min(retry or _DEFAULT_COOLDOWN_SECONDS, _MAX_COOLDOWN_SECONDS), "secondary"
+    return None
+
+
+def _observe_quota(status: int, headers: Any) -> str:
+    global _quota_deadline, _quota_reason
+    limit = _quota_delay(status, headers)
+    if limit is None:
+        return ""
+    delay, reason = limit
+    with _quota_lock:
+        deadline = monotonic() + delay
+        if deadline > _quota_deadline:
+            _quota_deadline, _quota_reason = deadline, reason
+    return f" ({reason} rate limit; retry in {math.ceil(delay)}s)"
+
+
+def _check_quota() -> None:
+    with _quota_lock:
+        remaining = _quota_deadline - monotonic()
+        reason = _quota_reason
+    if remaining > 0:
+        raise PublicGithubIncomplete(
+            f"public API {reason} rate limit cooldown; request not sent; "
+            f"retry in {math.ceil(remaining)}s"
+        )
+
+
 def _get_json(path: str) -> tuple[Any, bool]:
+    _check_quota()
     # All callers construct paths from already validated owner/repo/PR and
     # server-generated integer page numbers. No caller-controlled URL.
     request = urllib.request.Request(_API_ROOT + path, headers=_API_HEADERS)
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
+            quota = _observe_quota(response.status, response.headers)
             if response.status != 200:
-                raise PublicGithubIncomplete(f"public API HTTP {response.status}")
+                raise PublicGithubIncomplete(f"public API HTTP {response.status}{quota}")
             if "application/json" not in response.headers.get("Content-Type", ""):
                 raise PublicGithubIncomplete("public API returned non-JSON")
             raw = response.read(_MAX_RESPONSE_BYTES + 1)
@@ -43,7 +99,8 @@ def _get_json(path: str) -> tuple[Any, bool]:
                 raise PublicGithubIncomplete("public API response exceeds byte bound")
             next_page = 'rel="next"' in response.headers.get("Link", "")
     except urllib.error.HTTPError as exc:
-        raise PublicGithubIncomplete(f"public API HTTP {exc.code}") from None
+        quota = _observe_quota(exc.code, exc.headers)
+        raise PublicGithubIncomplete(f"public API HTTP {exc.code}{quota}") from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise PublicGithubIncomplete(f"public API transport {type(exc).__name__}") from None
     try:

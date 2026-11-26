@@ -15,6 +15,12 @@ HEAD = "a" * 40
 BASE = "b" * 40
 
 
+@pytest.fixture(autouse=True)
+def reset_public_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(github_public, "_quota_deadline", 0.0)
+    monkeypatch.setattr(github_public, "_quota_reason", "")
+
+
 def _fake_public_data(monkeypatch: pytest.MonkeyPatch, *, comment_body: str = "public") -> list[str]:
     requested: list[str] = []
 
@@ -175,6 +181,7 @@ def test_dedicated_token_keeps_existing_gh_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("GROSSER_ADLER_GITHUB_TOKEN", "dedicated-test-read-token")
+    monkeypatch.setattr(github_public, "_quota_deadline", github_public.monotonic() + 60)
     calls = []
 
     def fake_run(argv, **kwargs):
@@ -197,3 +204,108 @@ def test_dedicated_token_keeps_existing_gh_contract(
     assert calls[0][:2] == ["/usr/bin/gh", "pr"]
     assert "github_access" not in result
     assert result["structured"]["source_complete"] is True
+
+def test_exhausted_primary_quota_stops_remaining_sources_and_next_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GROSSER_ADLER_GITHUB_TOKEN", raising=False)
+    clock = [100.0]
+    monkeypatch.setattr(github_public, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(github_public, "time", lambda: 1000.0)
+    calls = []
+    headers = Message()
+    headers["X-RateLimit-Remaining"] = "0"
+    headers["X-RateLimit-Reset"] = "1040"
+
+    def denied(request, timeout):
+        calls.append(request.full_url)
+        raise urllib.error.HTTPError(request.full_url, 403, "rate limited", headers, None)
+
+    monkeypatch.setattr(github_public.urllib.request, "urlopen", denied)
+    first = server.github_pr("heimgewebe/grosser-adler", 27)
+    second = server.github_pr("heimgewebe/grosser-adler", 28)
+    assert len(calls) == 1
+    assert "primary rate limit" in first["metadata"]["stderr"]
+    assert "request not sent" in first["reviews"]["stderr"]
+    assert "request not sent" in second["metadata"]["stderr"]
+    assert not first["structured"]["observation_complete"]
+    assert not second["structured"]["observation_complete"]
+
+    clock[0] = 140.0
+    with pytest.raises(github_public.PublicGithubIncomplete, match="HTTP 403"):
+        github_public._get_json("/repos/heimgewebe/grosser-adler/pulls/27")
+    assert len(calls) == 2
+
+
+def test_generic_403_does_not_block_other_public_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GROSSER_ADLER_GITHUB_TOKEN", raising=False)
+    calls = []
+
+    def denied(request, timeout):
+        calls.append(request.full_url)
+        raise urllib.error.HTTPError(request.full_url, 403, "forbidden", None, None)
+
+    monkeypatch.setattr(github_public.urllib.request, "urlopen", denied)
+    result = server.github_pr("heimgewebe/grosser-adler", 27)
+    assert len(calls) == 3
+    assert not result["structured"]["observation_complete"]
+    assert "rate limit" not in result["metadata"]["stderr"]
+
+
+@pytest.mark.parametrize("status,retry", [(429, None), (403, "17")])
+def test_secondary_limit_is_bounded(monkeypatch: pytest.MonkeyPatch, status, retry) -> None:
+    monkeypatch.setattr(github_public, "monotonic", lambda: 100.0)
+    headers = Message()
+    if retry is not None:
+        headers["Retry-After"] = retry
+    assert "secondary" in github_public._observe_quota(status, headers)
+    assert github_public._quota_deadline == 100 + (int(retry) if retry else 60)
+    with pytest.raises(github_public.PublicGithubIncomplete, match="request not sent"):
+        github_public._check_quota()
+
+
+def test_successful_last_request_preserves_data_but_blocks_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(github_public, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(github_public, "time", lambda: 1000.0)
+    calls = []
+
+    class Response:
+        status = 200
+        headers = Message()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size):
+            return b'{"ok":true}'
+
+    Response.headers["Content-Type"] = "application/json"
+    Response.headers["X-RateLimit-Remaining"] = "0"
+    Response.headers["X-RateLimit-Reset"] = "1040"
+
+    def fake_urlopen(request, timeout):
+        calls.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(github_public.urllib.request, "urlopen", fake_urlopen)
+    assert github_public._get_json("/repos/heimgewebe/grosser-adler/pulls/27") == (
+        {"ok": True}, False
+    )
+    with pytest.raises(github_public.PublicGithubIncomplete, match="request not sent"):
+        github_public._get_json("/repos/heimgewebe/grosser-adler/pulls/28")
+    assert len(calls) == 1
+
+
+def test_unreasonable_reset_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(github_public, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(github_public, "time", lambda: 1000.0)
+    headers = Message()
+    headers["X-RateLimit-Remaining"] = "0"
+    headers["X-RateLimit-Reset"] = "999999999999"
+    github_public._observe_quota(403, headers)
+    assert github_public._quota_deadline == 3700.0
